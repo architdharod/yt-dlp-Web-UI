@@ -1,0 +1,33 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: yt-dlp-web-ui-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3033}:80"
+    labels:
+      - homepage.group=muusic.dharod.de
+      - homepage.name=music-for-arr
+      - homepage.icon=https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/youtube-dl.svg
+      - homepage.href=https://get-youtube.int.dharod.de
+      - homepage.description=download music from YouTube/SoundCloud as FLAC
+      - homepage.siteMonitor=https://get-youtube.int.dharod.de
+      - homepage.weight=20
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: yt-dlp-web-ui-backend
+    user: "1000:1000"
+    restart: unless-stopped
+    environment:
+      - DOWNLOAD_PATH=${DOWNLOAD_PATH}
+      - DOWNLOAD_TIMEOUT_SECONDS=${DOWNLOAD_TIMEOUT_SECONDS}
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS}
+    volumes:
+      - ${DOWNLOAD_PATH}:${DOWNLOAD_PATH}
