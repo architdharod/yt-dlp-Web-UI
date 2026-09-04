@@ -1,6 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/queryKeys";
-import type { Job, SSEEvent } from "@/lib/types";
+import type { Job, Notice, SSEEvent } from "@/lib/types";
 
 /**
  * Statuses `GET /queue` does not return. A job that reaches one of them is
@@ -170,12 +170,67 @@ export function setJobActionError(
 }
 
 /**
+ * Read one element of a `notices` event's list, or null when it is malformed.
+ *
+ * The event data is `Record<string, unknown>` on the wire, so every field is
+ * checked rather than cast: a malformed entry should be ignored, not rendered
+ * as a banner with `undefined` in it.
+ */
+function parseNotice(data: Record<string, unknown>): Notice | null {
+  const { id, level, source, message, created_at: createdAt } = data;
+  if (typeof id !== "string" || id.length === 0) return null;
+  if (level !== "error" && level !== "warning") return null;
+  if (source !== "navidrome" && source !== "lidarr") return null;
+  if (typeof message !== "string") return null;
+  if (typeof createdAt !== "string") return null;
+  return { id, level, source, message, created_at: createdAt };
+}
+
+/**
+ * Replace the cached notice list from a `notices` event.
+ *
+ * The event carries the *whole* open set, so this overwrites rather than
+ * merges: a notice the backend has cleared is simply absent from the next
+ * push, and that is the only thing that makes it leave the client. Elements
+ * that do not parse are dropped, the rest still render.
+ *
+ * An unfetched cache is seeded rather than left alone: `GET /notices` may
+ * still be in flight, and a banner the user should see must not wait for it.
+ */
+function applyNoticesEvent(
+  queryClient: QueryClient,
+  data: Record<string, unknown>,
+): void {
+  const raw = data.notices;
+  if (!Array.isArray(raw)) return;
+
+  const notices = raw
+    .map((entry) =>
+      typeof entry === "object" && entry !== null
+        ? parseNotice(entry as Record<string, unknown>)
+        : null,
+    )
+    .filter((notice): notice is Notice => notice !== null);
+
+  // `useNotices` sets no `staleTime`, so a mount or refocus refetch may be out
+  // right now; it would write its older answer over this push when it lands.
+  // Cancelling is synchronous inside the call, so there is nothing to await:
+  // the cancelled query settles at the value written just below and does not
+  // refetch itself, while a later `invalidateQueries` still refetches normally.
+  void queryClient.cancelQueries({ queryKey: queryKeys.notices });
+  queryClient.setQueryData<Notice[]>(queryKeys.notices, notices);
+}
+
+/**
  * Apply one SSE event to the query cache.
  *
  * A plain function over a `QueryClient` rather than something inside the hook,
  * so the whole event-to-cache contract is testable without an EventSource.
  *
  *   - `library_changed` invalidates the library query and touches nothing else.
+ *   - `notices` replaces the notices query with the open set the event
+ *     carries, so a service failure paints a banner — and a cleared one stops
+ *     being shown — without a refetch.
  *   - An event for a job the cache does not hold means the view is stale
  *     (submitted from another tab, or restored after a backend restart), so the
  *     queue query is invalidated. The snapshot in the event is deliberately not
@@ -190,6 +245,11 @@ export function applyQueueEvent(
 ): void {
   if (event.event === "library_changed") {
     void queryClient.invalidateQueries({ queryKey: queryKeys.library });
+    return;
+  }
+
+  if (event.event === "notices") {
+    applyNoticesEvent(queryClient, event.data);
     return;
   }
 
@@ -257,6 +317,12 @@ export function resyncAfterReconnect(queryClient: QueryClient): void {
   );
   void queryClient.invalidateQueries(
     { queryKey: queryKeys.library },
+    { cancelRefetch: false },
+  );
+  // A notice raised while the stream was down was never delivered, and one the
+  // backend has since cleared should stop being shown.
+  void queryClient.invalidateQueries(
+    { queryKey: queryKeys.notices },
     { cancelRefetch: false },
   );
 }

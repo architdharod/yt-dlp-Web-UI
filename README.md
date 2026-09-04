@@ -130,6 +130,12 @@ All configuration is via environment variables in `.env`:
 | `PUID`                     | `1000`                  | UID the backend container runs as                        |
 | `PGID`                     | `1000`                  | GID the backend container runs as                        |
 | `CORS_ORIGINS`             | unset                   | Dev only: comma-separated browser origins allowed to call the API directly. Not needed for the compose stack, where the UI is same-origin behind nginx. |
+| `NAVIDROME_URL`            | empty (disabled)        | Navidrome base URL, e.g. `http://navidrome:4533`, without a trailing `/rest` |
+| `NAVIDROME_USER`           | empty (disabled)        | Navidrome user to scan as; must be an admin                             |
+| `NAVIDROME_PASSWORD`       | empty (disabled)        | That user's password; the app derives a token and salt per request      |
+| `LIDARR_URL`               | empty (disabled)        | Lidarr base URL, e.g. `http://lidarr:8686`                              |
+| `LIDARR_API_KEY`           | empty (disabled)        | Lidarr API key, from Settings > General                                 |
+| `LIDARR_ROOT_FOLDER`       | Lidarr's first          | The root folder to rescan, as Lidarr sees it                            |
 
 These are the effective defaults: `docker-compose.yml` substitutes them when a
 variable is unset or empty, so an incomplete `.env` no longer breaks the stack.
@@ -146,6 +152,36 @@ pre-creates `/config` world-writable, so the named volume compose mounts there
 inherits that mode and is writable whatever `PUID:PGID` you run as. If you
 replace the named volume with a bind mount of a host directory, that directory
 must exist and be writable by `PUID:PGID` yourself.
+
+## Navidrome and Lidarr
+
+After every change to the library the backend waits five seconds for the writing
+to stop, touches the album folders that changed, and then asks Navidrome and
+Lidarr to rescan — once, however many tracks landed. Each service is skipped
+when its variables are empty, and a failure never fails a download: it shows as
+a dismissible banner in the UI and a line in the log.
+
+**Navidrome.** `startScan` is admin-only, so `NAVIDROME_USER` must be an admin;
+create a dedicated user for it rather than reusing your own. Set
+`ND_SCANNER_PURGEMISSING=always` on the Navidrome container (Navidrome 0.56.0 or
+newer), or tracks this app deletes stay in Navidrome's database as unplayable
+entries. Navidrome's own
+filesystem watcher usually notices new files by itself; the explicit scan is
+insurance for the setups where it does not (network mounts, some bind mounts).
+
+**Lidarr.** The rescan is sent with `filter=known` and `addNewArtists=false`, so
+only artists Lidarr already tracks are rescanned and nothing this app downloads
+is added to Lidarr's library behind your back. Two settings on the Lidarr side
+matter:
+
+- Albums you delete here that Lidarr monitors will be searched for again.
+  Unmonitor the album in Lidarr if you meant the delete to stick.
+- Leave *Settings > Metadata > Tag Audio Files with Metadata* at `no` or
+  `newFiles`, and leave *Scrub Existing Tags* off. Scrubbing strips the
+  `SOURCEID` and `SOURCEURL` tags this app writes, which is what its duplicate
+  detection reads. The app checks this at startup and again after each rescan,
+  and shows a banner while scrubbing is on; turn it off and the banner clears
+  after the next rescan.
 
 ## Limitations
 

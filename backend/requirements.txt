@@ -5,3 +5,5 @@ mutagen==1.48.1
 python-multipart==0.0.32
 pydantic==2.13.5
 sse-starlette==3.4.10
+# Async HTTP client for the Navidrome and Lidarr rescan calls.
+httpx==0.28.1

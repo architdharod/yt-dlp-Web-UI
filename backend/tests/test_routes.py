@@ -11,6 +11,7 @@ with mocked downloader and controlled queue behavior.  Covers:
 """
 
 import asyncio
+import logging
 import os
 import sqlite3
 import threading
@@ -919,6 +920,112 @@ class TestCors:
         resp = client.get("/health", headers={"Origin": "https://evil.example"})
         assert resp.status_code == 200
         assert "access-control-allow-origin" not in resp.headers
+
+
+class TestLifespanShutdown:
+    """Shutdown is a chain of independent steps: no teardown step can strand
+    the ones after it.
+
+    Each test breaks exactly one step -- the startup probe, the rescan hook,
+    the job store -- and asks that the lifespan still exit cleanly, say what
+    went wrong in the log, and carry out the steps that come after the broken
+    one.  ``store.close()`` is the one that has to happen.
+    """
+
+    @staticmethod
+    def _spy_on_store_close(monkeypatch):
+        """Record every ``JobStore.close`` call, then do the real close.
+
+        ``JobStore.close`` is idempotent and an unclosed WAL database still
+        answers ``SELECT 1``, so reading the file back proves nothing about
+        whether teardown actually reached the close.  A spy does.
+        """
+        calls = []
+        original = JobStore.close
+
+        def spy(self):
+            calls.append(self)
+            return original(self)
+
+        monkeypatch.setattr(JobStore, "close", spy)
+        return calls
+
+    def test_a_failing_startup_check_does_not_strand_the_close(
+        self, monkeypatch, caplog
+    ):
+        import app.main as main_module
+        from app.rescan import RescanHook
+
+        async def boom(self):
+            raise RuntimeError("probe exploded")
+
+        monkeypatch.setattr(RescanHook, "check_lidarr_config", boom)
+        closes = self._spy_on_store_close(monkeypatch)
+
+        with caplog.at_level(logging.ERROR):
+            with TestClient(main_module.app) as client:
+                assert client.get("/health").status_code == 200
+
+        assert "The startup check task failed" in caplog.text
+        assert closes, "teardown never reached store.close()"
+
+    def test_a_failing_hook_shutdown_does_not_strand_the_close(
+        self, monkeypatch, caplog
+    ):
+        import app.main as main_module
+        from app.rescan import RescanHook
+
+        async def boom(self):
+            raise RuntimeError("hook would not stop")
+
+        monkeypatch.setattr(RescanHook, "aclose", boom)
+        closes = self._spy_on_store_close(monkeypatch)
+
+        with caplog.at_level(logging.ERROR):
+            with TestClient(main_module.app) as client:
+                assert client.get("/health").status_code == 200
+
+        assert "Could not stop the rescan hook" in caplog.text
+        assert closes, "teardown never reached store.close()"
+
+    def test_a_failing_close_does_not_strand_the_steps_after_it(
+        self, monkeypatch, caplog
+    ):
+        import app.main as main_module
+
+        def boom(self):
+            raise RuntimeError("the database would not close")
+
+        monkeypatch.setattr(JobStore, "close", boom)
+
+        with caplog.at_level(logging.ERROR):
+            with TestClient(main_module.app) as client:
+                assert client.get("/health").status_code == 200
+
+        assert "Could not close the job store" in caplog.text
+        # The last step still ran: a stale loop reference would have SSE
+        # events posted into a dead loop on the next boot.
+        assert main_module._loop is None
+
+    def test_a_malformed_lidarr_url_boots_and_shuts_down_without_a_traceback(
+        self, monkeypatch, isolated_paths
+    ):
+        """A smoke test, not a failure-path test.
+
+        ``notaport`` is not a port, so httpx raises ``InvalidURL`` somewhere
+        inside the probe.  Nothing here forces the failure to reach the
+        lifespan -- the probe swallows it -- so this only asserts that the
+        real configuration path boots, serves, and tears down.
+        """
+        import app.main as main_module
+
+        monkeypatch.setenv("LIDARR_URL", "http://lidarr:notaport")
+        monkeypatch.setenv("LIDARR_API_KEY", "x")
+
+        with TestClient(main_module.app) as client:
+            assert client.get("/health").status_code == 200
+
+        assert main_module.rescan_hook is None
 
 
 class TestDataPathStartupChecks:

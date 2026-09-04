@@ -31,6 +31,14 @@ services:
       - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-2}
       - DATA_PATH=/config
       - HOME=/tmp
+      # Rescan targets. Each service is skipped when its variables are empty,
+      # so an unset one simply turns that half of the hook off.
+      - NAVIDROME_URL=${NAVIDROME_URL:-}
+      - NAVIDROME_USER=${NAVIDROME_USER:-}
+      - NAVIDROME_PASSWORD=${NAVIDROME_PASSWORD:-}
+      - LIDARR_URL=${LIDARR_URL:-}
+      - LIDARR_API_KEY=${LIDARR_API_KEY:-}
+      - LIDARR_ROOT_FOLDER=${LIDARR_ROOT_FOLDER:-}
     volumes:
       - ${DOWNLOAD_PATH:-/data/music/downloads}:${DOWNLOAD_PATH:-/data/music/downloads}
       - music-for-arr-data:/config

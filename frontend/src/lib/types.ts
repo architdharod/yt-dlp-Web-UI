@@ -57,6 +57,23 @@ export interface SSEEvent {
 }
 
 /**
+ * A standing problem with Navidrome or Lidarr, from `GET /notices` and the
+ * `notices` SSE event, which carries the whole open set on every change.
+ *
+ * The backend de-duplicates these by (source, message) while they are open, so
+ * a wrong password is one notice however many downloads follow it. `id` is
+ * fresh every time a problem is raised again after a success in between, which
+ * is what lets a dismissed banner come back when the problem returns.
+ */
+export interface Notice {
+  id: string;
+  level: "error" | "warning";
+  source: "navidrome" | "lidarr";
+  message: string;
+  created_at: string;
+}
+
+/**
  * One audio file under the library root, as `GET /library` reports it.
  *
  * `path` is the POSIX path relative to `DOWNLOAD_PATH` and is the track's

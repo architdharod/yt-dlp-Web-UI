@@ -6,7 +6,7 @@ Defines request/response schemas, job state model, and SSE event payloads.
 import ipaddress
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator
@@ -153,17 +153,47 @@ class SSEEvent(BaseModel):
     carries ``data["paths"]``, the POSIX paths of what changed relative to that
     root.  It has no ``job_id`` when nothing queued caused the change -- a move,
     a delete, or a manual tag write -- which is why the field is optional.
+
+    ``notices`` carries ``data["notices"]``: the complete list of open service
+    notices, the same shape ``GET /notices`` returns, sent every time that set
+    changes.  It is the whole list rather than the one that changed because a
+    notice going away has nothing of its own to send; a client replaces its
+    state with the payload.  It never has a ``job_id``.
     """
 
     event: str = Field(
         ...,
-        description="Event type: status_change, progress, error, library_changed",
+        description="Event type: status_change, progress, error, library_changed, notices",
     )
     job_id: str | None = Field(
         None,
         description="ID of the job this event relates to, or null when no job caused it",
     )
     data: dict[str, Any] = Field(default_factory=dict, description="Event-specific payload data")
+
+
+
+class Notice(BaseModel):
+    """A standing complaint about one of the external services.
+
+    Notices exist because a rescan failure has nowhere else to go: no job
+    failed, no request was refused, and the user is the only one who can fix a
+    wrong password or a non-admin Navidrome account.  The open set is broadcast
+    as the ``notices`` SSE event and served by ``GET /notices`` so a client that
+    connects after startup still sees the ones already open.
+
+    ``id`` changes whenever a notice is raised afresh, which is what lets the
+    frontend keep a dismissed notice hidden until the same problem happens
+    again after a success in between.
+    """
+
+    id: str = Field(..., description="Unique id of this raising of the notice")
+    level: Literal["error", "warning"] = Field(..., description="How loudly to show it")
+    source: Literal["navidrome", "lidarr"] = Field(
+        ..., description="The service the notice is about"
+    )
+    message: str = Field(..., description="Human-readable text; never contains a secret")
+    created_at: str = Field(..., description="When it was raised, ISO 8601 UTC")
 
 
 class HealthResponse(BaseModel):

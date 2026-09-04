@@ -14,4 +14,10 @@ export const queryKeys = {
    * `library_changed` SSE event says the folder on disk moved on.
    */
   library: ["library"] as const,
+  /**
+   * GET /notices — the open Navidrome and Lidarr problems. The `notices` SSE
+   * event overwrites this key with the whole open set, so a failure — or a
+   * clear — that happens while the tab is open needs no refetch.
+   */
+  notices: ["notices"] as const,
 };

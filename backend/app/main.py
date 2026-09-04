@@ -5,6 +5,7 @@ Defines all API routes:
   - POST /download       -- submit a URL for download
   - GET  /library        -- the DOWNLOAD_PATH tree as artists, albums, tracks
   - GET  /library/cover  -- cover art for one album
+  - GET  /notices        -- open Navidrome/Lidarr problems worth showing
   - GET  /queue          -- list in-flight and errored jobs
   - GET  /queue/stream   -- SSE stream of job events
   - POST /queue/{id}/retry   -- retry a failed job
@@ -39,7 +40,15 @@ from app.models import (
     HealthResponse,
     Job,
     LibraryResponse,
+    Notice,
     SSEEvent,
+)
+from app.rescan import (
+    NoticeBoard,
+    RescanHook,
+    build_http_client,
+    describe_config,
+    load_config,
 )
 from app.queue_manager import (
     DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
@@ -124,8 +133,26 @@ async def _broadcast_event(event: SSEEvent) -> None:
 _loop: asyncio.AbstractEventLoop | None = None
 
 
+async def _handle_event(event: SSEEvent) -> None:
+    """Fan an event out to the SSE clients, and act on it where we must.
+
+    ``library_changed`` is the single announcement that files under
+    ``DOWNLOAD_PATH`` moved on, so it is also where the rescan hook is fed:
+    every later phase that moves, trashes, restores, or re-tags a file already
+    ends by calling ``QueueManager.emit_library_changed``, and gets the
+    Navidrome and Lidarr rescan for free by doing so.
+    """
+    await _broadcast_event(event)
+
+    if event.event == "library_changed" and rescan_hook is not None:
+        paths = event.data.get("paths") or []
+        # Runs on the event-loop thread because this coroutine was scheduled
+        # onto it, which is what RescanHook.notify requires.
+        rescan_hook.notify([path for path in paths if isinstance(path, str)])
+
+
 def _on_queue_event(event: SSEEvent) -> None:
-    """Synchronous callback for QueueManager — schedules the async broadcast.
+    """Synchronous callback for QueueManager — schedules the async handling.
 
     This may be called from a background thread (e.g. yt-dlp progress hooks
     running inside ``run_in_executor``), so we use
@@ -135,10 +162,34 @@ def _on_queue_event(event: SSEEvent) -> None:
     if _loop is None or _loop.is_closed():
         return
     try:
-        asyncio.run_coroutine_threadsafe(_broadcast_event(event), _loop)
+        asyncio.run_coroutine_threadsafe(_handle_event(event), _loop)
     except RuntimeError:
         # Loop was closed between the check and the call — nothing to do.
         pass
+
+
+def _on_notices_changed(notices: list[Notice]) -> None:
+    """Push the whole open notice list to every connected client.
+
+    The event carries the full list rather than the one notice that changed, so
+    a clear is expressible at all: "Navidrome works again" has no notice of its
+    own to send.  The payload is exactly what ``GET /notices`` returns, which
+    lets a client replace its state outright instead of reconciling.
+    """
+    _on_queue_event(
+        SSEEvent(
+            event="notices",
+            job_id=None,
+            data={"notices": [notice.model_dump(mode="json") for notice in notices]},
+        )
+    )
+
+
+# The board of open Navidrome/Lidarr problems, and the hook that fills it.
+# The board is a module singleton so GET /notices can read it; the hook needs a
+# running event loop and an HTTP client, so it is built in the lifespan.
+notice_board = NoticeBoard(on_change=_on_notices_changed)
+rescan_hook: RescanHook | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +271,18 @@ async def lifespan(app: FastAPI):
         DEFAULT_DOWNLOAD_TIMEOUT_SECONDS
     )
 
+    rescan_config = load_config()
+
     logger.info("=== yt-dlp Web UI backend starting ===")
     logger.info("yt-dlp version           = %s", yt_dlp.version.__version__)
     logger.info("DOWNLOAD_PATH            = %s", download_path)
     logger.info("DATA_PATH                = %s", data_path)
     logger.info("MAX_CONCURRENT_DOWNLOADS = %s", max_concurrent)
     logger.info("DOWNLOAD_TIMEOUT_SECONDS = %s", timeout)
+    for line in describe_config(rescan_config):
+        logger.info("%s", line)
+    for warning in rescan_config.warnings:
+        logger.warning("%s", warning)
 
     _validate_directory("DOWNLOAD_PATH", download_path)
     _validate_directory("DATA_PATH", data_path)
@@ -245,17 +302,49 @@ async def lifespan(app: FastAPI):
     )
     sweep_task = asyncio.create_task(_sweep_periodically())
 
+    global rescan_hook
+    http_client = build_http_client()
+    rescan_hook = RescanHook(rescan_config, http_client, notice_board)
+    # Lidarr's tag-scrubbing setting is worth a banner, but reading it must
+    # never delay or fail boot, so it goes out as a background task with its
+    # own timeout inside.
+    startup_check = asyncio.create_task(rescan_hook.check_lidarr_config())
+
     try:
         yield
     finally:
-        sweep_task.cancel()
+        # Every step below is independent on purpose.  These are background
+        # tasks and network clients; any of them can fail on the way down, and
+        # a failure here used to strand the ones after it -- most importantly
+        # store.close(), which is the one that has to happen.
+        for name, task in (("startup check", startup_check), ("retention sweep", sweep_task)):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("The %s task failed", name)
+
         try:
-            await sweep_task
-        except asyncio.CancelledError:
-            pass
-        store.close()
-        _loop = None
-        logger.info("=== yt-dlp Web UI backend shutting down ===")
+            await rescan_hook.aclose()
+        except Exception:
+            logger.exception("Could not stop the rescan hook")
+        finally:
+            rescan_hook = None
+
+        try:
+            await http_client.aclose()
+        except Exception:
+            logger.exception("Could not close the HTTP client")
+        finally:
+            try:
+                store.close()
+            except Exception:
+                logger.exception("Could not close the job store")
+            finally:
+                _loop = None
+                logger.info("=== yt-dlp Web UI backend shutting down ===")
 
 
 app = FastAPI(title="yt-dlp Web UI", version="0.1.0", lifespan=lifespan)
@@ -284,6 +373,18 @@ if _configured_cors_origins:
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(status="ok", service="yt-dlp-web-ui-backend")
+
+
+@app.get("/notices", response_model=list[Notice])
+async def get_notices() -> list[Notice]:
+    """The Navidrome and Lidarr problems currently worth showing the user.
+
+    The ``notices`` SSE event carries this same list every time it changes,
+    but a client that connects after
+    the backend raised one -- the Lidarr tag-scrub warning is raised seconds
+    after boot -- would never hear about it, hence this endpoint.
+    """
+    return notice_board.open_notices()
 
 
 @app.post("/download", response_model=Job)

@@ -3,6 +3,7 @@ import type {
   Job,
   LibraryAlbum,
   LibraryResponse,
+  Notice,
   SSEEvent,
 } from "./types";
 
@@ -150,6 +151,23 @@ export async function getLibrary(
 }
 
 /**
+ * Fetch the open Navidrome and Lidarr problems.
+ *
+ * New ones arrive over the SSE stream; this is what a tab opened after the
+ * backend raised one needs — the Lidarr tag-scrub warning is raised seconds
+ * after boot, long before any browser is watching.
+ */
+export async function fetchNotices(): Promise<Notice[]> {
+  const res = await fetch(`${API_BASE_URL}/notices`);
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch notices: ${await parseErrorDetail(res)}`);
+  }
+
+  return res.json() as Promise<Notice[]>;
+}
+
+/**
  * The cover art URL for an album.
  *
  * The path travels as a query parameter rather than a URL segment because it
@@ -187,6 +205,7 @@ export function connectQueueStream(
     "error",
     "metadata",
     "library_changed",
+    "notices",
   ];
   for (const eventType of eventTypes) {
     eventSource.addEventListener(eventType, (e: MessageEvent) => {

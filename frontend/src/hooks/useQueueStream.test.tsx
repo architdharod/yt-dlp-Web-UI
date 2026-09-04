@@ -72,8 +72,12 @@ describe("useQueueStream", () => {
     act(() => handlers.onOpen());
 
     expect(result.current).toEqual({ connected: true, error: null });
-    // Events emitted while it was down were lost, so both queries refetch.
-    expect(invalidated).toEqual([queryKeys.queue, queryKeys.library]);
+    // Events emitted while it was down were lost, so everything refetches.
+    expect(invalidated).toEqual([
+      queryKeys.queue,
+      queryKeys.library,
+      queryKeys.notices,
+    ]);
   });
 
   it("resyncs only once per outage", () => {
@@ -82,7 +86,11 @@ describe("useQueueStream", () => {
     act(() => handlers.onOpen());
     act(() => handlers.onOpen());
 
-    expect(invalidated).toEqual([queryKeys.queue, queryKeys.library]);
+    expect(invalidated).toEqual([
+      queryKeys.queue,
+      queryKeys.library,
+      queryKeys.notices,
+    ]);
   });
 
   it("patches the cache with the events it receives", () => {
@@ -113,6 +121,27 @@ describe("useQueueStream", () => {
 
     expect(queryClient.getQueryData<{ progress: number }[]>(queryKeys.queue)![0]
       .progress).toBe(42);
+  });
+
+  it("routes a notices event to the notices cache", () => {
+    queryClient.setQueryData(queryKeys.notices, [
+      {
+        id: "n1",
+        level: "error",
+        source: "navidrome",
+        message: "Navidrome rejected the credentials",
+        created_at: "2026-09-04T00:00:00Z",
+      },
+    ]);
+    render();
+
+    // The backend cleared the last open notice.
+    act(() =>
+      handlers.onEvent({ event: "notices", job_id: null, data: { notices: [] } }),
+    );
+
+    expect(queryClient.getQueryData(queryKeys.notices)).toEqual([]);
+    expect(invalidated).toEqual([]);
   });
 
   it("closes the stream on unmount", () => {

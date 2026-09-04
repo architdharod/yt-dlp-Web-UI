@@ -9,7 +9,7 @@ import {
   resyncAfterReconnect,
 } from "@/lib/queueCache";
 import { queryKeys } from "@/lib/queryKeys";
-import type { Job, JobStatus, SSEEvent } from "@/lib/types";
+import type { Job, JobStatus, Notice, SSEEvent } from "@/lib/types";
 
 // The reconciliation tests drive the real queue query, so the only thing that
 // needs faking is the request itself.
@@ -184,11 +184,114 @@ describe("applyQueueEvent", () => {
   });
 });
 
+/** A notice as the backend puts it on the wire. */
+function notice(id: string, message = `problem ${id}`): Notice {
+  return {
+    id,
+    level: "error",
+    source: "navidrome",
+    message,
+    created_at: "2026-09-04T00:00:00Z",
+  };
+}
+
+/** The notices currently in the ["notices"] cache. */
+function notices(): Notice[] | undefined {
+  return queryClient.getQueryData<Notice[]>(queryKeys.notices);
+}
+
+function noticesEvent(...open: Notice[]): SSEEvent {
+  return { event: "notices", job_id: null, data: { notices: open } };
+}
+
+describe("the notices event", () => {
+  it("seeds a cache GET /notices has not filled yet", () => {
+    applyQueueEvent(queryClient, noticesEvent(notice("n1")));
+
+    expect(notices()!.map((n) => n.id)).toEqual(["n1"]);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("replaces the list rather than merging into it", () => {
+    // The event carries the whole open set, so a notice missing from it has
+    // been cleared — merging would leave it on screen forever.
+    queryClient.setQueryData(queryKeys.notices, [notice("n1"), notice("n2")]);
+
+    applyQueueEvent(queryClient, noticesEvent(notice("n3")));
+
+    expect(notices()!.map((n) => n.id)).toEqual(["n3"]);
+  });
+
+  it("empties the cache when the last notice clears", () => {
+    queryClient.setQueryData(queryKeys.notices, [notice("n1")]);
+
+    applyQueueEvent(queryClient, noticesEvent());
+
+    expect(notices()).toEqual([]);
+  });
+
+  it("keeps the well-formed entries and drops the rest", () => {
+    applyQueueEvent(queryClient, {
+      event: "notices",
+      job_id: null,
+      data: {
+        notices: [
+          { ...notice("n1"), level: "catastrophe" },
+          notice("n2"),
+          null,
+          "n3",
+        ],
+      },
+    });
+
+    expect(notices()!.map((n) => n.id)).toEqual(["n2"]);
+  });
+
+  it("ignores an event whose data carries no list", () => {
+    queryClient.setQueryData(queryKeys.notices, [notice("n1")]);
+
+    applyQueueEvent(queryClient, { event: "notices", job_id: null, data: {} });
+
+    expect(notices()!.map((n) => n.id)).toEqual(["n1"]);
+  });
+
+  it("survives a GET /notices that was already in flight", async () => {
+    // `useNotices` sets no staleTime, so a focus refetch can be out when a push
+    // arrives; its older answer must not land on top of the pushed one.
+    let settle!: (open: Notice[]) => void;
+    const inFlight = queryClient.fetchQuery({
+      queryKey: queryKeys.notices,
+      queryFn: () => new Promise<Notice[]>((resolve) => (settle = resolve)),
+    });
+    // fetchQuery rejects with a CancelledError once the push cancels it.
+    const held = inFlight.catch(() => undefined);
+
+    applyQueueEvent(queryClient, noticesEvent(notice("n1")));
+    settle([]);
+    await held;
+
+    expect(notices()!.map((n) => n.id)).toEqual(["n1"]);
+  });
+
+  it("does not touch the queue", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a")]);
+
+    applyQueueEvent(queryClient, noticesEvent(notice("n1")));
+
+    expect(queue()!.map((j) => j.id)).toEqual(["a"]);
+    expect(invalidated).toEqual([]);
+  });
+});
+
 describe("resyncAfterReconnect", () => {
-  it("invalidates both queries, since events were lost while it was down", () => {
+  it("invalidates every query, since events were lost while it was down", () => {
     resyncAfterReconnect(queryClient);
 
-    expect(invalidated).toEqual([queryKeys.queue, queryKeys.library]);
+    expect(invalidated).toEqual([
+      queryKeys.queue,
+      queryKeys.library,
+      queryKeys.notices,
+    ]);
   });
 });
 

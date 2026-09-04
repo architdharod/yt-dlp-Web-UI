@@ -7,6 +7,7 @@ import {
 } from "@/components/ui/tabs";
 import { DownloadTab } from "@/components/DownloadTab";
 import { LibraryTab } from "@/components/LibraryTab";
+import { NoticeBanner } from "@/components/NoticeBanner";
 import { TrashTab } from "@/components/TrashTab";
 import { useActiveJobCount } from "@/hooks/useQueueQuery";
 import { useQueueStream } from "@/hooks/useQueueStream";
@@ -24,6 +25,12 @@ export function App() {
 
   return (
     <div className="mx-auto flex h-dvh max-w-2xl flex-col gap-4 overflow-hidden p-4 sm:p-6">
+      {/*
+        Above the tabs, not inside one: a Navidrome or Lidarr problem is about
+        the whole library, and burying it in the tab that happens to be open
+        would hide it from the user who caused it.
+      */}
+      <NoticeBanner />
       <Tabs
         defaultValue="download"
         className="flex min-h-0 flex-1 flex-col gap-4"
