@@ -332,7 +332,7 @@ describe("addJobToCache", () => {
  * `queueQueryOptions`, with the response held open on a promise so the SSE
  * patch lands strictly between the request and its answer.
  */
-describe("reconciling a fetch that overlapped a drop", () => {
+describe("reconciling a fetch that overlapped a cache patch", () => {
   /** A client whose queue query answers with whatever `release` is called with. */
   function gatedClient() {
     const client = new QueryClient({
@@ -410,6 +410,72 @@ describe("reconciling a fetch that overlapped a drop", () => {
 
     expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
       ["a", "b"],
+    );
+  });
+
+  it("keeps a job submitted while the response was on the wire, at its freshest state", async () => {
+    const { client, release } = gatedClient();
+    client.setQueryData(queryKeys.queue, [job("a")]);
+
+    const { done: fetching } = await startFetch(client);
+    addJobToCache(client, job("b", "queued"));
+    // The stream then starts it, so the re-append must not replay the queued copy.
+    applyQueueEvent(client, event("status_change", "b", { status: "downloading" }));
+
+    // The server answered from before b existed.
+    release([job("a")]);
+    await fetching;
+
+    const jobs = client.getQueryData<Job[]>(queryKeys.queue)!;
+    expect(jobs.map((j) => j.id)).toEqual(["a", "b"]);
+    expect(jobs[1].status).toBe("downloading");
+  });
+
+  it("does not re-append a job that was added and then dropped", async () => {
+    const { client, release } = gatedClient();
+    client.setQueryData(queryKeys.queue, [job("a")]);
+
+    const { done: fetching } = await startFetch(client);
+    addJobToCache(client, job("b", "queued"));
+    removeJobFromCache(client, "b");
+
+    release([job("a"), job("b")]);
+    await fetching;
+
+    expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
+      ["a"],
+    );
+  });
+
+  it("does not duplicate an added job the response already lists", async () => {
+    const { client, release } = gatedClient();
+    client.setQueryData(queryKeys.queue, [job("a")]);
+
+    const { done: fetching } = await startFetch(client);
+    addJobToCache(client, job("b", "queued"));
+
+    release([job("a"), job("b", "queued")]);
+    await fetching;
+
+    expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
+      ["a", "b"],
+    );
+  });
+
+  it("forgets adds from before the request, so a finished job is not resurrected", async () => {
+    const { client, release } = gatedClient();
+    client.setQueryData(queryKeys.queue, [job("a")]);
+
+    // b is submitted first; the fetch leaves afterwards, so the server's answer
+    // is authoritative about b — here it has already finished and is omitted.
+    addJobToCache(client, job("b", "queued"));
+    const { done: fetching } = await startFetch(client);
+
+    release([job("a")]);
+    await fetching;
+
+    expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
+      ["a"],
     );
   });
 });

@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { ChevronRight } from "lucide-react";
 import type { LibraryView } from "@/lib/library";
 
@@ -16,10 +17,13 @@ export function LibraryBreadcrumb({
   crumbs,
   current,
   onNavigate,
+  children,
 }: {
   crumbs: readonly Crumb[];
   current: string;
   onNavigate: (view: LibraryView) => void;
+  /** Level actions (Rename, Move album) — the prototype puts them here. */
+  children?: ReactNode;
 }) {
   return (
     <nav
@@ -42,6 +46,9 @@ export function LibraryBreadcrumb({
       <span className="px-1 font-medium text-foreground" aria-current="page">
         {current}
       </span>
+      {children !== undefined && (
+        <span className="ml-auto flex items-center gap-1">{children}</span>
+      )}
     </nav>
   );
 }

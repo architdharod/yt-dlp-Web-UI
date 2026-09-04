@@ -1,9 +1,15 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LibraryTab } from "@/components/LibraryTab";
-import { getLibrary } from "@/lib/api";
+import { getLibrary, moveLibraryPath } from "@/lib/api";
 import {
   album,
   artist,
@@ -19,9 +25,11 @@ import type { LibraryResponse } from "@/lib/types";
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/api")>()),
   getLibrary: vi.fn(),
+  moveLibraryPath: vi.fn(),
 }));
 
 const getLibraryMock = vi.mocked(getLibrary);
+const moveMock = vi.mocked(moveLibraryPath);
 
 /** Mount the tab against a fresh client, leaving the mock to the caller. */
 function renderLibraryTab() {
@@ -58,6 +66,8 @@ async function openBonobo() {
 
 beforeEach(() => {
   getLibraryMock.mockReset();
+  moveMock.mockReset();
+  moveMock.mockResolvedValue({ moved: [], removed: [], destination: null });
 });
 
 describe("LibraryTab", () => {
@@ -427,5 +437,270 @@ describe("LibraryTab", () => {
     expect(screen.getByText("ARTIST")).toBeTruthy();
     // Repeated Vorbis comments are joined, so one tag stays one row.
     expect(screen.getByText("Bonobo, Andreya Triana")).toBeTruthy();
+  });
+});
+
+describe("LibraryTab selection and move", () => {
+  /** Open Bonobo, then Black Sands: the level where tracks are selectable. */
+  async function openBlackSands() {
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+  }
+
+  it("offers a Move action on every track row", async () => {
+    await openBlackSands();
+
+    expect(screen.getAllByRole("button", { name: "Move" })).toHaveLength(2);
+  });
+
+  it("counts the ticked tracks and offers to move them together", async () => {
+    await openBlackSands();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    expect(screen.getByText("1 track selected")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Kiara" }));
+    expect(screen.getByText("2 tracks selected")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Move selected" }));
+
+    expect(await screen.findByRole("dialog")).toBeTruthy();
+    expect(screen.getByText(/2 tracks from Bonobo · Black Sands/)).toBeTruthy();
+  });
+
+  it("unticking a track takes it back out of the selection", async () => {
+    await openBlackSands();
+
+    const prelude = screen.getByRole("checkbox", { name: "Select Prelude" });
+    fireEvent.click(prelude);
+    fireEvent.click(prelude);
+
+    expect(screen.queryByText(/selected/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Move selected" })).toBeNull();
+  });
+
+  it("clears the selection when the user leaves the folder", async () => {
+    await openBlackSands();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    expect(screen.getByText("1 track selected")).toBeTruthy();
+
+    click(/^Bonobo$/);
+    click(/Black Sands/);
+
+    expect(screen.queryByText("1 track selected")).toBeNull();
+  });
+
+  it("renames an artist from the breadcrumb row", async () => {
+    renderTab();
+    await openBonobo();
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+
+    expect(await screen.findByText("Rename artist")).toBeTruthy();
+    expect(screen.getByText(/Rename "Bonobo"/)).toBeTruthy();
+  });
+
+  it("offers no rename on the synthetic bucket, which is not a folder", async () => {
+    renderTab();
+    await screen.findByRole("button", { name: /Unknown Artist/ });
+    click(/Unknown Artist/);
+
+    expect(screen.queryByRole("button", { name: "Rename" })).toBeNull();
+  });
+
+  it("moves a whole album from the breadcrumb row", async () => {
+    await openBlackSands();
+
+    fireEvent.click(screen.getByRole("button", { name: "Move album" }));
+
+    expect(
+      await screen.findByText(/Album "Black Sands" \(2 tracks\) from Bonobo/),
+    ).toBeTruthy();
+  });
+
+  it("lets a Single be moved out of the artist page", async () => {
+    renderTab();
+    await openBonobo();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Cirrus" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move selected" }));
+
+    expect(await screen.findByText(/"Cirrus" from Bonobo · Singles/)).toBeTruthy();
+  });
+});
+
+/** An album whose files really sit in `Disc 1` / `Disc 2` subfolders. */
+function multiDiscLibrary(): LibraryResponse {
+  return library([
+    artist("Bonobo", [
+      album("Bonobo/Migration", [
+        track("Bonobo/Migration/Disc 1/Outer.flac", {
+          title: "Outer",
+          track_number: 1,
+          disc_number: 1,
+        }),
+        track("Bonobo/Migration/Disc 2/Kerala.flac", {
+          title: "Kerala",
+          track_number: 1,
+          disc_number: 2,
+        }),
+      ]),
+    ]),
+  ]);
+}
+
+describe("LibraryTab moving", () => {
+  /** Open the two-track Black Sands, where a selection can be made. */
+  async function openBlackSands() {
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+  }
+
+  /** Open Bonobo's flattened two-disc Migration. */
+  async function openMigration() {
+    renderTab(multiDiscLibrary());
+    await screen.findByRole("button", { name: /Bonobo/ });
+    click(/Bonobo/);
+    click(/Migration/);
+  }
+
+  /** Press the dialog's own submit button, not a row's Move action. */
+  async function submitDialog(name: string) {
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name }));
+  }
+
+  /** The text of the last breadcrumb, which is the level on screen. */
+  function currentCrumb(): string {
+    return document.querySelector('[aria-current="page"]')?.textContent ?? "";
+  }
+
+  it("keeps the selection when the move dialog is cancelled", async () => {
+    await openBlackSands();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move selected" }));
+    await submitDialog("Cancel");
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    // Cancelling the dialog undoes nothing the user did on the page.
+    expect(screen.getByText("1 track selected")).toBeTruthy();
+  });
+
+  it("clears the selection once the move goes through", async () => {
+    await openBlackSands();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    fireEvent.click(screen.getByRole("button", { name: "Move selected" }));
+    await submitDialog("Move");
+
+    await waitFor(() =>
+      expect(screen.queryByText("1 track selected")).toBeNull(),
+    );
+  });
+
+  it("keeps a same-folder selection when a second track is ticked", async () => {
+    await openBlackSands();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Kiara" }));
+
+    expect(screen.getByText("2 tracks selected")).toBeTruthy();
+  });
+
+  it("starts a new selection when a tick reaches into another disc folder", async () => {
+    await openMigration();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Outer" }));
+    expect(screen.getByText("1 track selected")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Kerala" }));
+    // Not 2: the two discs are two folders, and one move carries one folder.
+    expect(screen.getByText("1 track selected")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Move selected" }));
+    await submitDialog("Move");
+
+    await waitFor(() => expect(moveMock).toHaveBeenCalledTimes(1));
+    const { paths } = moveMock.mock.calls[0][0] as { paths: string[] };
+    expect(paths).toEqual(["Bonobo/Migration/Disc 2/Kerala.flac"]);
+    const parents = new Set(
+      paths.map((path) => path.slice(0, path.lastIndexOf("/"))),
+    );
+    expect(parents.size).toBe(1);
+  });
+
+  it("follows an artist through a rename instead of dropping to the root", async () => {
+    const renamed = libraryFixture();
+    renamed.artists[0] = {
+      ...renamed.artists[0],
+      name: "Bonobo (UK)",
+      path: "Bonobo (UK)",
+    };
+    getLibraryMock.mockResolvedValueOnce(libraryFixture());
+    getLibraryMock.mockResolvedValue(renamed);
+    moveMock.mockResolvedValue({
+      moved: [
+        {
+          from: "Bonobo/Black Sands/Prelude.flac",
+          to: "Bonobo (UK)/Black Sands/Prelude.flac",
+        },
+      ],
+      removed: [],
+      destination: "Bonobo (UK)",
+    });
+    renderLibraryTab();
+    await openBonobo();
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    fireEvent.change(await screen.findByLabelText(/^Artist$/), {
+      target: { value: "Bonobo (UK)" },
+    });
+    await submitDialog("Rename");
+
+    // The artist page under the new name, not the library root.
+    await waitFor(() => expect(currentCrumb()).toBe("Bonobo (UK)"));
+  });
+
+  it("follows an album move that reports a destination but moved no file", async () => {
+    // A merge into an existing folder where every track was already there and
+    // only sidecars were skipped: `moved` is empty, so the old derivation had
+    // nothing to go on, but `destination` still names the folder.
+    const merged = library([
+      artist("Bonobo (UK)", [
+        album("Bonobo (UK)/Black Sands (Remastered)", [
+          track("Bonobo (UK)/Black Sands (Remastered)/Prelude.flac", {
+            title: "Prelude",
+          }),
+        ]),
+      ]),
+    ]);
+    getLibraryMock.mockResolvedValueOnce(libraryFixture());
+    getLibraryMock.mockResolvedValue(merged);
+    moveMock.mockResolvedValue({
+      moved: [],
+      removed: [],
+      destination: "Bonobo (UK)/Black Sands (Remastered)",
+    });
+    renderLibraryTab();
+    await openBonobo();
+    click(/Black Sands/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Move album" }));
+    fireEvent.change(await screen.findByLabelText(/^Artist$/), {
+      target: { value: "Bonobo (UK)" },
+    });
+    fireEvent.change(await screen.findByLabelText(/^Album$/), {
+      target: { value: "Black Sands (Remastered)" },
+    });
+    await submitDialog("Move");
+
+    // The album page at its new home, not the library root.
+    await waitFor(() =>
+      expect(currentCrumb()).toBe("Black Sands (Remastered)"),
+    );
   });
 });

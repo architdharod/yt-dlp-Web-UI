@@ -145,3 +145,40 @@ export interface LibraryResponse {
   track_count: number;
   scanned_at: string;
 }
+
+/**
+ * Request body for `POST /library/move`.
+ *
+ * One shape covers the three moves: `paths` for tracks that share a folder,
+ * `path` for an album folder (moved to `artist`, optionally renamed by
+ * `album`) or an artist folder (renamed to `artist`). Exactly one of the two
+ * is sent. `album` blank or omitted means a loose Single, whose `ALBUM` tag
+ * the backend clears.
+ */
+export interface LibraryMoveRequest {
+  path?: string;
+  paths?: string[];
+  artist: string;
+  album?: string | null;
+}
+
+/** One file's old and new path, as `POST /library/move` reports it. */
+export interface MovedPath {
+  from: string;
+  to: string;
+}
+
+/**
+ * The `POST /library/move` response. `removed` are the folders the move
+ * emptied and the backend cleaned up.
+ *
+ * `destination` is the POSIX path, relative to `DOWNLOAD_PATH`, of the folder
+ * the album or artist now lives at — authoritative even when `moved` is empty,
+ * which happens for a merge into an existing folder where every file was
+ * skipped. It is null for track moves, which leave the browsed folder standing.
+ */
+export interface LibraryMoveResponse {
+  moved: MovedPath[];
+  removed: string[];
+  destination: string | null;
+}

@@ -6,7 +6,8 @@ Determines the output file path for a downloaded track following the pattern:
 Artist and album are resolved using a priority chain:
     1. User-provided values (if given)
     2. yt-dlp extracted metadata (fallback)
-    3. "Unknown Artist" / "Unknown Album" (final fallback)
+    3. "Unknown Artist" for the artist; no album at all (a loose Single) when
+       none is known
 
 Every path component is sanitised so that user- or site-supplied names can
 never escape ``DOWNLOAD_PATH`` (no separators, no ``..``, no absolute paths).
@@ -21,14 +22,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DOWNLOAD_PATH = "/data/music/downloads"
 FALLBACK_ARTIST = "Unknown Artist"
+
+# The album folder every earlier version filed an album-less download under.
+# Since Phase 6 such a download is a loose Single at ``Artist/<title>.flac``,
+# which is what the domain model calls it, so this name is no longer written --
+# it survives only so that the duplicate check can still recognise a track an
+# earlier version put at ``Artist/Unknown Album/<title>.flac`` and not fetch it
+# again.  Libraries written by an earlier version are left exactly as they are;
+# the move dialog is how they get tidied.
 FALLBACK_ALBUM = "Unknown Album"
-# Known divergence, deliberate until Phase 6: the library's domain model calls a
-# track with no album a loose Single and expects it at ``Artist/<title>.flac``,
-# but this writer still files album-less downloads under
-# ``Artist/Unknown Album/``.  The two are changed together in Phase 6, when the
-# move code lands and ``_already_in_library`` has to accept both the new
-# loose-Single path and the legacy ``Unknown Album`` one, so that libraries
-# written by an earlier version are not re-downloaded.
+
+# What "this track has no album" is spelled as throughout the move and download
+# code: the empty string, never None, so it can be joined into a path or
+# compared to a folder name without a special case at every call site.
+NO_ALBUM = ""
 
 # Scratch directory inside DOWNLOAD_PATH where yt-dlp writes everything
 # unfinished, and the directory Phase 7 moves deleted tracks into.  Both are
@@ -43,8 +50,9 @@ TRASH_DIRNAME = ".trash"
 # ``sanitize_filename`` leaves all of them alone, so we must not.  Compared
 # case-folded because the filesystem may well be case-insensitive.
 #
-# A leading dot on its own is fine: "...And You Will Know Us by the Trail of
-# Dead" is a real band.
+# Names that merely *begin* with a dot are not in here: they are not reserved,
+# they are hidden, and :func:`sanitize_component` strips the leading dots off
+# them rather than replacing the whole name with the fallback.
 _RESERVED_NAMES = {".", "..", TEMP_DIRNAME, TRASH_DIRNAME}
 
 
@@ -58,12 +66,22 @@ def sanitize_component(value: str, fallback: str) -> str:
     Path separators are replaced with look-alike characters by yt-dlp's
     ``sanitize_filename``; empty results and the reserved names it leaves
     untouched (see :data:`_RESERVED_NAMES`) fall back to *fallback*.
+
+    Leading dots are then stripped.  A leading dot hides the folder from
+    ``library._is_hidden``, from Navidrome and from Lidarr, so filing a
+    download under "...And You Will Know Us by the Trail of Dead" verbatim
+    would put it somewhere the user cannot see it in any of the three.  The
+    band keeps its name in the tags; only the folder loses the dots.
     """
     cleaned = sanitize_filename(value).strip()
     if not cleaned or cleaned.casefold() in _RESERVED_NAMES:
         logger.debug("Component %r is unsafe or empty, using fallback %r", value, fallback)
         return fallback
-    return cleaned
+    stripped = cleaned.lstrip(".").strip()
+    if not stripped:
+        logger.debug("Component %r is only dots, using fallback %r", value, fallback)
+        return fallback
+    return stripped
 
 
 def _resolve(
@@ -99,12 +117,17 @@ def resolve_artist_album(
     names the folders carry.  A FLAC whose ``ALBUMARTIST`` disagrees with the
     folder it sits in is what makes Navidrome and Lidarr file the same track
     twice, so both must come from one resolution and not be resolved twice.
+
+    The album is :data:`NO_ALBUM` when neither the user nor yt-dlp named one:
+    the track is a loose Single under the artist, gets no album folder and no
+    ``ALBUM`` tag, rather than being filed under an invented "Unknown Album".
     """
     artist = sanitize_component(
         _resolve("artist", user_artist, ytdlp_artist, FALLBACK_ARTIST), FALLBACK_ARTIST
     )
-    album = sanitize_component(
-        _resolve("album", user_album, ytdlp_album, FALLBACK_ALBUM), FALLBACK_ALBUM
+    resolved_album = _resolve("album", user_album, ytdlp_album, NO_ALBUM)
+    album = (
+        sanitize_component(resolved_album, NO_ALBUM) if resolved_album else NO_ALBUM
     )
     return artist, album
 
@@ -128,7 +151,9 @@ def get_output_path(
         download_path: Root download directory. Defaults to /data/music/downloads.
 
     Returns:
-        Path object: download_path / Artist / Album / track_filename
+        Path object: ``download_path / Artist / Album / track_filename``, or
+        ``download_path / Artist / track_filename`` when no album is known --
+        the loose Single the domain model expects at depth 2.
 
     Raises:
         UnsafePathError: If the resulting path would fall outside download_path.
@@ -139,7 +164,7 @@ def get_output_path(
     filename = sanitize_component(track_filename, "Unknown Title.flac")
 
     root = Path(download_path)
-    output = root / artist / album / filename
+    output = (root / artist / album / filename) if album else (root / artist / filename)
 
     # Belt and braces: even after sanitising, refuse anything that resolves
     # outside the download root.

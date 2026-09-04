@@ -6,10 +6,16 @@ Defines request/response schemas, job state model, and SSE event payloads.
 import ipaddress
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+)
 
 # Hosts (and their subdomains) that may be submitted for download.  The
 # backend also restricts yt-dlp's extractors, but rejecting at the API edge
@@ -115,6 +121,22 @@ class Job(BaseModel):
     kind: JobKind = Field(default=JobKind.DOWNLOAD, description="What this queue entry does")
     parent_id: str | None = Field(None, description="Id of the bulk parent this job belongs to")
     path: str | None = Field(None, description="Library path a tagging job targets (track or album)")
+    target_dir: str | None = Field(
+        None,
+        description=(
+            "The library folder this download will file into, POSIX and "
+            "relative to DOWNLOAD_PATH; None until it has been resolved"
+        ),
+    )
+    target_guessed: bool = Field(
+        default=False,
+        description=(
+            "Whether ``target_dir`` is only a guess: the metadata probe never "
+            "returned and the user named no artist, so the folder is the "
+            "'Unknown Artist' fallback rather than anywhere the download will "
+            "really land"
+        ),
+    )
     result_path: str | None = Field(None, description="Library path written once the download finished")
     attempts: int = Field(
         default=0,
@@ -295,3 +317,100 @@ class LibraryResponse(BaseModel):
     album_count: int = Field(..., description="Number of albums across all artists")
     track_count: int = Field(..., description="Number of tracks across all artists")
     scanned_at: str = Field(..., description="When this scan ran, ISO 8601 UTC")
+
+
+# Longest a folder name may be in a move request.  Not a filesystem limit (255
+# bytes per component is the common one) but a sanity bound: anything longer is
+# a paste accident, and the error is clearer here than from the kernel.
+MAX_FOLDER_NAME = 200
+
+# Bounds on the path list a move may carry.  A move is a UI gesture over one
+# folder, so a thousand tracks is already far past anything a user selects, and
+# 4096 is the usual PATH_MAX: past either the request is a paste accident or an
+# attempt to make the backend chew on megabytes of strings.
+MAX_PATH_LENGTH = 4096
+MAX_MOVE_PATHS = 1000
+
+
+class LibraryMoveRequest(BaseModel):
+    """Schema for POST /library/move.
+
+    One body covers the three moves the UX ticket defines, told apart by what
+    the caller sends and what is on disk:
+
+    * ``paths`` -- tracks sharing one folder, moved to ``artist`` and the
+      optional ``album``.  A blank ``album`` makes them loose Singles.
+    * ``path`` naming a folder at depth 2 -- an album, moved to ``artist``,
+      optionally renamed to ``album``, merging into a folder already there.
+    * ``path`` naming a folder at depth 1 -- an artist, renamed to ``artist``.
+
+    Library paths always travel in the body, never in a URL segment (domain
+    model), so a folder called ``AC/DC`` needs no encoding scheme of its own.
+    ``artist`` and ``album`` are *names*, not paths; the mover validates them
+    as single components and sanitises new ones.
+    """
+
+    path: str | None = Field(
+        None,
+        max_length=MAX_PATH_LENGTH,
+        description="The track, album, or artist to move, relative to DOWNLOAD_PATH",
+    )
+    paths: list[Annotated[str, StringConstraints(max_length=MAX_PATH_LENGTH)]] | None = (
+        Field(
+            None,
+            max_length=MAX_MOVE_PATHS,
+            description="Track paths to move, all from one folder; alternative to 'path'",
+        )
+    )
+    artist: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_FOLDER_NAME,
+        description="Destination artist folder name (created if new)",
+    )
+    album: str | None = Field(
+        None,
+        max_length=MAX_FOLDER_NAME,
+        description="Destination album folder name; blank or omitted means a loose Single",
+    )
+
+    @field_validator("paths")
+    @classmethod
+    def _check_paths(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and not value:
+            raise ValueError("paths must name at least one track")
+        return value
+
+
+class MovedPath(BaseModel):
+    """One file's old and new identity.
+
+    ``from`` is a Python keyword, so the field is ``source`` with an alias; the
+    route serialises by alias, which is what the API contract says.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    source: str = Field(..., alias="from")
+    target: str = Field(..., alias="to")
+
+
+class LibraryMoveResponse(BaseModel):
+    """Schema for POST /library/move.
+
+    ``removed`` are the folders the move emptied and cleaned up, so a client
+    can tell "the album is gone" from "the album is still there, minus a
+    track" without re-reading the tree.
+
+    ``destination`` is where the album or artist now lives, so the browser can
+    follow the thing it just moved instead of dropping the user back at a
+    folder that is no longer there.  ``None`` for a track move, whose tracks
+    went into a folder rather than being one, and for a no-op.
+    """
+
+    moved: list[MovedPath] = Field(default_factory=list)
+    removed: list[str] = Field(default_factory=list)
+    destination: str | None = Field(
+        default=None,
+        description="Where the moved album or artist now lives, relative POSIX",
+    )

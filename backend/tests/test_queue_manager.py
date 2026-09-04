@@ -38,6 +38,34 @@ from app.queue_manager import (
 # ---------------------------------------------------------------------------
 
 
+class _GatedAsyncio:
+    """`asyncio` as app.queue_manager sees it, with a gated `wait_for`.
+
+    The timeout path used to be provoked with a real 0.2 s timeout and a
+    thread that had to file its track first: an ordering that held only while
+    the machine was idle, and that a loaded CI box lost.  Standing in for the
+    module's `asyncio` reference makes the ordering explicit -- the test opens
+    the gate exactly when the track has been filed, and `wait_for` then
+    cancels the run and raises `TimeoutError` as the real one would.
+    """
+
+    def __init__(self, gate: asyncio.Event) -> None:
+        self._gate = gate
+
+    def __getattr__(self, name):
+        return getattr(asyncio, name)
+
+    async def wait_for(self, awaitable, timeout):
+        task = asyncio.ensure_future(awaitable)
+        await self._gate.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise asyncio.TimeoutError
+
+
 def _make_job(**overrides) -> Job:
     """Create a Job with sensible defaults, overriding any field.
 
@@ -180,7 +208,7 @@ class TestStateTransitionsHappyPath:
         events should be emitted via the on_event hook."""
         events = []
 
-        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             on_progress(25.0)
             on_progress(50.0)
             on_progress(100.0)
@@ -202,7 +230,7 @@ class TestStateTransitionsHappyPath:
     async def test_job_progress_updated_on_callback(self, mock_download):
         recorded_progresses = []
 
-        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             on_progress(42.0)
             recorded_progresses.append(job.progress)
             return "/data/music/Artist/Album/track.flac"
@@ -609,6 +637,53 @@ class TestRetryLogic:
 
         await _wait_for_job_status(qm, "job-1", JobStatus.DONE, timeout=5.0)
 
+    @patch("app.queue_manager.download_audio")
+    async def test_retry_keeps_the_resolved_target(self, mock_download):
+        """A retry keeps the destination the previous run resolved.
+
+        The re-run resolves from the same ``artist``/``album`` and overwrites
+        it through ``on_target`` before it creates anything, so the stored
+        answer is the best guess available.  Dropping it made the retried job
+        count as *unresolved*, and one unresolved job refuses every move in
+        the library with a 409 until it finally runs.
+        """
+        mock_download.side_effect = DownloadError("Fail")
+
+        qm = QueueManager(max_concurrent=2, timeout=10)
+        qm.add_job(_make_job(target_dir="Bonobo/Fragments"))
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.ERROR)
+        assert qm.get_job("job-1").target_dir == "Bonobo/Fragments"
+
+        assert qm.retry_job("job-1").target_dir == "Bonobo/Fragments"
+        assert qm.in_flight_library_targets().unresolved == 0
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_re_run_overwrites_the_kept_target(self, mock_download, tmp_path):
+        """The kept value is stale for no longer than the run takes to resolve."""
+        result = tmp_path / "out.flac"
+        result.write_text("flac")
+
+        runs: list[int] = []
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
+            runs.append(1)
+            if len(runs) == 1:
+                raise DownloadError("Fail")
+            on_target("Bonobo/Migration")
+            return str(result)
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=2, timeout=10)
+        qm.add_job(_make_job(target_dir="Bonobo/Fragments"))
+        await _wait_for_job_status(qm, "job-1", JobStatus.ERROR)
+
+        qm.retry_job("job-1")
+        await _wait_for_job_status(qm, "job-1", JobStatus.DONE)
+
+        assert qm.get_job("job-1").target_dir == "Bonobo/Migration"
+
     def test_retry_nonexistent_job_raises(self):
         qm = QueueManager(max_concurrent=2, timeout=10)
 
@@ -788,7 +863,7 @@ class TestPhaseReporting:
     async def test_converting_phase_emits_status_change(self, mock_download):
         events = []
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             on_progress(100.0)
             on_phase("converting")
             return "/data/music/Artist/Album/track.flac"
@@ -807,7 +882,7 @@ class TestPhaseReporting:
     async def test_metadata_phase_emits_metadata_event(self, mock_download):
         events = []
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             job.title = "Backfilled Title"
             job.duration = 99.0
             on_phase("metadata")
@@ -838,7 +913,7 @@ class TestProgressThrottling:
     async def test_only_whole_percent_changes_are_emitted(self, mock_download):
         events = []
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             on_progress(10.2)
             on_progress(10.7)
             on_progress(11.0)
@@ -858,7 +933,7 @@ class TestProgressThrottling:
     async def test_job_progress_still_tracks_every_callback(self, mock_download):
         """Throttling is about SSE traffic, not about the job's own state."""
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             on_progress(10.2)
             on_progress(10.7)
             return "/data/music/Artist/Album/track.flac"
@@ -891,7 +966,7 @@ class TestTimeoutCancellation:
         release = threading.Event()
         seen = {}
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(5)
             seen["cancelled"] = cancel.is_set()
             # A zombie thread must not be able to resurrect the job's progress.
@@ -934,7 +1009,7 @@ class TestRetryGuard:
 
         release = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(5)
             return "/data/music/Artist/Album/track.flac"
 
@@ -978,7 +1053,7 @@ class TestDuplicateUrls:
 
         release = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(5)
             return "/data/music/Artist/Album/track.flac"
 
@@ -1596,14 +1671,20 @@ class TestTimeoutDoesNotRaceTheDownloadThread:
     async def test_a_track_filed_before_the_verdict_is_taken_back_by_the_loop(
         self, mock_download, store, isolated_paths
     ):
-        """Ordering (a): the thread files, and only then does the timeout fire."""
+        """Ordering (a): the thread files, and only then does the timeout fire.
+
+        The ordering is enforced, not raced: the timeout is held open until the
+        run really has published its track, so the test says the same thing on
+        a loaded machine as on an idle one.
+        """
         download_dir, _ = isolated_paths
         result = download_dir / "Artist" / "Album" / "Title.flac"
         may_return = threading.Event()
         worker: dict[str, int] = {}
         callers: list[int] = []
+        gate = asyncio.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             worker["ident"] = threading.get_ident()
             result.parent.mkdir(parents=True, exist_ok=True)
             result.write_text("flac")
@@ -1617,8 +1698,23 @@ class TestTimeoutDoesNotRaceTheDownloadThread:
         mock_download.side_effect = fake
 
         qm = QueueManager(max_concurrent=1, timeout=0.2, store=store)
-        with patch("app.queue_manager.unfile_track", self._unfile_spy(callers)):
+        with (
+            patch("app.queue_manager.unfile_track", self._unfile_spy(callers)),
+            patch("app.queue_manager.asyncio", _GatedAsyncio(gate)),
+        ):
             qm.add_job(_make_job(id=self.JOB_ID))
+
+            # Wait for the thread's track to be published, then let the
+            # timeout fire -- ordering (a), with nothing left to the clock.
+            while True:
+                run = qm._active_runs.get(self.JOB_ID)
+                if run is not None:
+                    with run.lock:
+                        if run.filed is not None:
+                            break
+                await asyncio.sleep(0.01)
+            gate.set()
+
             await _wait_for_job_status(qm, self.JOB_ID, JobStatus.ERROR)
             while not callers:
                 await asyncio.sleep(0.01)
@@ -1639,7 +1735,7 @@ class TestTimeoutDoesNotRaceTheDownloadThread:
         worker: dict[str, int] = {}
         callers: list[int] = []
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             worker["ident"] = threading.get_ident()
             may_file.wait(5)  # released only once the job has already errored
             result.parent.mkdir(parents=True, exist_ok=True)
@@ -1673,7 +1769,7 @@ class TestTimeoutDoesNotRaceTheDownloadThread:
         may_file = threading.Event()
         callers: list[int] = []
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             may_file.wait(5)
             result.parent.mkdir(parents=True, exist_ok=True)
             result.write_text("flac")
@@ -1721,7 +1817,7 @@ class TestTerminalStatusIsAbsorbing:
         events: list[SSEEvent] = []
         reported = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             # The pre-check in on_phase reads the cancel flag a moment before it
             # acts on it; a stale False is what the download thread saw in the
             # real race, and pinning it here makes that instant reproducible.
@@ -1763,7 +1859,7 @@ class TestTerminalStatusIsAbsorbing:
         events: list[SSEEvent] = []
         reported = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             cancel.is_set = lambda: False
             while job.status != JobStatus.ERROR:
                 time.sleep(0.01)
@@ -1798,7 +1894,7 @@ def _files(result) -> "callable":
     for ``download_audio`` has to call ``on_filed`` like the real one.
     """
 
-    def fake(job, on_progress=None, cancel=None, on_phase=None, on_filed=None):
+    def fake(job, on_progress=None, cancel=None, on_phase=None, on_filed=None, on_target=None):
         path = Path(result)
         on_filed(FiledTrack(path, frozenset({path.parent, path.parent.parent})))
         return path
@@ -2040,7 +2136,7 @@ class TestCancelQueued:
         release = threading.Event()
         started: list[str] = []
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             started.append(job.id)
             release.wait(5)
             return "/data/music/Artist/Album/track.flac"
@@ -2113,7 +2209,7 @@ class TestCancelRunning:
 
         cancelled_seen = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             for _ in range(500):
                 if cancel.is_set():
                     cancelled_seen.set()
@@ -2184,7 +2280,7 @@ class TestCancelRunning:
 
         release = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(5)
             raise DownloadError("Download cancelled")
 
@@ -2207,7 +2303,7 @@ class TestCancelRunning:
 
         release = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             on_phase("converting")
             release.wait(5)
             raise DownloadError("Download cancelled")
@@ -2233,7 +2329,7 @@ class TestCancelRunning:
         temp_dir = download_dir / ".tmp" / "job-1"
         release = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             temp_dir.mkdir(parents=True, exist_ok=True)
             (temp_dir / "job-1.webm.part").write_text("half a download")
             release.wait(5)
@@ -2276,7 +2372,7 @@ class TestCancelRunning:
         filed = threading.Event()
         may_return = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             result.parent.mkdir(parents=True, exist_ok=True)
             result.write_bytes(b"flac")
             on_filed(FiledTrack(result, frozenset({result.parent})))
@@ -2378,7 +2474,7 @@ class TestTimeoutStopsTheConverter:
         release = threading.Event()
         seen = {}
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             on_phase("converting")
             # Real code is blocked in ffmpeg's communicate() here; the token is
             # what reaches into that and signals the process.
@@ -2411,7 +2507,7 @@ class TestTimeoutStopsTheConverter:
 
         stopped = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             while not cancel.is_set():
                 time.sleep(0.01)
             stopped.set()
@@ -2447,7 +2543,7 @@ class TestCancelDoesNotBlockTheEventLoop:
         registered = threading.Event()
         gate = threading.Event()  # never set: the fake encode hangs
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             process = FakeFfmpegProcess(
                 ["ffmpeg"], gate, 0, b"", ignore_terminate=True
             )
@@ -2486,7 +2582,7 @@ class TestCancelSurvivesARestart:
         download_dir, _ = isolated_paths
         release = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(5)  # the thread is still working when we "restart"
             raise DownloadError("Download cancelled")
 
@@ -2553,7 +2649,7 @@ class TestCancelSurvivesARestart:
         filed = threading.Event()
         may_return = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             result.parent.mkdir(parents=True, exist_ok=True)
             result.write_text("flac")
             on_filed(FiledTrack(result, frozenset({result.parent})))
@@ -2612,7 +2708,7 @@ class TestTimeoutWaitsForItsThread:
         release = threading.Event()
         started: list[str] = []
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             started.append(job.id)
             release.wait(5)  # ignores the cancel, like a wedged conversion
             return "/data/music/Artist/Album/track.flac"
@@ -2639,7 +2735,7 @@ class TestTimeoutWaitsForItsThread:
         """Bounded: one stuck thread must not close the queue for good."""
         release = threading.Event()
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(10)
             return "/data/music/Artist/Album/track.flac"
 
@@ -2666,7 +2762,7 @@ class TestTimeoutWaitsForItsThread:
             ThreadPoolExecutor(max_workers=1)
         )
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(10)  # the pool's only worker, and it ignores the cancel
             return "/data/music/Artist/Album/track.flac"
 
@@ -2748,7 +2844,7 @@ class TestLibraryChanged:
         """A fake download that files *relative* under the library root."""
         result = download_dir / relative
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             result.parent.mkdir(parents=True, exist_ok=True)
             result.write_text("flac")
             on_filed(
@@ -2803,7 +2899,7 @@ class TestLibraryChanged:
 
     @patch("app.queue_manager.download_audio")
     async def test_a_cancelled_job_changes_nothing(self, mock_download, store):
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             for _ in range(500):
                 if cancel.is_set():
                     raise DownloadError("Download cancelled")
@@ -2833,7 +2929,7 @@ class TestLibraryChanged:
         know, so the event goes out saying only that."""
         stray = tmp_path / "elsewhere" / "Title.flac"
 
-        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             stray.parent.mkdir(parents=True, exist_ok=True)
             stray.write_text("flac")
             on_filed(FiledTrack(stray, frozenset({stray.parent})))

@@ -25,6 +25,7 @@ import base64
 import hashlib
 import logging
 import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -172,6 +173,15 @@ class _CacheState:
     tag_reads: int = 0
     last_result: dict[str, Any] | None = None
     last_finished_at: float = 0.0
+    # Bumped by every invalidation (and by a root change).  A scan captures it
+    # before it walks and only publishes its result if it still matches, so a
+    # scan that was already under way when the tree changed cannot install a
+    # snapshot of the *old* tree over the invalidation that superseded it.
+    generation: int = 0
+    # The generation ``last_result`` was produced under, so a caller can tell a
+    # cached result that is genuinely current from one an invalidation has
+    # since retired.
+    last_generation: int = -1
 
 
 _state = _CacheState()
@@ -190,6 +200,7 @@ def invalidate() -> None:
         _state.entries.clear()
         _state.last_result = None
         _state.last_finished_at = 0.0
+        _state.generation += 1
 
 
 def tag_read_count() -> int:
@@ -750,6 +761,8 @@ def scan_library(root: Path | None = None) -> dict[str, Any]:
             _state.entries.clear()
             _state.last_result = None
             _state.last_finished_at = 0.0
+            _state.generation += 1
+        generation = _state.generation
 
     with _lock_scan:
         with _lock:
@@ -757,14 +770,33 @@ def scan_library(root: Path | None = None) -> dict[str, Any]:
                 _state.last_result is not None
                 and _state.root == key
                 and _state.last_finished_at > arrived
+                # An invalidation since that result was published retires it,
+                # however recently it finished: a rename leaves every file's
+                # size and mtime alone, so nothing else can notice.
+                and _state.last_generation == generation
             )
             if fresh:
                 return _state.last_result  # type: ignore[return-value]
         result = _scan(base)
         with _lock:
-            _state.last_result = result
-            _state.last_finished_at = time.monotonic()
-        return result
+            # Published only if nothing invalidated the cache while this scan
+            # was walking.  A stale result is still returned to *this* caller
+            # -- it is the tree as it was a moment ago, which is what any scan
+            # answers -- but it must not become the answer the next caller is
+            # handed, because the next caller would then never see the change.
+            publish = _state.generation == generation and _state.root == key
+            if publish:
+                _state.last_result = result
+                _state.last_finished_at = time.monotonic()
+                _state.last_generation = generation
+    if publish:
+        # Only after a scan that actually walked the tree and became the cached
+        # answer, and only in this thread, which the route already keeps off
+        # the event loop.  A scan served from the cache above returns without
+        # touching the disk cache; a superseded one must not prune against a
+        # tree that has already moved on.
+        prune_cover_cache(result)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -922,11 +954,25 @@ def _write_cache_atomically(target: Path, data: bytes) -> None:
 
     A half-written cover would be served as a truncated image forever, so the
     file only appears at its final name once every byte is on disk.
+
+    The temporary name comes from ``mkstemp``, so two threads (or two workers)
+    caching the same cover at once cannot share it -- a pid was not enough,
+    because both requests run in the same process.  Its ``tmp-`` prefix cannot
+    match :func:`_drop_stale_cache`'s ``<sha>-*`` glob either, so a concurrent
+    prune cannot delete the file out from under the rename.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
     try:
-        tmp.write_bytes(data)
+        handle, name = tempfile.mkstemp(
+            dir=target.parent, prefix="tmp-", suffix=".tmp"
+        )
+    except OSError as exc:
+        logger.warning("Could not cache cover %s: %s", target.name, exc)
+        return
+    tmp = Path(name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
         os.replace(tmp, target)
     except OSError as exc:
         logger.warning("Could not cache cover %s: %s", target.name, exc)
@@ -1043,6 +1089,74 @@ def get_album_cover(rel: str, root: Path | None = None, data_path: Path | None =
     _write_cache_atomically(directory / name, data)
     _drop_stale_cache(directory, prefix, name)
     return Cover(data, content_type, f'"{name}"')
+
+
+def prune_cover_cache(
+    payload: dict[str, Any], data_path: Path | None = None
+) -> int:
+    """Drop cached covers for albums that are no longer in the library.
+
+    A move or a delete leaves the cache holding art for a folder that has gone;
+    without this the directory only ever grows, one entry per album the user
+    ever reorganised.  Entries are named ``<sha256 of the album path>-<version>``,
+    which cannot be turned back into a path, so the live albums decide what
+    stays: every file whose prefix is not one of theirs goes.
+
+    Cheap on purpose -- one ``scandir`` of a flat directory and a set lookup per
+    entry -- and called from :func:`scan_library` only when a scan really
+    rebuilt, on the scan's own thread.  Returns how many files were removed.
+
+    Failures are logged and swallowed: a cover cache that could not be tidied
+    must never fail the request that was only asking for the tree.
+    """
+    directory = cover_cache_dir(
+        data_path if data_path is not None else _default_data_path()
+    )
+    if not directory.is_dir():
+        return 0
+
+    # A scan that found no artists at all is far more often an unmounted or
+    # unreadable root -- scan_library swallows the OSError and returns an empty
+    # tree -- than a library the user really emptied, and pruning on that would
+    # throw away every cached cover for a library that is still there.  The
+    # guard is on artists, not albums: a Singles-only library has no albums at
+    # all and its stale entries should still go.
+    artists = payload.get("artists") or []
+    if not artists:
+        return 0
+
+    live = {
+        _cache_key(album["path"])
+        for artist in artists
+        for album in artist.get("albums", [])
+    }
+
+    removed = 0
+    try:
+        for entry in os.scandir(directory):
+            if not entry.is_file():
+                continue
+            # A half-written cover another thread is about to rename into
+            # place.  It belongs to no album yet, so no prefix of ours can
+            # match it and it would always look stale.
+            if entry.name.startswith("tmp-"):
+                continue
+            prefix = entry.name.split("-", 1)[0]
+            if prefix in live:
+                continue
+            try:
+                os.unlink(entry.path)
+            except OSError as exc:  # pragma: no cover - defensive
+                logger.debug("Could not prune cover cache entry %s: %s", entry.name, exc)
+            else:
+                removed += 1
+    except OSError as exc:  # pragma: no cover - defensive
+        logger.debug("Could not read the cover cache directory: %s", exc)
+        return removed
+
+    if removed:
+        logger.info("Pruned %d cover cache entr(y/ies) for albums that are gone", removed)
+    return removed
 
 
 def _default_data_path() -> Path:

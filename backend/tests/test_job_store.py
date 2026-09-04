@@ -102,6 +102,8 @@ class TestSchema:
             "artist",
             "album",
             "path",
+            "target_dir",
+            "target_guessed",
             "result_path",
             "error",
             "attempts",
@@ -154,6 +156,51 @@ class TestSchema:
 
         with pytest.raises(JobStoreError, match="newer than this build"):
             JobStore(path)
+
+    def test_a_pre_release_database_missing_a_column_is_refused(self, tmp_path):
+        """Migration 1 is still edited in place, so an old file can lie.
+
+        A ``queue.db`` written before ``target_dir`` joined migration 1 records
+        ``user_version = 1`` and has nothing left to migrate, so it opens
+        cleanly and then fails deep inside ``load_active`` with an IndexError,
+        or inside ``upsert`` with an OperationalError -- a bare traceback at
+        boot.  The columns and the fix belong in the message instead.
+        """
+        path = tmp_path / "queue.db"
+        conn = sqlite3.connect(path)
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+                id            TEXT PRIMARY KEY,
+                kind          TEXT NOT NULL,
+                parent_id     TEXT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                status        TEXT NOT NULL,
+                url           TEXT,
+                title         TEXT,
+                thumbnail_url TEXT,
+                duration      REAL,
+                artist        TEXT,
+                album         TEXT,
+                path          TEXT,
+                result_path   TEXT,
+                error         TEXT,
+                attempts      INTEGER NOT NULL DEFAULT 0,
+                restart_attempts INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL,
+                finished_at   TEXT NULL
+            )
+            """
+        )
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(JobStoreError, match="target_dir") as caught:
+            JobStore(path)
+        assert "pre-release" in str(caught.value)
+        assert "delete the database" in str(caught.value).lower()
 
     def test_a_refused_database_does_not_leak_its_connection(self, tmp_path):
         """The refusal is a JobStoreError, which no sqlite3 handler catches."""

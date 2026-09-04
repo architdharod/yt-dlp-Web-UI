@@ -12,6 +12,8 @@ pictures onto it.  Nothing here needs ffmpeg or a checked-in binary.
 """
 
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -529,6 +531,71 @@ def test_cache_entries_for_deleted_files_are_evicted(library_root):
     assert len(library._state.entries) == before - 1
 
 
+def test_a_scan_that_invalidation_overtook_does_not_become_the_cached_answer(
+    library_root,
+):
+    """A scan of the old tree must not be published over a newer invalidation.
+
+    The window: a scan walks the tree, a move renames a folder and invalidates
+    the cache, and only *then* does the scan publish what it walked.  A second
+    reader that arrived in that window was handed the pre-move tree as a fresh
+    result -- and, because a rename leaves every file's size and mtime alone,
+    nothing else would ever have noticed.
+    """
+    real_scan = library._scan
+    walked = threading.Event()
+    release = threading.Event()
+
+    def blocking_scan(base):
+        result = real_scan(base)
+        walked.set()
+        assert release.wait(10)
+        return result
+
+    library._scan = blocking_scan
+    overtaken: list[dict] = []
+    second: list[dict] = []
+    try:
+        first = threading.Thread(
+            target=lambda: overtaken.append(library.scan_library(library_root))
+        )
+        first.start()
+        assert walked.wait(10)
+
+        # The move: the folder is renamed and the cache invalidated while the
+        # scan above is still holding the tree it walked before either.
+        (library_root / "Bonobo").rename(library_root / "Bonobo Renamed")
+        library.invalidate()
+
+        # The second reader arrives *before* the first scan publishes, which is
+        # the only ordering the bug needed: it blocks on the scan lock and then
+        # reads whatever the first scan left behind.
+        library._scan = real_scan
+        reader = threading.Thread(
+            target=lambda: second.append(library.scan_library(library_root))
+        )
+        reader.start()
+        key = str(library_root.resolve())
+        deadline = time.monotonic() + 10
+        while library._state.root != key and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert library._state.root == key
+
+        release.set()
+        first.join(10)
+        reader.join(10)
+    finally:
+        library._scan = real_scan
+        release.set()
+
+    # The overtaken scan still answers its own caller with the tree it walked
+    # -- that is what any scan does -- but it must not answer anybody else's.
+    assert "Bonobo" in {entry["name"] for entry in overtaken[0]["artists"]}
+    names = {entry["name"] for entry in second[0]["artists"]}
+    assert "Bonobo Renamed" in names
+    assert "Bonobo" not in names
+
+
 def test_invalidate_forces_a_full_re_read(library_root):
     scan(library_root)
     library.reset_tag_read_count()
@@ -810,6 +877,38 @@ def test_a_sidecar_only_cover_miss_opens_no_audio_files(
     assert response.status_code == 200
     assert response.content == TINY_JPEG
     assert opened == []
+
+
+def test_concurrent_writers_of_one_cover_all_succeed(tmp_path):
+    """Eight threads caching the same cover must not fight over the temp file.
+
+    The name used to be ``<target>.<pid>.tmp``, which every thread in one
+    process shares: the losers renamed a file the winner had already renamed
+    away, and one of them could publish a half-written image.
+    """
+    target = tmp_path / "covers" / "abc-1.jpg"
+    payload = b"\xff\xd8" + b"cover bytes" * 512
+    failures: list[BaseException] = []
+    start = threading.Barrier(8)
+
+    def write():
+        try:
+            start.wait(10)
+            library._write_cache_atomically(target, payload)
+        except BaseException as exc:  # pragma: no cover - reported below
+            failures.append(exc)
+
+    threads = [threading.Thread(target=write) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert failures == []
+    assert target.read_bytes() == payload
+    # Nothing left behind: every writer either renamed its temp file into
+    # place or removed it.
+    assert sorted(entry.name for entry in target.parent.iterdir()) == [target.name]
 
 
 def test_cover_cache_files_land_under_data_path(client, isolated_paths, library_root):

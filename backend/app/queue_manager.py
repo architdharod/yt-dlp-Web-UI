@@ -76,7 +76,7 @@ from app.downloader import (
 )
 from app.file_organizer import DEFAULT_DOWNLOAD_PATH
 from app.job_store import JobStore
-from app.models import Job, JobStatus, SSEEvent
+from app.models import Job, JobKind, JobStatus, SSEEvent
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +133,27 @@ def _env_int(name: str, default: int) -> int:
     """
     raw = os.environ.get(name)
     return int(raw) if raw else default
+
+
+@dataclass(frozen=True)
+class InFlightTargets:
+    """Where the running downloads are going, and how many will not say yet.
+
+    ``targets`` are the library folders (artist, and artist/album when the job
+    has an album) that in-flight jobs will write into; ``unresolved`` is how
+    many in-flight jobs have not resolved a destination yet.  The two travel
+    together because a caller that only looked at ``targets`` would read an
+    unresolved job as "aiming nowhere" and happily rename the folder it is
+    about to land in.
+    """
+
+    targets: list[str]
+    unresolved: int
+    # One short label per unresolved job -- its title, or its id while the
+    # probe has not returned one -- so the 409 can name the download the user
+    # is being asked to wait for instead of leaving them to guess at a queue
+    # that may be several jobs deep.
+    unresolved_jobs: list[str] = field(default_factory=list)
 
 
 class QueueError(Exception):
@@ -273,6 +294,63 @@ class QueueManager:
                 return job
         return None
 
+    def in_flight_library_targets(self) -> InFlightTargets:
+        """The library folders in-flight jobs are going to write into.
+
+        Read off ``Job.target_dir``, the folder the job resolved for itself:
+        one entry for the artist folder and, when the job has an album, a
+        second for the album folder, as POSIX paths relative to
+        ``DOWNLOAD_PATH``.  ``target_dir`` is set at submit time from the
+        user's names plus the probe's metadata and rewritten by the download
+        thread the moment it has resolved the real one, so this is the folder
+        a running download will actually create rather than a second guess at
+        it -- guessing from ``job.artist`` alone answered "Unknown Artist" for
+        every job the user did not name an artist for, while the file landed
+        under whatever yt-dlp said.
+
+        ``unresolved`` counts the in-flight downloads whose ``target_dir`` is
+        either missing or still the submit-time guess, and ``unresolved_jobs``
+        names them.  Their destination is
+        genuinely unknown, so the only safe answer for a caller about to change
+        the tree is "not yet" -- see :func:`~app.mover.move_library_entry`,
+        which turns a non-zero count into a 409 that says which download it is
+        waiting for.
+
+        The library's move and delete routes refuse to touch a folder that
+        appears here: a download that lands in a folder renamed out from under
+        it leaves a track the user cannot find.
+        """
+        targets: list[str] = []
+        unresolved_jobs: list[str] = []
+        for job in self._jobs.values():
+            if job.status not in _IN_FLIGHT:
+                continue
+            # Only downloads create folders in the library.  A bulk parent and
+            # a tagging job never write a new path, so neither is a destination
+            # anybody has to wait for -- and a tagging job has no
+            # ``target_dir`` at all, which would otherwise make every tagging
+            # run refuse every move.
+            if job.kind is not JobKind.DOWNLOAD:
+                continue
+            # A guessed target is no better than no target: it is the
+            # "Unknown Artist" fallback, and the download will land somewhere
+            # else entirely once the download thread has probed.  Naming that
+            # folder in ``targets`` would guard the wrong one and leave the
+            # real one unguarded.
+            if not job.target_dir or job.target_guessed:
+                unresolved_jobs.append(job.title or job.url or job.id)
+                continue
+            artist = job.target_dir.split("/")[0]
+            if artist not in targets:
+                targets.append(artist)
+            if job.target_dir not in targets:
+                targets.append(job.target_dir)
+        return InFlightTargets(
+            targets=targets,
+            unresolved=len(unresolved_jobs),
+            unresolved_jobs=unresolved_jobs,
+        )
+
     def get_jobs(self) -> list[Job]:
         """Return the in-flight and errored jobs, ordered by insertion.
 
@@ -334,6 +412,14 @@ class QueueManager:
         # other reason first; a job the user has just asked to run again is not
         # a job the user has asked to stop.
         job.cancel_requested = False
+        # ``target_dir`` and ``target_guessed`` are deliberately left as they
+        # are.  It was resolved from
+        # the same ``artist``/``album`` this re-run will resolve from again
+        # (neither is ever mutated), and ``on_target`` overwrites it before the
+        # run creates any folder -- so the stored answer is the best guess
+        # available and guarding it costs nothing.  Nulling it made every
+        # retried job count as unresolved, which refused *every* move with a
+        # 409 until the job finally ran.
         self._persist(job)
         self._emit_event("status_change", job)
 
@@ -515,6 +601,11 @@ class QueueManager:
             job.status = JobStatus.QUEUED
             job.error = None
             job.progress = 0.0
+            # ``target_dir`` and ``target_guessed`` are kept, as they are on a
+            # manual retry: the next run
+            # resolves from the same inputs and ``on_target`` overwrites it
+            # before anything is created, while dropping it would make the job
+            # unresolved and block every move until it ran.
         job.finished_at = None
         self._persist(job)
 
@@ -728,6 +819,24 @@ class QueueManager:
                 self._persist(job)
                 self._emit_event("metadata", job)
 
+        def on_target(target_dir: str) -> None:
+            """Record the folder this run has resolved as its destination.
+
+            Persisted but not announced: ``target_dir`` is a stored column the
+            in-flight guard reads, and nothing in the UI shows it, so an SSE
+            event would be noise.  Same shape as the ``metadata`` phase hook --
+            write the row, say nothing.
+
+            ``target_guessed`` clears with it: this is the download thread's
+            own answer, resolved from yt-dlp's metadata, so the folder is where
+            the track is really going and no longer the submit-time fallback.
+            """
+            if job.status in _TERMINAL:
+                return
+            job.target_dir = target_dir
+            job.target_guessed = False
+            self._persist(job)
+
         def note_filed(track: FiledTrack) -> None:
             """Publish the move to the event loop, or undo it if it is too late.
 
@@ -764,6 +873,7 @@ class QueueManager:
                     cancel=run.cancel,
                     on_phase=on_phase,
                     on_filed=note_filed,
+                    on_target=on_target,
                 )
             finally:
                 # Cleanup belongs to the thread that owns the temp directory:

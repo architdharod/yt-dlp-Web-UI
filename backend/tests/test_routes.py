@@ -168,6 +168,100 @@ class TestPostDownload:
         assert data["album"] == "Greatest Hits"
 
     @patch("app.main.extract_metadata")
+    def test_submit_records_the_folder_the_job_will_land_in(
+        self, mock_extract, client_and_qm
+    ):
+        """The move guard reads ``target_dir``, so it exists from submit on.
+
+        yt-dlp's artist is what most downloads are filed under -- nobody types
+        one -- so the guard has to know it before the download thread starts,
+        not after.
+        """
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata(artist="Blender", album="Deep")
+
+        resp = client.post("/download", json={"url": "https://youtube.com/watch?v=abc"})
+
+        assert resp.status_code == 200
+        assert qm.get_job(resp.json()["id"]).target_dir == "Blender/Deep"
+
+    @patch("app.main.extract_metadata")
+    def test_a_job_with_no_album_targets_the_artist_folder_alone(
+        self, mock_extract, client_and_qm
+    ):
+        """No album is a loose Single: the artist folder and nothing below it."""
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata(artist="Blender", album=None)
+
+        resp = client.post("/download", json={"url": "https://youtube.com/watch?v=abc"})
+
+        assert qm.get_job(resp.json()["id"]).target_dir == "Blender"
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_a_probe_that_failed_and_no_typed_artist_makes_the_target_a_guess(
+        self, mock_extract, mock_download, client_and_qm, isolated_paths
+    ):
+        """"Unknown Artist" is not a destination, and must not guard one.
+
+        With no probe and nothing typed, ``target_dir`` is the fallback while
+        the download thread will file the track under whatever yt-dlp says.
+        Guarding the fallback folder leaves the real one unguarded, so the job
+        counts as unresolved instead and every move waits for it.
+        """
+        client, qm = client_and_qm
+        download_dir, _ = isolated_paths
+        (download_dir / "Bonobo").mkdir(parents=True, exist_ok=True)
+        mock_extract.side_effect = DownloadError("no probe")
+        release = threading.Event()
+        mock_download.side_effect = _blocking_download(release)
+
+        try:
+            resp = client.post("/download", json={"url": "https://youtube.com/watch?v=a"})
+            job = qm.get_job(resp.json()["id"])
+
+            assert job.target_dir == "Unknown Artist"
+            assert job.target_guessed is True
+
+            in_flight = qm.in_flight_library_targets()
+            assert in_flight.targets == []
+            assert in_flight.unresolved == 1
+
+            move = client.post(
+                "/library/move", json={"path": "Bonobo", "artist": "Bonobo (UK)"}
+            )
+            assert move.status_code == 409
+            # Named by url: the probe never returned a title to call it by.
+            assert move.json()["detail"]["conflicts"] == [
+                "https://youtube.com/watch?v=a"
+            ]
+        finally:
+            release.set()
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_a_typed_artist_is_a_real_target_even_when_the_probe_failed(
+        self, mock_extract, mock_download, client_and_qm
+    ):
+        """The user's own name is not a guess: nothing can overrule it."""
+        client, qm = client_and_qm
+        mock_extract.side_effect = DownloadError("no probe")
+        release = threading.Event()
+        mock_download.side_effect = _blocking_download(release)
+
+        try:
+            resp = client.post(
+                "/download",
+                json={"url": "https://youtube.com/watch?v=a", "artist": "Lone"},
+            )
+            job = qm.get_job(resp.json()["id"])
+
+            assert job.target_guessed is False
+            assert qm.in_flight_library_targets().targets == ["Lone"]
+        finally:
+            release.set()
+
+    @patch("app.main.extract_metadata")
     def test_submit_creates_job_in_queue(self, mock_extract, client_and_qm):
         client, qm = client_and_qm
         mock_extract.return_value = _make_metadata()
@@ -758,7 +852,7 @@ class TestDuplicateSubmission:
 
         release = threading.Event()
 
-        def blocking_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def blocking_download(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(5)
             return "/data/music/output.flac"
 
@@ -1258,7 +1352,7 @@ class TestCancelEndpoint:
         mock_extract.return_value = _make_metadata()
         release = threading.Event()
 
-        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None, on_target=None):
             release.wait(timeout=5)
             raise DownloadError("Download cancelled")
 
@@ -1354,3 +1448,35 @@ class TestDismissEndpoint:
         client.post(f"/queue/{job.id}/dismiss")
 
         assert qm._store.get(job.id) is None
+
+
+def test_a_queue_event_whose_handling_raises_is_logged(client, caplog):
+    """Nothing awaits the scheduled coroutine, so it has to log for itself.
+
+    Without the done-callback an exception in ``_handle_event`` vanished into
+    a future nobody read: the rescan simply never happened and no line said so.
+    """
+    import app.main as main_module
+
+    class ExplodingHook:
+        def notify(self, paths):
+            raise RuntimeError("boom")
+
+    original = main_module.rescan_hook
+    main_module.rescan_hook = ExplodingHook()
+    try:
+        with caplog.at_level(logging.ERROR, logger="app.main"):
+            main_module._on_queue_event(
+                SSEEvent(event="library_changed", data={"paths": ["Bonobo"]})
+            )
+            deadline = time.time() + 5
+            while (
+                "Handling a queue event failed" not in caplog.text
+                and time.time() < deadline
+            ):
+                time.sleep(0.01)
+    finally:
+        main_module.rescan_hook = original
+
+    assert "Handling a queue event failed" in caplog.text
+    assert "boom" in caplog.text

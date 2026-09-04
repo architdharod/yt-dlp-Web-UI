@@ -29,6 +29,7 @@ from app.downloader import (
     _YtDlpLogger,
     TrackMetadata,
     _make_progress_hook,
+    _missing_output_dirs,
     _run_ffmpeg,
     _terminate_process,
     download_audio,
@@ -1315,6 +1316,78 @@ class TestFfmpegConversion:
 # ===========================================================================
 
 
+class TestAlbumLessDownloadsAreLooseSingles:
+    """A track no source named an album for lands at ``Artist/<title>.flac``.
+
+    The domain model calls that a loose Single; earlier versions filed it under
+    an invented ``Unknown Album`` folder, and the duplicate check still has to
+    recognise a library written that way.
+    """
+
+    NO_ALBUM_INFO = {key: value for key, value in SAMPLE_INFO.items() if key != "album"}
+
+    @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_it_lands_directly_under_the_artist(
+        self, mock_ydl_cls, mock_sanitize, tmp_path
+    ):
+        _install_ydl_mocks(mock_ydl_cls, info=self.NO_ALBUM_INFO)
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            result = download_audio(_make_job(artist="A"))
+
+        assert result == tmp_path / "A" / "My Cool Track.flac"
+        assert not (tmp_path / "A" / "Unknown Album").exists()
+
+    @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_it_gets_no_album_tag(self, mock_ydl_cls, mock_sanitize, tmp_path):
+        _install_ydl_mocks(mock_ydl_cls, info=self.NO_ALBUM_INFO)
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            result = download_audio(_make_job(artist="A"))
+
+        tags = FLAC(result)
+        assert "ALBUM" not in tags
+        assert tags["ALBUMARTIST"] == ["A"]
+
+    @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_the_legacy_unknown_album_copy_still_counts_as_a_duplicate(
+        self, mock_ydl_cls, mock_sanitize, tmp_path
+    ):
+        _install_ydl_mocks(mock_ydl_cls, info=self.NO_ALBUM_INFO)
+        legacy = tmp_path / "A" / "Unknown Album" / "My Cool Track.flac"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_bytes(b"OLD")
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            with pytest.raises(DownloadError) as excinfo:
+                download_audio(_make_job(artist="A"))
+
+        assert str(excinfo.value) == (
+            ALREADY_IN_LIBRARY_PREFIX + "A/Unknown Album/My Cool Track.flac"
+        )
+        assert legacy.read_bytes() == b"OLD"
+        assert not (tmp_path / "A" / "My Cool Track.flac").exists()
+
+    @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_a_legacy_copy_under_another_album_is_not_a_duplicate(
+        self, mock_ydl_cls, mock_sanitize, tmp_path
+    ):
+        """Only the ``Unknown Album`` twin counts; a real album is a real album."""
+        _install_ydl_mocks(mock_ydl_cls, info=self.NO_ALBUM_INFO)
+        other = tmp_path / "A" / "Some Album" / "My Cool Track.flac"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"OLD")
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            result = download_audio(_make_job(artist="A"))
+
+        assert result == tmp_path / "A" / "My Cool Track.flac"
+
+
 class TestTagging:
     """What ends up in the finished FLAC's Vorbis comments and PICTURE block."""
 
@@ -1871,3 +1944,32 @@ class TestFiledTrack:
         unfile_track(FiledTrack(album / "Track.flac", frozenset({album})))
 
         assert album.is_dir()
+
+
+class TestMissingOutputDirs:
+    """The library root is never a directory the cleanup may remove."""
+
+    def test_the_root_is_never_recorded_as_created(self, tmp_path):
+        """A loose Single's grandparent *is* the root, existing or not.
+
+        On a first run into an empty volume the root does not exist yet, and
+        recording it here would let one failed download ``rmdir`` the whole
+        library root.
+        """
+        root = tmp_path / "not-yet-there"
+        output = root / "Lone" / "Airglow.flac"
+
+        created = _missing_output_dirs(output, str(root))
+
+        assert created == frozenset({root / "Lone"})
+
+    def test_an_album_records_both_folders_it_has_to_create(self, tmp_path):
+        root = tmp_path / "music"
+        root.mkdir()
+        output = root / "Lone" / "Reality Testing" / "Airglow.flac"
+
+        created = _missing_output_dirs(output, str(root))
+
+        assert created == frozenset(
+            {root / "Lone", root / "Lone" / "Reality Testing"}
+        )

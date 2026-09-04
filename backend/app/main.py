@@ -5,6 +5,7 @@ Defines all API routes:
   - POST /download       -- submit a URL for download
   - GET  /library        -- the DOWNLOAD_PATH tree as artists, albums, tracks
   - GET  /library/cover  -- cover art for one album
+  - POST /library/move   -- move tracks or an album, or rename an artist
   - GET  /notices        -- open Navidrome/Lidarr problems worth showing
   - GET  /queue          -- list in-flight and errored jobs
   - GET  /queue/stream   -- SSE stream of job events
@@ -14,6 +15,7 @@ Defines all API routes:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import uuid
@@ -26,20 +28,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from app.downloader import DownloadError, extract_metadata
-from app.file_organizer import DEFAULT_DOWNLOAD_PATH
+from app.file_organizer import DEFAULT_DOWNLOAD_PATH, resolve_artist_album
 from app.job_store import JobStore, get_data_path, get_db_path
 from app.library import (
     LibraryNotFound,
     LibraryPathError,
     get_album_cover,
     get_download_path,
+    invalidate as library_invalidate,
     scan_library,
 )
+from app.mover import LIBRARY_WRITE_LOCK, LibraryConflict, move_library_entry
 from app.models import (
     DownloadRequest,
     HealthResponse,
     Job,
+    LibraryMoveRequest,
+    LibraryMoveResponse,
     LibraryResponse,
+    MovedPath,
     Notice,
     SSEEvent,
 )
@@ -162,10 +169,29 @@ def _on_queue_event(event: SSEEvent) -> None:
     if _loop is None or _loop.is_closed():
         return
     try:
-        asyncio.run_coroutine_threadsafe(_handle_event(event), _loop)
+        future = asyncio.run_coroutine_threadsafe(_handle_event(event), _loop)
     except RuntimeError:
         # Loop was closed between the check and the call — nothing to do.
+        return
+    # Nothing awaits this future, so without a callback an exception inside
+    # ``_handle_event`` -- a rescan hook that raised, a broadcast that failed --
+    # would be swallowed by asyncio and surface only as "exception was never
+    # retrieved" at garbage-collection time, if at all.
+    future.add_done_callback(_log_event_failure)
+
+
+def _log_event_failure(future: concurrent.futures.Future) -> None:
+    """Log whatever handling a queue event raised.
+
+    Cancellation is not a failure: the loop shutting down cancels what it has
+    not run yet, and that is the normal end of a session.
+    """
+    try:
+        future.result()
+    except concurrent.futures.CancelledError:
         pass
+    except Exception:
+        logger.exception("Handling a queue event failed")
 
 
 def _on_notices_changed(notices: list[Notice]) -> None:
@@ -402,6 +428,10 @@ async def submit_download(request: DownloadRequest) -> Job:
     title = None
     thumbnail_url = None
     duration = None
+    ytdlp_artist = None
+    ytdlp_album = None
+    # Whether the probe really answered, as opposed to timing out or failing.
+    probed = False
 
     try:
         metadata = await asyncio.wait_for(
@@ -411,6 +441,9 @@ async def submit_download(request: DownloadRequest) -> Job:
         title = metadata.title
         thumbnail_url = metadata.thumbnail_url
         duration = metadata.duration
+        ytdlp_artist = metadata.artist
+        ytdlp_album = metadata.album
+        probed = True
     except asyncio.TimeoutError:
         logger.warning(
             "Metadata extraction timed out after %ss, enqueuing job anyway",
@@ -418,6 +451,23 @@ async def submit_download(request: DownloadRequest) -> Job:
         )
     except DownloadError as exc:
         logger.warning("Metadata extraction failed, enqueuing job anyway: %s", exc)
+
+    # Resolved here, from the same function the downloader uses, so the queue
+    # can say where this job is going the moment it is queued.  The download
+    # thread republishes it once it has yt-dlp's own answer; until then this is
+    # the best one available, and it is what the move guard reads.  A blank
+    # album is a loose Single (file_organizer.NO_ALBUM), which is the artist
+    # folder and nothing below it.
+    artist, album = resolve_artist_album(
+        request.artist, request.album, ytdlp_artist, ytdlp_album
+    )
+    # When the probe never returned and the user named no artist, the folder
+    # above is not a destination at all -- it is ``Unknown Artist``, the
+    # fallback, while the download thread will file the track under whatever
+    # yt-dlp says once it has looked.  Recorded as a guess so the move guard
+    # treats this job as "has not said where it is going" rather than pinning
+    # a folder that will almost certainly not be the one.
+    target_guessed = not (probed or bool(request.artist and request.artist.strip()))
 
     job = Job(
         id=str(uuid.uuid4()),
@@ -427,6 +477,8 @@ async def submit_download(request: DownloadRequest) -> Job:
         duration=duration,
         artist=request.artist,
         album=request.album,
+        target_dir=f"{artist}/{album}" if album else artist,
+        target_guessed=target_guessed,
     )
 
     try:
@@ -627,3 +679,71 @@ async def get_library_cover(
         # with 304 means it costs headers rather than an image.
         return Response(status_code=304, headers=headers)
     return Response(content=cover.data, media_type=cover.content_type, headers=headers)
+
+
+@app.post("/library/move", response_model=LibraryMoveResponse)
+async def move_library_path(request: LibraryMoveRequest) -> LibraryMoveResponse:
+    """Move tracks, move an album to another artist, or rename an artist.
+
+    All-or-nothing: a target that is occupied refuses the whole request with
+    409 and the list of conflicting paths, and nothing on disk has moved. The
+    same 409 covers the in-flight guard -- a download already aiming at one of
+    the folders involved -- because both mean "not now, here is what is in the
+    way", and the dialog shows them the same.
+
+    The filesystem work runs in a thread under one library-wide lock, so a
+    second move (or, from phase 7, a delete) can never slip between another's
+    collision check and its renames.
+    """
+    async with LIBRARY_WRITE_LOCK:
+        # Read inside the lock, on the event-loop thread where the queue's
+        # dicts are only ever mutated: a snapshot taken before the lock could
+        # have been overtaken by a job that resolved its destination while an
+        # earlier move held it, and this move would then not see it at all.
+        in_flight = queue_manager.in_flight_library_targets()
+
+        try:
+            outcome = await asyncio.to_thread(
+                move_library_entry,
+                root=get_download_path(),
+                artist=request.artist,
+                album=request.album,
+                path=request.path,
+                paths=request.paths,
+                in_flight=in_flight.targets,
+                unresolved=in_flight.unresolved,
+                unresolved_jobs=in_flight.unresolved_jobs,
+            )
+        except LibraryPathError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except LibraryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except LibraryConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": exc.message, "conflicts": exc.conflicts},
+            ) from exc
+        except OSError as exc:
+            logger.exception("Move failed")
+            raise HTTPException(
+                status_code=500, detail=f"The move failed: {exc.strerror or exc}"
+            ) from exc
+
+        # Inside the lock: the next writer's collision check must not run
+        # against a scan cache that still describes the tree we just changed.
+        # A rename leaves every file's size and mtime alone, so the mtime-keyed
+        # cache cannot notice this on its own.
+        if outcome.changed:
+            await asyncio.to_thread(library_invalidate)
+
+    if outcome.changed:
+        # One event for the whole move: it invalidates the library query in
+        # every open tab and feeds the debounced Navidrome/Lidarr rescan with
+        # the folders on both ends.
+        queue_manager.emit_library_changed(outcome.changed)
+
+    return LibraryMoveResponse(
+        moved=[MovedPath(source=item["from"], target=item["to"]) for item in outcome.moved],
+        removed=outcome.removed,
+        destination=outcome.destination,
+    )

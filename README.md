@@ -13,7 +13,8 @@ This is a project for educational purpose, to learn the usage of the library yt-
 3. The job enters an async queue and runs a three-stage pipeline: yt-dlp fetches the best audio stream and the
    thumbnail (no postprocessing), an ffmpeg subprocess of ours converts that stream to FLAC, and Mutagen writes the
    tags, the cover art, and the `SOURCEID`/`SOURCEURL` fields that record where the track came from.
-4. Files are saved to `DOWNLOAD_PATH/Artist/Album/track.flac`, falling back to "Unknown Artist"/"Unknown Album" when metadata isn't available.
+4. Files are saved to `DOWNLOAD_PATH/Artist/Album/track.flac`, falling back to "Unknown Artist" when no artist is
+   known. A track with no album is a Single and lands at `DOWNLOAD_PATH/Artist/track.flac` with no `ALBUM` tag.
 Real-time progress is streamed to the browser via Server-Sent Events — no polling. The UI is split into tabs:
 **Download** (the form and the in-flight queue, with a badge counting the jobs still working) and **Library**, with a
 **Trash** tab that appears once something is in it.
@@ -22,6 +23,16 @@ Queue rows carry two actions. **Cancel** stops a job that is queued, downloading
 own process, so it is killed rather than waited out, and every partial and temporary file is removed. Cancelled jobs
 leave the queue and are not retried — resubmit the URL instead. **Dismiss** removes a failed job, which is otherwise
 kept until you have seen it.
+
+### Move and rename
+
+Anything filed in the wrong place can be moved from the Library tab: tick tracks and use **Move selected**, use
+**Move** on a single row, **Move album** to hand an album to another artist, or **Rename** an artist. The dialog's
+Artist and Album fields suggest what the library already has and accept a new name, which creates the folder;
+leaving Album blank files the track loose under the artist as a Single. A move rewrites `ALBUMARTIST`, `ARTIST` and
+`ALBUM` to match the new folders and leaves every other tag alone, folders left without audio are removed, and a
+move is all-or-nothing — if anything is already in the way the whole move is refused and the conflicting paths are
+listed in the dialog.
 
 ## Architecture
 
@@ -188,6 +199,6 @@ matter:
 - **Single tracks only** — playlist and channel URLs are rejected with an error; only the single track behind a URL is ever downloaded.
 - **YouTube and SoundCloud only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com` and their subdomains, and rejects everything else with a validation error. No Spotify, Bandcamp, or other sources.
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
-- **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced.
+- **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced. A move onto an occupied path is refused the same way.
 - **No authentication** — designed for private/internal networks.
 - **FLAC only** — lossy sources are losslessly wrapped in FLAC for consistent output.

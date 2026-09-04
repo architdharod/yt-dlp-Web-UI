@@ -3,7 +3,12 @@
 Covers all combinations of the artist/album priority chain:
     1. User-provided values
     2. yt-dlp metadata fallback
-    3. "Unknown Artist" / "Unknown Album" final fallback
+    3. "Unknown Artist" for the artist; no album at all for the album
+
+A track nobody named an album for is a loose Single at ``Artist/<title>.flac``
+(domain model), not a track under an invented "Unknown Album" folder, so the
+album half of the chain ends in :data:`NO_ALBUM` and the path is one component
+shorter.
 """
 
 from pathlib import Path
@@ -12,8 +17,8 @@ import pytest
 
 from app.file_organizer import (
     DEFAULT_DOWNLOAD_PATH,
-    FALLBACK_ALBUM,
     FALLBACK_ARTIST,
+    NO_ALBUM,
     get_output_path,
     resolve_artist_album,
 )
@@ -78,13 +83,13 @@ class TestYtdlpFallback:
         )
         assert result == Path(DOWNLOAD) / "Radiohead" / "OK Computer" / TRACK
 
-    def test_ytdlp_artist_only_album_fallback(self):
+    def test_ytdlp_artist_only_is_a_loose_single(self):
         result = get_output_path(
             TRACK,
             ytdlp_artist="Radiohead",
             download_path=DOWNLOAD,
         )
-        assert result == Path(DOWNLOAD) / "Radiohead" / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / "Radiohead" / TRACK
 
     def test_ytdlp_album_only_artist_fallback(self):
         result = get_output_path(
@@ -96,11 +101,11 @@ class TestYtdlpFallback:
 
 
 class TestFullFallback:
-    """Falls back to Unknown Artist / Unknown Album when nothing is provided."""
+    """Falls back to Unknown Artist, and to a loose Single, when nothing is given."""
 
     def test_no_metadata_at_all(self):
         result = get_output_path(TRACK, download_path=DOWNLOAD)
-        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / TRACK
 
     def test_all_none_explicitly(self):
         result = get_output_path(
@@ -111,7 +116,7 @@ class TestFullFallback:
             ytdlp_album=None,
             download_path=DOWNLOAD,
         )
-        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / TRACK
 
 
 class TestEmptyAndWhitespaceHandling:
@@ -124,7 +129,7 @@ class TestEmptyAndWhitespaceHandling:
             ytdlp_artist="Radiohead",
             download_path=DOWNLOAD,
         )
-        assert result == Path(DOWNLOAD) / "Radiohead" / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / "Radiohead" / TRACK
 
     def test_whitespace_user_artist_falls_back_to_ytdlp(self):
         result = get_output_path(
@@ -133,7 +138,7 @@ class TestEmptyAndWhitespaceHandling:
             ytdlp_artist="Radiohead",
             download_path=DOWNLOAD,
         )
-        assert result == Path(DOWNLOAD) / "Radiohead" / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / "Radiohead" / TRACK
 
     def test_empty_user_album_falls_back_to_ytdlp(self):
         result = get_output_path(
@@ -160,7 +165,7 @@ class TestEmptyAndWhitespaceHandling:
             ytdlp_album="",
             download_path=DOWNLOAD,
         )
-        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / TRACK
 
     def test_whitespace_ytdlp_values_fall_back_to_unknown(self):
         result = get_output_path(
@@ -169,7 +174,7 @@ class TestEmptyAndWhitespaceHandling:
             ytdlp_album="  \n  ",
             download_path=DOWNLOAD,
         )
-        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / TRACK
 
     def test_empty_user_and_ytdlp_both_fall_back(self):
         result = get_output_path(
@@ -180,7 +185,7 @@ class TestEmptyAndWhitespaceHandling:
             ytdlp_album="",
             download_path=DOWNLOAD,
         )
-        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / FALLBACK_ALBUM / TRACK
+        assert result == Path(DOWNLOAD) / FALLBACK_ARTIST / TRACK
 
     def test_whitespace_values_are_stripped(self):
         """Leading/trailing whitespace is stripped from valid values."""
@@ -229,14 +234,13 @@ class TestOutputStructure:
         result = get_output_path(TRACK, download_path=DOWNLOAD)
         assert isinstance(result, Path)
 
-    def test_fallback_path_still_has_correct_structure(self):
-        """Even with all fallbacks, structure is maintained."""
+    def test_fallback_path_is_a_loose_single_under_the_fallback_artist(self):
+        """With no album anywhere, the track sits directly under the artist."""
         result = get_output_path(TRACK, download_path=DOWNLOAD)
         relative = result.relative_to(DOWNLOAD)
-        assert len(relative.parts) == 3
+        assert len(relative.parts) == 2
         assert relative.parts[0] == FALLBACK_ARTIST
-        assert relative.parts[1] == FALLBACK_ALBUM
-        assert relative.parts[2] == TRACK
+        assert relative.parts[1] == TRACK
 
     def test_preserves_track_filename(self):
         """The track filename is passed through as-is."""
@@ -260,7 +264,8 @@ class TestPathTraversalIsImpossible:
 
     def _assert_contained(self, result: Path) -> None:
         relative = result.relative_to(DOWNLOAD)
-        assert len(relative.parts) == 3
+        # Three components under an album, two for a loose Single.
+        assert len(relative.parts) in (2, 3)
         assert ".." not in relative.parts
         assert "." not in relative.parts
         assert not any(part.startswith("/") for part in relative.parts)
@@ -278,21 +283,23 @@ class TestPathTraversalIsImpossible:
 
     def test_bare_parent_artist_falls_back(self):
         result = get_output_path(TRACK, user_artist="..", download_path=DOWNLOAD)
-        assert result.parts[-3] == FALLBACK_ARTIST
+        assert result.parts[-2] == FALLBACK_ARTIST
         self._assert_contained(result)
 
     def test_bare_dot_artist_falls_back(self):
         result = get_output_path(TRACK, user_artist=".", download_path=DOWNLOAD)
-        assert result.parts[-3] == FALLBACK_ARTIST
+        assert result.parts[-2] == FALLBACK_ARTIST
         self._assert_contained(result)
 
-    def test_bare_parent_album_falls_back(self):
+    def test_bare_parent_album_becomes_no_album_at_all(self):
         result = get_output_path(TRACK, user_album="..", download_path=DOWNLOAD)
-        assert result.parts[-2] == FALLBACK_ALBUM
+        assert result.relative_to(DOWNLOAD).parts == (FALLBACK_ARTIST, TRACK)
         self._assert_contained(result)
 
     def test_separator_becomes_a_single_component(self):
-        result = get_output_path(TRACK, user_artist="a/b", download_path=DOWNLOAD)
+        result = get_output_path(
+            TRACK, user_artist="a/b", user_album="Album", download_path=DOWNLOAD
+        )
         relative = result.relative_to(DOWNLOAD)
         assert len(relative.parts) == 3
         assert "/" not in relative.parts[0]
@@ -307,7 +314,7 @@ class TestPathTraversalIsImpossible:
             ytdlp_album="..",
             download_path=DOWNLOAD,
         )
-        assert result.parts[-2] == FALLBACK_ALBUM
+        assert result.relative_to(DOWNLOAD).parts[-1] == TRACK
         self._assert_contained(result)
 
     def test_parent_filename_falls_back(self):
@@ -333,20 +340,31 @@ class TestHousekeepingDirectoriesAreReserved:
     @pytest.mark.parametrize("name", [".tmp", ".TMP", ".Tmp", ".trash", ".TRASH"])
     def test_reserved_artist_falls_back(self, name):
         result = get_output_path(TRACK, user_artist=name, download_path=DOWNLOAD)
-        assert result.parts[-3] == FALLBACK_ARTIST
+        assert result.parts[-2] == FALLBACK_ARTIST
 
     @pytest.mark.parametrize("name", [".tmp", ".TMP", ".trash"])
-    def test_reserved_album_falls_back(self, name):
+    def test_reserved_album_leaves_the_track_loose(self, name):
         result = get_output_path(
             TRACK, user_artist="A", user_album=name, download_path=DOWNLOAD
         )
-        assert result.parts[-2] == FALLBACK_ALBUM
+        assert result.relative_to(DOWNLOAD).parts == ("A", TRACK)
 
-    def test_a_leading_dot_is_otherwise_fine(self):
-        """"...And You Will Know Us by the Trail of Dead" is a real band."""
+    def test_a_leading_dot_is_stripped_from_the_folder_name(self):
+        """"...And You Will Know Us by the Trail of Dead" is a real band.
+
+        Its name is kept, but not its leading dots: a dot-prefixed folder is
+        hidden from the scanner, from Navidrome and from Lidarr, so filing the
+        download verbatim would put it where the user cannot see it in any of
+        the three.  The tags still carry the band's name in full.
+        """
         artist = "...And You Will Know Us by the Trail of Dead"
         result = get_output_path(TRACK, user_artist=artist, download_path=DOWNLOAD)
-        assert result.parts[-3] == artist
+        assert result.parts[-2] == "And You Will Know Us by the Trail of Dead"
+
+    def test_a_name_of_nothing_but_dots_falls_back(self):
+        """Stripping the dots off "...." leaves nothing to name a folder."""
+        result = get_output_path(TRACK, user_artist="....", download_path=DOWNLOAD)
+        assert result.parts[-2] == FALLBACK_ARTIST
 
 
 # ===========================================================================
@@ -380,10 +398,10 @@ class TestResolveArtistAlbum:
         ) == ("Mine", "Ours")
 
     def test_missing_values_fall_back(self):
-        assert resolve_artist_album() == (FALLBACK_ARTIST, FALLBACK_ALBUM)
+        assert resolve_artist_album() == (FALLBACK_ARTIST, NO_ALBUM)
 
     def test_names_are_sanitised_the_same_way_the_folders_are(self):
         artist, album = resolve_artist_album(user_artist="AC/DC", user_album="..")
 
         assert "/" not in artist
-        assert album == FALLBACK_ALBUM
+        assert album == NO_ALBUM

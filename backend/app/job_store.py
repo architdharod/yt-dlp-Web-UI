@@ -58,6 +58,8 @@ _COLUMNS: tuple[str, ...] = (
     "artist",
     "album",
     "path",
+    "target_dir",
+    "target_guessed",
     "result_path",
     "error",
     "attempts",
@@ -71,9 +73,13 @@ _COLUMNS: tuple[str, ...] = (
 # Each entry is one schema version: the statements that take the database from
 # version N-1 to version N.  Never edit an entry that has shipped; append a new
 # one instead.  Migration 1 is Phase 1's schema and has not shipped yet, so it
-# is still being edited in place -- Phase 2 added `cancel_requested` to it
-# rather than appending a migration; from the first release onwards it is
-# frozen.  The full column set is created in migration 1 even though later
+# is still being edited in place -- Phase 2 added `cancel_requested` and
+# Phase 6 added `target_dir` and `target_guessed` to it rather than appending a
+# migration; from the
+# first release onwards it is frozen.  A file written by an earlier
+# pre-release build therefore claims to be at version 1 while missing those
+# columns, which `_migrate` catches at open rather than letting it surface as
+# an IndexError three calls later.  The full column set is created in migration 1 even though later
 # phases (bulk parents, tagging jobs) are what fill most of it in -- adding
 # columns later would mean a migration per phase for no benefit.
 _MIGRATIONS: tuple[tuple[str, ...], ...] = (
@@ -91,6 +97,8 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
             artist        TEXT,
             album         TEXT,
             path          TEXT,
+            target_dir    TEXT,
+            target_guessed INTEGER NOT NULL DEFAULT 0,
             result_path   TEXT,
             error         TEXT,
             attempts      INTEGER NOT NULL DEFAULT 0,
@@ -220,6 +228,32 @@ class JobStore:
                 raise
             self._conn.execute("COMMIT")
 
+        self._check_columns()
+
+    def _check_columns(self) -> None:
+        """Refuse a database whose ``jobs`` table is missing a column.
+
+        Migration 1 is still edited in place while the app is unreleased, so a
+        ``queue.db`` written by an earlier pre-release build opens cleanly --
+        ``user_version`` is 1, and no migration has anything to add -- and then
+        fails deep inside :meth:`load_active` with an ``IndexError`` on the
+        missing key, or inside :meth:`upsert` with an ``OperationalError``,
+        crashing the boot with a bare traceback nobody can act on.  Naming the
+        columns and the fix here turns that into one clear sentence.
+        """
+        present = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")
+        }
+        missing = [column for column in _COLUMNS if column not in present]
+        if missing:
+            raise JobStoreError(
+                f"Job database {self._db_path} is missing the column(s) "
+                f"{', '.join(missing)}.  It was written by an earlier "
+                "pre-release build of this app, whose schema is not "
+                "upgradeable.  Delete the database and start again "
+                "(docker volume rm music-for-arr-data), then restart."
+            )
+
     @property
     def schema_version(self) -> int:
         """Return the ``user_version`` currently recorded in the database.
@@ -253,6 +287,8 @@ class JobStore:
             job.artist,
             job.album,
             job.path,
+            job.target_dir,
+            int(job.target_guessed),
             job.result_path,
             job.error,
             job.attempts,
@@ -282,6 +318,8 @@ class JobStore:
             artist=row["artist"],
             album=row["album"],
             path=row["path"],
+            target_dir=row["target_dir"],
+            target_guessed=bool(row["target_guessed"]),
             result_path=row["result_path"],
             error=row["error"],
             attempts=row["attempts"],

@@ -2,6 +2,8 @@ import type {
   DownloadRequest,
   Job,
   LibraryAlbum,
+  LibraryMoveRequest,
+  LibraryMoveResponse,
   LibraryResponse,
   Notice,
   SSEEvent,
@@ -16,37 +18,53 @@ import type {
  */
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
 
+/** `JSON.parse` that answers null for a body that was not JSON at all. */
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Extract a human-readable message from an error response body.
+ * Extract a human-readable message from an already-read error body.
  *
  * FastAPI returns `{"detail": "..."}` for HTTPException and
  * `{"detail": [{"msg": "...", ...}, ...]}` for request validation errors (422).
+ * Anything else falls back to *fallback*, which callers set to the status text.
+ *
+ * It takes the parsed body rather than the `Response` because a body can only
+ * be read once: a caller that has already looked at the body for a shape of
+ * its own — `moveLibraryPath` and its 409 conflicts — would otherwise get
+ * "body already read" here and report the bare status.
  */
-async function parseErrorDetail(res: Response): Promise<string> {
-  try {
-    const body: unknown = await res.json();
-    if (body && typeof body === "object" && "detail" in body) {
-      const detail = (body as { detail: unknown }).detail;
-      if (typeof detail === "string" && detail.trim().length > 0) {
-        return detail;
-      }
-      if (Array.isArray(detail)) {
-        const messages = detail
-          .map((item) =>
-            item &&
-            typeof item === "object" &&
-            typeof (item as { msg?: unknown }).msg === "string"
-              ? (item as { msg: string }).msg
-              : null,
-          )
-          .filter((msg): msg is string => msg !== null);
-        if (messages.length > 0) return messages.join("; ");
-      }
+function errorDetail(body: unknown, fallback: string): string {
+  if (body && typeof body === "object" && "detail" in body) {
+    const detail = (body as { detail: unknown }).detail;
+    if (typeof detail === "string" && detail.trim().length > 0) {
+      return detail;
     }
-  } catch {
-    // Body was not JSON — fall through to the status text.
+    if (Array.isArray(detail)) {
+      const messages = detail
+        .map((item) =>
+          item &&
+          typeof item === "object" &&
+          typeof (item as { msg?: unknown }).msg === "string"
+            ? (item as { msg: string }).msg
+            : null,
+        )
+        .filter((msg): msg is string => msg !== null);
+      if (messages.length > 0) return messages.join("; ");
+    }
   }
-  return res.statusText;
+  return fallback;
+}
+
+/** The message for an error response whose body nobody has read yet. */
+async function parseErrorDetail(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  return errorDetail(parseJson(text), res.statusText);
 }
 
 /**
@@ -209,6 +227,11 @@ export function connectQueueStream(
   ];
   for (const eventType of eventTypes) {
     eventSource.addEventListener(eventType, (e: MessageEvent) => {
+      // EventSource's own connection "error" event is dispatched on the same
+      // target and reaches these listeners as a plain Event with no `data`.
+      // `JSON.parse(undefined)` would throw into the catch below, which is
+      // harmless but hides nothing useful; bail out explicitly instead.
+      if (typeof e.data !== "string") return;
       try {
         const parsed = JSON.parse(e.data) as SSEEvent;
         onEvent(parsed);
@@ -229,4 +252,76 @@ export function connectQueueStream(
   return () => {
     eventSource.close();
   };
+}
+
+/**
+ * A move the backend refused because something is already in the way.
+ *
+ * `conflicts` are the target paths that are occupied — every one of them, so
+ * the dialog can show the whole list rather than making the user discover them
+ * one retry at a time. An in-flight download aiming at one of the folders
+ * involved arrives as the same 409 with the folder as its one conflict.
+ */
+export class LibraryMoveConflict extends Error {
+  readonly conflicts: string[];
+
+  constructor(message: string, conflicts: string[]) {
+    super(message);
+    this.name = "LibraryMoveConflict";
+    this.conflicts = conflicts;
+  }
+}
+
+/**
+ * Read the structured 409 body `{"detail": {"message", "conflicts"}}`.
+ * Returns null for any other shape, so an unexpected body falls through to the
+ * plain error path instead of rendering an empty conflict list.
+ */
+function parseConflict(body: unknown): LibraryMoveConflict | null {
+  if (body === null || typeof body !== "object" || !("detail" in body)) {
+    return null;
+  }
+  const detail = (body as { detail: unknown }).detail;
+  if (detail === null || typeof detail !== "object") return null;
+  const { message, conflicts } = detail as {
+    message?: unknown;
+    conflicts?: unknown;
+  };
+  if (typeof message !== "string" || !Array.isArray(conflicts)) return null;
+  return new LibraryMoveConflict(
+    message,
+    conflicts.filter((item): item is string => typeof item === "string"),
+  );
+}
+
+/**
+ * Move tracks, move an album to another artist, or rename an artist.
+ *
+ * Paths travel in the body, never in the URL: a folder called "AC/DC" is a
+ * perfectly good library path and would need an encoding scheme of its own in
+ * a URL segment. A 409 throws a `LibraryMoveConflict` carrying the occupied
+ * paths; every other failure throws a plain Error with the backend's message.
+ */
+export async function moveLibraryPath(
+  request: LibraryMoveRequest,
+): Promise<LibraryMoveResponse> {
+  const res = await fetch(`${API_BASE_URL}/library/move`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+
+  if (!res.ok) {
+    // Read once: a 409 whose body is not the conflict shape still has to
+    // produce a message, and a second read of the same body would throw.
+    const text = await res.text().catch(() => "");
+    const body = parseJson(text);
+    if (res.status === 409) {
+      const conflict = parseConflict(body);
+      if (conflict !== null) throw conflict;
+    }
+    throw new Error(errorDetail(body, res.statusText));
+  }
+
+  return res.json() as Promise<LibraryMoveResponse>;
 }

@@ -39,6 +39,7 @@ from mutagen.id3 import PictureType
 
 from app.file_organizer import (
     DEFAULT_DOWNLOAD_PATH,
+    FALLBACK_ALBUM,
     TEMP_DIRNAME,
     UnsafePathError,
     get_output_path,
@@ -156,11 +157,20 @@ _TOPIC_SUFFIX = " - Topic"
 
 @dataclass
 class TrackMetadata:
-    """Metadata extracted from a URL before downloading."""
+    """Metadata extracted from a URL before downloading.
+
+    ``artist`` and ``album`` are what yt-dlp reported, unresolved and
+    unsanitised: the caller feeds them to
+    :func:`~app.file_organizer.resolve_artist_album` together with whatever the
+    user typed, so that the folder a job is going to land in is known the moment
+    it is queued rather than only once the download thread starts.
+    """
 
     title: str
     thumbnail_url: str | None
     duration: float | None
+    artist: str | None = None
+    album: str | None = None
 
 
 class DownloadError(Exception):
@@ -360,6 +370,8 @@ def extract_metadata(url: str) -> TrackMetadata:
         title=info.get("title") or "Unknown Title",
         thumbnail_url=info.get("thumbnail"),
         duration=info.get("duration"),
+        artist=_pick_artist(info),
+        album=info.get("album"),
     )
     logger.info(
         "Metadata extracted: title=%r, duration=%s, has_thumbnail=%s",
@@ -851,8 +863,11 @@ def _write_tags(
         "TITLE": title,
         "ARTIST": artist,
         "ALBUMARTIST": artist,
-        "ALBUM": album,
     }
+    # A loose Single has no album folder and gets no ``ALBUM`` tag: an invented
+    # one is what makes Navidrome show a shelf full of one-track albums.
+    if album:
+        tags["ALBUM"] = album
     source_id = _source_id(info)
     if source_id:
         tags["SOURCEID"] = source_id
@@ -885,6 +900,27 @@ def _write_tags(
     )
 
 
+def _legacy_single_path(output_path: Path, download_path: str) -> Path | None:
+    """Where an earlier version would have filed this loose Single.
+
+    Album-less downloads used to land at ``Artist/Unknown Album/<title>.flac``
+    and now land at ``Artist/<title>.flac``.  A library written before that
+    change still holds the old path, and re-downloading a track the user
+    already has is exactly what the duplicate check exists to prevent, so the
+    check looks in both places.
+
+    Returns None for anything that is not a loose Single -- a track filed under
+    a real album folder has no legacy twin.
+    """
+    try:
+        relative = output_path.relative_to(Path(download_path))
+    except ValueError:  # pragma: no cover - get_output_path guarantees this
+        return None
+    if len(relative.parts) != 2:
+        return None
+    return output_path.parent / FALLBACK_ALBUM / output_path.name
+
+
 def _already_in_library(output_path: Path, download_path: str) -> None:
     """Raise if *output_path* is already occupied by a file in the library.
 
@@ -904,12 +940,16 @@ def _already_in_library(output_path: Path, download_path: str) -> None:
     Raises:
         DownloadError: If the target file exists.
     """
-    if not output_path.exists():
-        return
+    occupied = output_path
+    if not occupied.exists():
+        legacy = _legacy_single_path(output_path, download_path)
+        if legacy is None or not legacy.exists():
+            return
+        occupied = legacy
     try:
-        relative = output_path.relative_to(Path(download_path)).as_posix()
+        relative = occupied.relative_to(Path(download_path)).as_posix()
     except ValueError:  # pragma: no cover - get_output_path guarantees this
-        relative = output_path.name
+        relative = occupied.name
     logger.info("Skipping download: %s is already in the library", relative)
     raise DownloadError(f"{ALREADY_IN_LIBRARY_PREFIX}{relative}")
 
@@ -936,16 +976,23 @@ def _remove_empty_output_dirs(output_path: Path, created_only: frozenset[Path]) 
             return
 
 
-def _missing_output_dirs(output_path: Path) -> frozenset[Path]:
+def _missing_output_dirs(output_path: Path, download_path: str | Path) -> frozenset[Path]:
     """Return which of *output_path*'s album/artist directories do not exist yet.
 
     Sampled before the download starts, so the failure path can tell the
     directories this run would have created from ones that were already there.
+
+    The library root is never one of them, however it started out.  A loose
+    Single is ``<root>/Artist/track.flac``, so ``output_path.parent.parent`` is
+    the root itself -- and on a first run into an empty volume the root does
+    not exist yet, which would put it in the candidate set and let the cleanup
+    ``rmdir`` the whole library root after one failed download.
     """
+    root = Path(download_path)
     return frozenset(
         directory
         for directory in (output_path.parent, output_path.parent.parent)
-        if not directory.exists()
+        if directory != root and not directory.exists()
     )
 
 
@@ -990,6 +1037,7 @@ def download_audio(
     cancel: CancelToken | None = None,
     on_phase: Callable[[str], None] | None = None,
     on_filed: Callable[[FiledTrack], None] | None = None,
+    on_target: Callable[[str], None] | None = None,
 ) -> Path:
     """Run the download pipeline for *job* and return the finished FLAC's path.
 
@@ -1009,6 +1057,12 @@ def download_audio(
         on_phase: Optional callback invoked with ``"metadata"`` once the job's
             metadata fields have been filled in, and ``"converting"`` just
             before ffmpeg is started.
+        on_target: Optional callback invoked with the library folder this run
+            has resolved as its destination (POSIX, relative to
+            ``DOWNLOAD_PATH``), before anything is created.  This is the
+            authoritative answer -- yt-dlp's artist and album are only known
+            here -- and the in-flight guard reads it, so it is published before
+            the first mkdir rather than after the download.
         on_filed: Optional callback invoked with a :class:`FiledTrack` the
             moment the finished file joins the library.  It carries the
             directories this run created as well as the path, which is what a
@@ -1097,6 +1151,13 @@ def download_audio(
         job.artist, job.album, ytdlp_artist, ytdlp_album
     )
 
+    # Published before the scratch directory, the download and every mkdir:
+    # the in-flight guard has to know where this job is going before anything
+    # of it exists on disk, otherwise a move could rename the folder out from
+    # under a download whose destination nobody could name yet.
+    if on_target is not None:
+        on_target(f"{tag_artist}/{tag_album}" if tag_album else tag_artist)
+
     logger.info("Output file path: %s", output_path)
 
     # Cheap check first: nothing has been fetched yet, so a track that is
@@ -1105,7 +1166,7 @@ def download_audio(
 
     # Sampled before anything is created so the failure path can tell "we made
     # this empty folder" from "the user's empty folder" (or a concurrent job's).
-    would_create = _missing_output_dirs(output_path)
+    would_create = _missing_output_dirs(output_path, download_path)
 
     # Nothing unfinished may be written into the library, so yt-dlp gets a
     # per-job scratch directory and we move the finished file out ourselves.

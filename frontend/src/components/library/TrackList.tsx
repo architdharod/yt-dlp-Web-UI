@@ -2,9 +2,29 @@ import { Fragment, useRef } from "react";
 import { AlertTriangle } from "lucide-react";
 import { TrackDetailPopover } from "@/components/library/TrackDetailPopover";
 import { Badge } from "@/components/ui/badge";
-import { formatDuration } from "@/lib/format";
+import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { formatDuration, plural } from "@/lib/format";
 import type { LibraryTrack } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+/**
+ * The multi-select and Move affordances a track list may be given.
+ *
+ * All optional: the Singles list on an artist page and the album's track list
+ * both get them, but a list rendered somewhere read-only simply leaves them
+ * out rather than passing no-ops.
+ */
+export interface TrackListActions {
+  /** Paths of the selected tracks in this list. */
+  selected?: ReadonlySet<string>;
+  onSelect?: (path: string, selected: boolean) => void;
+  onClearSelection?: () => void;
+  /** Move one track, from its own row action. */
+  onMove?: (track: LibraryTrack) => void;
+  /** Move everything currently ticked. */
+  onMoveSelected?: () => void;
+}
 
 /** The container format that needs no badge, because almost everything is it. */
 const DEFAULT_FORMAT = "flac";
@@ -14,22 +34,33 @@ function TrackRow({
   position,
   highlighted,
   onHighlightMount,
+  actions,
 }: {
   track: LibraryTrack;
   position: string;
   highlighted: boolean;
   onHighlightMount: (node: HTMLDivElement | null) => void;
+  actions: TrackListActions;
 }) {
+  const { selected, onSelect, onMove } = actions;
+
   return (
     <div
       role="listitem"
       ref={highlighted ? onHighlightMount : undefined}
       data-highlighted={highlighted || undefined}
       className={cn(
-        "flex min-h-9 items-center gap-2.5 rounded-lg px-2 py-1.5 hover:bg-muted",
+        "group/row flex min-h-9 items-center gap-2.5 rounded-lg px-2 py-1.5 hover:bg-muted",
         highlighted && "ring-2 ring-ring/60",
       )}
     >
+      {onSelect !== undefined && (
+        <Checkbox
+          checked={selected?.has(track.path) ?? false}
+          onCheckedChange={(checked) => onSelect(track.path, checked)}
+          aria-label={`Select ${track.title}`}
+        />
+      )}
       <span className="w-6 shrink-0 text-right text-xs tabular-nums text-muted-foreground">
         {position}
       </span>
@@ -49,6 +80,18 @@ function TrackRow({
       <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
         {formatDuration(track.duration)}
       </span>
+      {onMove !== undefined && (
+        // Always in the DOM, only visible on hover or keyboard focus: an action
+        // that appears on hover alone is unreachable from a keyboard.
+        <Button
+          variant="ghost"
+          size="xs"
+          className="opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100"
+          onClick={() => onMove(track)}
+        >
+          Move
+        </Button>
+      )}
       <TrackDetailPopover track={track} />
     </div>
   );
@@ -111,14 +154,41 @@ function DiscHeading({ disc }: { disc: number }) {
  * view once per path — a ref callback rather than an effect, because the row
  * only exists once the list has rendered, and the ref fires exactly then.
  */
+/** The bar under a list with a tick in it: what is selected, and what to do. */
+function SelectionBar({
+  count,
+  onMoveSelected,
+  onClearSelection,
+}: {
+  count: number;
+  onMoveSelected: () => void;
+  onClearSelection?: () => void;
+}) {
+  return (
+    <div className="mt-2 flex items-center gap-2 rounded-lg bg-muted px-2 py-1.5 text-sm">
+      <span className="font-medium">{plural(count, "track")} selected</span>
+      <Button variant="outline" size="sm" onClick={onMoveSelected}>
+        Move selected
+      </Button>
+      {onClearSelection !== undefined && (
+        <Button variant="ghost" size="sm" onClick={onClearSelection}>
+          Clear
+        </Button>
+      )}
+    </div>
+  );
+}
+
 export function TrackList({
   tracks,
   numbered = true,
   highlightPath = null,
+  actions = {},
 }: {
   tracks: readonly LibraryTrack[];
   numbered?: boolean;
   highlightPath?: string | null;
+  actions?: TrackListActions;
 }) {
   const scrolledFor = useRef<string | null>(null);
 
@@ -142,6 +212,7 @@ export function TrackList({
       }
       highlighted={track.path === highlightPath}
       onHighlightMount={scrollHighlightIntoView}
+      actions={actions}
     />
   );
 
@@ -149,10 +220,25 @@ export function TrackList({
   // rows need strips the implicit list semantics in Safari/VoiceOver. Each
   // disc is its own list, because the `Disc N` heading between two runs would
   // otherwise sit inside a list as a non-listitem child.
+  const selectedHere = tracks.filter(
+    (track) => actions.selected?.has(track.path) ?? false,
+  ).length;
+  const bar =
+    selectedHere > 0 && actions.onMoveSelected !== undefined ? (
+      <SelectionBar
+        count={selectedHere}
+        onMoveSelected={actions.onMoveSelected}
+        onClearSelection={actions.onClearSelection}
+      />
+    ) : null;
+
   if (!showDiscs) {
     return (
-      <div role="list" className="flex flex-col">
-        {tracks.map(row)}
+      <div className="flex flex-col">
+        <div role="list" className="flex flex-col">
+          {tracks.map(row)}
+        </div>
+        {bar}
       </div>
     );
   }
@@ -167,6 +253,7 @@ export function TrackList({
           </div>
         </Fragment>
       ))}
+      {bar}
     </div>
   );
 }

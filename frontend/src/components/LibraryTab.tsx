@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { AlbumGrid } from "@/components/library/AlbumGrid";
+import { MoveDialog, type MoveTarget } from "@/components/library/MoveDialog";
 import { AlbumHeader } from "@/components/library/AlbumHeader";
 import { ArtistGrid } from "@/components/library/ArtistGrid";
 import { LibraryBreadcrumb } from "@/components/library/LibraryBreadcrumb";
@@ -19,7 +20,12 @@ import {
   type LibrarySearchResult,
   type LibraryView,
 } from "@/lib/library";
-import type { LibraryResponse } from "@/lib/types";
+import type {
+  LibraryAlbum,
+  LibraryMoveResponse,
+  LibraryResponse,
+  LibraryTrack,
+} from "@/lib/types";
 
 /** A small uppercase heading over the Singles list. */
 function SectionHeading({ children }: { children: React.ReactNode }) {
@@ -72,6 +78,13 @@ export function LibraryTab() {
   const [view, setView] = useState<LibraryView>(ARTISTS_VIEW);
   const [query, setQuery] = useState("");
   const [highlightPath, setHighlightPath] = useState<string | null>(null);
+  // Held as a bare set of paths that a refetch never prunes: consumers
+  // intersect it with the current data instead — `TrackList` with
+  // `selectedHere` at render time, `trackActions` by filtering `tracks` at
+  // submit time — so a background `library_changed` refetch cannot throw away
+  // a selection the user is still making.
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [moveTarget, setMoveTarget] = useState<MoveTarget | null>(null);
 
   const location = resolveLocation(view, data);
 
@@ -79,6 +92,55 @@ export function LibraryTab() {
   function navigate(next: LibraryView, highlight: string | null = null) {
     setView(next);
     setHighlightPath(highlight);
+    // A selection only ever means something within one folder, so leaving the
+    // folder ends it.
+    setSelected(new Set());
+  }
+
+  function toggleSelected(path: string, isSelected: boolean) {
+    setSelected((current) => {
+      if (!isSelected) {
+        const next = new Set(current);
+        next.delete(path);
+        return next;
+      }
+      // One move carries one folder. The scanner flattens an album's `Disc 1`
+      // and `Disc 2` subfolders into a single track list, so ticking across
+      // them is easy to do by accident and the backend answers 400: all the
+      // tracks in one move must come from the same folder. A move is
+      // all-or-nothing by design, so this does not split into several
+      // requests — reaching into another folder starts a new selection there.
+      const folder = parentFolder(path);
+      const elsewhere = [...current].some(
+        (selectedPath) => parentFolder(selectedPath) !== folder,
+      );
+      return elsewhere ? new Set([path]) : new Set(current).add(path);
+    });
+  }
+
+  function openMove(target: MoveTarget) {
+    setMoveTarget(target);
+  }
+
+  /** Cancel or Escape: the dialog goes, the ticks the user made stay. */
+  function closeMove() {
+    setMoveTarget(null);
+  }
+
+  /**
+   * The move landed: follow it if it moved the ground under the user, then
+   * drop the selection, which described files that are no longer there.
+   *
+   * `navigate` runs before the invalidated library refetch lands, so for one
+   * render the new path resolves against the old tree and the user sees the
+   * level above. It settles as soon as the tree arrives.
+   */
+  function finishMove(result: LibraryMoveResponse) {
+    const destination =
+      moveTarget === null ? null : destinationView(moveTarget, result);
+    setMoveTarget(null);
+    if (destination !== null) navigate(destination);
+    setSelected(new Set());
   }
 
   function openResult(result: LibrarySearchResult) {
@@ -134,10 +196,84 @@ export function LibraryTab() {
           location={location}
           highlightPath={highlightPath}
           onNavigate={navigate}
+          selected={selected}
+          onSelect={toggleSelected}
+          onClearSelection={() => setSelected(new Set())}
+          onMove={openMove}
+        />
+      )}
+
+      {/* Keyed by what it is moving, so a second target starts with fresh
+          fields instead of the previous one's names. */}
+      {moveTarget !== null && (
+        <MoveDialog
+          key={moveTargetKey(moveTarget)}
+          target={moveTarget}
+          library={data}
+          onClose={closeMove}
+          onMoved={finishMove}
         />
       )}
     </div>
   );
+}
+
+/** The folder a path sits in; "" for a file directly at the library root. */
+function parentFolder(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index === -1 ? "" : path.slice(0, index);
+}
+
+/**
+ * Where to stand once *target* has moved, or null to stay put.
+ *
+ * A rename or an album move takes the folder the user is looking at out from
+ * under them, and `resolveLocation` would drop them to the library root for
+ * want of the old path. Moving tracks leaves the current folder standing, so
+ * nothing has to move.
+ *
+ * `result.destination` is the backend's own answer for where the folder ended
+ * up, and it holds even for a merge that moved no file at all (every track
+ * already present, only sidecars skipped). Deriving the path from the first
+ * moved file is the fallback for a backend that does not send it.
+ */
+function destinationView(
+  target: MoveTarget,
+  result: LibraryMoveResponse,
+): LibraryView | null {
+  if (result.destination !== null && result.destination !== undefined) {
+    const folder = result.destination;
+    if (target.kind === "artist") return { level: "artist", artistPath: folder };
+    if (target.kind === "album") {
+      return {
+        level: "album",
+        artistPath: folder.split("/")[0],
+        albumPath: folder,
+      };
+    }
+    return null;
+  }
+
+  const destination = result.moved[0]?.to;
+  if (destination === undefined) return null;
+  const segments = destination.split("/");
+  const artistPath = segments[0];
+  if (target.kind === "artist") return { level: "artist", artistPath };
+  if (target.kind === "album") {
+    return {
+      level: "album",
+      artistPath,
+      albumPath: segments.slice(0, 2).join("/"),
+    };
+  }
+  return null;
+}
+
+/** A stable identity for a move target, used as the dialog's React key. */
+function moveTargetKey(target: MoveTarget): string {
+  if (target.kind === "artist") return `artist:${target.artist.path}`;
+  if (target.kind === "album") return `album:${target.album.path}`;
+  return `tracks:${target.tracks.map((track) => track.path).join("|")}`;
 }
 
 /**
@@ -152,11 +288,19 @@ function LibraryLevel({
   location,
   highlightPath,
   onNavigate,
+  selected,
+  onSelect,
+  onClearSelection,
+  onMove,
 }: {
   library: LibraryResponse;
   location: LibraryLocation;
   highlightPath: string | null;
   onNavigate: (view: LibraryView, highlight?: string | null) => void;
+  selected: ReadonlySet<string>;
+  onSelect: (path: string, selected: boolean) => void;
+  onClearSelection: () => void;
+  onMove: (target: MoveTarget) => void;
 }) {
   if (location.level === "artists") {
     if (library.artist_count === 0) {
@@ -178,6 +322,22 @@ function LibraryLevel({
 
   const { artist } = location;
 
+  /** The tracks and albums of this level, for the move actions below. */
+  const moveTracks = (tracks: readonly LibraryTrack[], album: LibraryAlbum | null) =>
+    onMove({ kind: "tracks", artist, album, tracks });
+
+  const trackActions = (tracks: readonly LibraryTrack[], album: LibraryAlbum | null) => ({
+    selected,
+    onSelect,
+    onClearSelection,
+    onMove: (track: LibraryTrack) => moveTracks([track], album),
+    onMoveSelected: () =>
+      moveTracks(
+        tracks.filter((track) => selected.has(track.path)),
+        album,
+      ),
+  });
+
   if (location.level === "artist") {
     return (
       <>
@@ -185,7 +345,19 @@ function LibraryLevel({
           crumbs={[{ label: "Library", view: ARTISTS_VIEW }]}
           current={artist.name}
           onNavigate={onNavigate}
-        />
+        >
+          {/* The synthetic bucket is not a folder, so there is nothing to
+              rename: its files are sorted by moving them out. */}
+          {!artist.synthetic && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => onMove({ kind: "artist", artist })}
+            >
+              Rename
+            </Button>
+          )}
+        </LibraryBreadcrumb>
         {artist.albums.length > 0 && (
           <AlbumGrid
             albums={artist.albums}
@@ -208,6 +380,7 @@ function LibraryLevel({
               tracks={artist.singles}
               numbered={false}
               highlightPath={highlightPath}
+              actions={trackActions(artist.singles, null)}
             />
           </>
         )}
@@ -234,9 +407,21 @@ function LibraryLevel({
         ]}
         current={album.name}
         onNavigate={onNavigate}
-      />
+      >
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => onMove({ kind: "album", artist, album })}
+        >
+          Move album
+        </Button>
+      </LibraryBreadcrumb>
       <AlbumHeader artist={artist} album={album} />
-      <TrackList tracks={album.tracks} highlightPath={highlightPath} />
+      <TrackList
+        tracks={album.tracks}
+        highlightPath={highlightPath}
+        actions={trackActions(album.tracks, album)}
+      />
     </>
   );
 }

@@ -29,9 +29,21 @@ const TERMINAL_HIDDEN_STATUSES: ReadonlySet<Job["status"]> = new Set<
  * fetches, which bounds it at the number of jobs that can finish in one
  * request round-trip.
  *
- * Only *removals* are protected this way. An in-place patch — the fresher job
+ * *Additions* are protected by the mirror set below, for the same reason in
+ * reverse: a `POST /download` answers while a `GET /queue` issued before the
+ * job existed is still on the wire, and that older snapshot would write the
+ * brand-new row back out of the cache. Nothing would put it back either — the
+ * backend emits no event for a `queued` job until a slot frees, so the row
+ * would simply be missing until the download starts. Only the *id* is kept, so
+ * the re-append reads the current cached copy rather than replaying a frozen
+ * one over fresher stream state.
+ *
+ * The two sets are mutually exclusive and the later record wins: an add
+ * followed by a drop is a drop, a drop followed by an add is an add.
+ *
+ * Other in-place patches are not protected. The fresher job
  * `replaceJobInCache` writes from a retry response, or the advisory text
- * `setJobActionError` puts on a row — can still be overwritten by a snapshot
+ * `setJobActionError` puts on a row, can still be overwritten by a snapshot
  * that was issued before the patch. That is accepted: the stream re-delivers
  * the job's true state on its next transition, and the action message is only
  * advisory. A "patched since this fetch went out" map was considered and
@@ -40,34 +52,76 @@ const TERMINAL_HIDDEN_STATUSES: ReadonlySet<Job["status"]> = new Set<
  */
 const droppedSinceFetch = new WeakMap<QueryClient, Set<string>>();
 
+/** Ids added to the cache since the last `GET /queue` went out. See above. */
+const addedSinceFetch = new WeakMap<QueryClient, Set<string>>();
+
+/** The set held in *store* for *queryClient*, created on first use. */
+function idsFor(
+  store: WeakMap<QueryClient, Set<string>>,
+  queryClient: QueryClient,
+): Set<string> {
+  let ids = store.get(queryClient);
+  if (ids === undefined) {
+    ids = new Set<string>();
+    store.set(queryClient, ids);
+  }
+  return ids;
+}
+
 /** The drop set for *queryClient*, created on first use. */
 function droppedIds(queryClient: QueryClient): Set<string> {
-  let dropped = droppedSinceFetch.get(queryClient);
-  if (dropped === undefined) {
-    dropped = new Set<string>();
-    droppedSinceFetch.set(queryClient, dropped);
-  }
-  return dropped;
+  return idsFor(droppedSinceFetch, queryClient);
+}
+
+/** The add set for *queryClient*, created on first use. */
+function addedIds(queryClient: QueryClient): Set<string> {
+  return idsFor(addedSinceFetch, queryClient);
 }
 
 /** Note that *jobId* left the cache, so a fetch already out cannot restore it. */
 function recordDrop(queryClient: QueryClient, jobId: string): void {
+  addedIds(queryClient).delete(jobId);
   droppedIds(queryClient).add(jobId);
+}
+
+/** Note that *jobId* joined the cache, so a fetch already out cannot erase it. */
+function recordAdd(queryClient: QueryClient, jobId: string): void {
+  droppedIds(queryClient).delete(jobId);
+  addedIds(queryClient).add(jobId);
 }
 
 /** Called by the queue `queryFn` as it issues the request. */
 export function beginQueueFetch(queryClient: QueryClient): void {
   droppedIds(queryClient).clear();
+  addedIds(queryClient).clear();
 }
 
-/** Filter a fetched queue through the drops that happened while it was away. */
+/**
+ * Reconcile a fetched queue with the cache changes that happened while it was
+ * away: drop the ids removed since, and re-append the ids added since that the
+ * response does not already list.
+ *
+ * The re-appended job is taken from the *current* cache, not from a copy saved
+ * at add time, so a job the stream has advanced in the meantime keeps the
+ * fresher state. One the stream has since removed is not in the cache at all
+ * and so is not re-appended.
+ */
 export function reconcileQueueSnapshot(
   queryClient: QueryClient,
   jobs: Job[],
 ): Job[] {
   const dropped = droppedIds(queryClient);
-  if (dropped.size === 0) return jobs;
-  return jobs.filter((job) => !dropped.has(job.id));
+  const added = addedIds(queryClient);
+
+  const kept = dropped.size === 0 ? jobs : jobs.filter((job) => !dropped.has(job.id));
+  if (added.size === 0) return kept;
+
+  const cached = queryClient.getQueryData<Job[]>(queryKeys.queue) ?? [];
+  const present = new Set(kept.map((job) => job.id));
+  const missing = cached.filter(
+    (job) => added.has(job.id) && !present.has(job.id),
+  );
+  return missing.length === 0 ? kept : [...kept, ...missing];
 }
 
 /**
@@ -123,6 +177,8 @@ function writeQueue(
 
 /** Add a newly created job to the cache; a job already there is left alone. */
 export function addJobToCache(queryClient: QueryClient, job: Job): void {
+  recordAdd(queryClient, job.id);
+
   if (readQueue(queryClient) === undefined) {
     // Nothing has been fetched yet — the initial GET /queue failed, or is still
     // out. Seeding the cache with just this job keeps the row the user asked
