@@ -3,6 +3,8 @@
 Defines all API routes:
   - GET  /health         -- liveness check
   - POST /download       -- submit a URL for download
+  - GET  /library        -- the DOWNLOAD_PATH tree as artists, albums, tracks
+  - GET  /library/cover  -- cover art for one album
   - GET  /queue          -- list in-flight and errored jobs
   - GET  /queue/stream   -- SSE stream of job events
   - POST /queue/{id}/retry   -- retry a failed job
@@ -18,14 +20,27 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import yt_dlp.version
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from app.downloader import DownloadError, extract_metadata
 from app.file_organizer import DEFAULT_DOWNLOAD_PATH
 from app.job_store import JobStore, get_data_path, get_db_path
-from app.models import DownloadRequest, HealthResponse, Job, SSEEvent
+from app.library import (
+    LibraryNotFound,
+    LibraryPathError,
+    get_album_cover,
+    get_download_path,
+    scan_library,
+)
+from app.models import (
+    DownloadRequest,
+    HealthResponse,
+    Job,
+    LibraryResponse,
+    SSEEvent,
+)
 from app.queue_manager import (
     DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     DEFAULT_MAX_CONCURRENT_DOWNLOADS,
@@ -52,6 +67,13 @@ logger = logging.getLogger(__name__)
 # gives up and enqueues the job without it.  Keeps the request well inside
 # nginx's 60 s proxy_read_timeout.
 METADATA_TIMEOUT_SECONDS = 20
+
+# How long a browser may keep a cover it fetched with an explicit ?v= version.
+# The version is a change stamp over the album folder, its sidecar images and
+# its audio files, so the URL changes whenever the art could have changed and
+# the entry it replaces is never asked for again -- which is exactly what
+# "immutable" promises.
+COVER_MAX_AGE_SECONDS = 31536000
 
 # Events buffered per connected SSE client before the oldest is dropped.
 SSE_CLIENT_QUEUE_SIZE = 256
@@ -413,3 +435,94 @@ async def dismiss_job(job_id: str) -> None:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except QueueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# Library
+# ---------------------------------------------------------------------------
+
+
+@app.get("/library", response_model=LibraryResponse)
+async def get_library(response: Response) -> LibraryResponse:
+    """Return the whole library tree: artists, their albums, and their singles.
+
+    The filesystem is the only source of truth, so this is a live scan -- served
+    from the in-memory tag cache, which makes a repeat call with nothing changed
+    a stat per file and no tag parses at all.  The walk is blocking, hence the
+    thread; ``no-store`` because a stale tree is worse than a second scan.
+    """
+    payload = await asyncio.to_thread(scan_library, get_download_path())
+    response.headers["Cache-Control"] = "no-store"
+    return LibraryResponse.model_validate(payload)
+
+
+def _if_none_match_hits(header: str | None, etag: str) -> bool:
+    """Whether *header* lists *etag*, in either the strong or the ``W/`` form.
+
+    RFC 9110 compares ``If-None-Match`` weakly, so ``W/"x"`` and ``"x"`` are the
+    same validator here; the prefix only matters for range requests, which this
+    endpoint does not serve.
+    """
+    if not header:
+        return False
+    if header.strip() == "*":
+        return True
+    for candidate in header.split(","):
+        value = candidate.strip()
+        if value.startswith("W/"):
+            value = value[2:].strip()
+        if value == etag:
+            return True
+    return False
+
+
+@app.get("/library/cover")
+async def get_library_cover(
+    request: Request,
+    path: str = Query(
+        "",
+        description="Album path relative to DOWNLOAD_PATH; empty means the synthetic bucket",
+    ),
+    v: str | None = Query(
+        None,
+        description="Cover version (the album's cover_version); makes the response cacheable",
+    ),
+) -> Response:
+    """Serve an album's cover: embedded picture, else `cover.jpg`, else a placeholder.
+
+    An artist path, the synthetic root bucket, and an album with no art anywhere
+    all get the generated SVG placeholder -- artist tiles ask for their
+    ``cover_album_path`` instead, so there is nothing to look up for a bare
+    artist folder.
+
+    ``v`` is the album's ``cover_version``.  When the frontend passes it the
+    URL is unique to that version of the art, so the response may be cached
+    forever; without it the browser must revalidate, because the same URL will
+    later serve different bytes.
+    """
+    try:
+        cover = await asyncio.to_thread(
+            get_album_cover, path, get_download_path(), Path(get_data_path())
+        )
+    except LibraryPathError as exc:
+        # str(exc) is written to never contain a filesystem path.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LibraryNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    cache_control = (
+        f"public, max-age={COVER_MAX_AGE_SECONDS}, immutable" if v else "no-cache"
+    )
+    # nosniff on every response: the body is only ever bytes we have sniffed
+    # ourselves (or our own SVG), and the header stops a browser from
+    # second-guessing that and rendering a cover as something executable.
+    headers = {
+        "Cache-Control": cache_control,
+        "ETag": cover.etag,
+        "X-Content-Type-Options": "nosniff",
+    }
+    if _if_none_match_hits(request.headers.get("if-none-match"), cover.etag):
+        # The no-cache path above still costs a request per cover; answering it
+        # with 304 means it costs headers rather than an image.
+        return Response(status_code=304, headers=headers)
+    return Response(content=cover.data, media_type=cover.content_type, headers=headers)

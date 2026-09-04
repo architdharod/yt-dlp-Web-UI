@@ -22,6 +22,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_DOWNLOAD_PATH = "/data/music/downloads"
 FALLBACK_ARTIST = "Unknown Artist"
 FALLBACK_ALBUM = "Unknown Album"
+# Known divergence, deliberate until Phase 6: the library's domain model calls a
+# track with no album a loose Single and expects it at ``Artist/<title>.flac``,
+# but this writer still files album-less downloads under
+# ``Artist/Unknown Album/``.  The two are changed together in Phase 6, when the
+# move code lands and ``_already_in_library`` has to accept both the new
+# loose-Single path and the legacy ``Unknown Album`` one, so that libraries
+# written by an earlier version are not re-downloaded.
 
 # Scratch directory inside DOWNLOAD_PATH where yt-dlp writes everything
 # unfinished, and the directory Phase 7 moves deleted tracks into.  Both are

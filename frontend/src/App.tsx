@@ -71,7 +71,16 @@ export function App() {
         >
           <DownloadTab />
         </TabsContent>
-        <TabsContent value="library" className="min-h-0 flex-1 overflow-y-auto">
+        {/*
+          keepMounted here too: the library keeps where the user had browsed to
+          in component state, and unmounting the panel would drop them back on
+          the artist grid every time they looked at the Download tab.
+        */}
+        <TabsContent
+          value="library"
+          keepMounted
+          className="min-h-0 flex-1 overflow-y-auto [&[hidden]]:hidden"
+        >
           <LibraryTab />
         </TabsContent>
         {trashCount > 0 && (

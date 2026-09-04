@@ -194,8 +194,9 @@ and tag writes). UI copy changes from "collection" to "library".
 `GET /library` scans `DOWNLOAD_PATH` (skipping `.trash` and `.tmp`, the per-job yt-dlp scratch directory) into Artists > Albums > Tracks plus Singles per artist
 and a synthetic `Unknown Artist` for root files, with title (tag, else filename), duration, format, and counts
 from a cheap tag read, served from the mtime-keyed scan cache so only changed albums are re-read.
-`GET /library/cover?path=` serves the embedded picture of the first track, else `cover.jpg`, else a generated
-placeholder, cached on disk keyed by album path plus folder mtime. The Library tab shows artist tiles, album tiles, and
+`GET /library/cover?path=` serves the embedded picture of the first track that carries a valid picture, else
+`cover.jpg`, else a generated placeholder, cached on disk keyed by album path plus a change stamp over the
+folder, sidecar images and audio file mtimes. The Library tab shows artist tiles, album tiles, and
 the numbered track list with breadcrumb navigation, a flat search across all levels, a format badge on
 non-FLAC tracks only, and a detail popover with size and full tags. The library query is invalidated by
 `library_changed` and refetches on window focus.
@@ -224,7 +225,8 @@ The debounced rescan hook fires after every job that writes a file: touch change
 as a dismissible banner delivered over SSE, and are logged. At startup the app reads Lidarr's metadata-provider
 config and warns in the banner if `scrubAudioTags` is on. Compose and `.env.example` gain the six service
 variables. README documents them, the Navidrome admin-user requirement, `ND_SCANNER_PURGEMISSING=always`, and
-Lidarr monitoring guidance.
+Lidarr monitoring guidance. Covers fetched from the Cover Art Archive are downscaled with ffmpeg before being
+written, falling back to the original bytes if ffmpeg fails.
 
 ### Acceptance criteria
 
@@ -249,7 +251,10 @@ every conflict. FLAC tags `ALBUMARTIST`, `ARTIST`, `ALBUM` are rewritten (`ALBUM
 everything else preserved. Empty album then artist folders are removed with non-audio leftovers. The move
 dialog has artist and album comboboxes with free-text creation; artist rename shows only the artist field.
 Checkboxes enable Move selected. A move whose source or target contains the target folder of an in-flight job
-returns 409 (in-flight guard). Every move fires the rescan hook and `library_changed`.
+returns 409 (in-flight guard). Every move fires the rescan hook and `library_changed`. Deferred here from Phase
+4: the downloader switches album-less downloads from `Artist/Unknown Album/` to the loose-Single form
+`Artist/<title>.flac`, with `_already_in_library` checking both the new and the legacy path. The cover disk
+cache also gains a prune of entries whose album path no longer exists after a scan.
 
 ### Acceptance criteria
 

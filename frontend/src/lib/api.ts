@@ -1,4 +1,10 @@
-import type { DownloadRequest, Job, SSEEvent } from "./types";
+import type {
+  DownloadRequest,
+  Job,
+  LibraryAlbum,
+  LibraryResponse,
+  SSEEvent,
+} from "./types";
 
 /**
  * Backend base URL — configurable via VITE_API_BASE_URL env var.
@@ -26,8 +32,10 @@ async function parseErrorDetail(res: Response): Promise<string> {
       if (Array.isArray(detail)) {
         const messages = detail
           .map((item) =>
-            item && typeof item === "object" && typeof (item as { msg?: unknown }).msg === "string"
-              ? ((item as { msg: string }).msg)
+            item &&
+            typeof item === "object" &&
+            typeof (item as { msg?: unknown }).msg === "string"
+              ? (item as { msg: string }).msg
               : null,
           )
           .filter((msg): msg is string => msg !== null);
@@ -117,6 +125,44 @@ export async function dismissJob(jobId: string): Promise<void> {
   if (!res.ok) {
     throw new Error(await parseErrorDetail(res));
   }
+}
+
+/**
+ * Fetch the whole scanned library: artists, their albums, and every track.
+ *
+ * One request for the whole tree is deliberate — the backend serves it from an
+ * mtime-keyed scan cache, and having it all client-side is what lets the flat
+ * search run over every level without a round trip.
+ *
+ * *signal* is TanStack Query's — a tab switched away from mid-scan aborts the
+ * request instead of leaving the whole tree in flight.
+ */
+export async function getLibrary(
+  signal?: AbortSignal,
+): Promise<LibraryResponse> {
+  const res = await fetch(`${API_BASE_URL}/library`, { signal });
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch library: ${await parseErrorDetail(res)}`);
+  }
+
+  return res.json() as Promise<LibraryResponse>;
+}
+
+/**
+ * The cover art URL for an album.
+ *
+ * The path travels as a query parameter rather than a URL segment because it
+ * contains slashes; `encodeURIComponent` is what keeps `#`, `&`, and `?` in a
+ * folder name from being read as URL syntax. `v` is the album's
+ * `cover_version`, so a folder that changed gets a fresh URL instead of the
+ * browser's cached image.
+ */
+export function coverUrl(
+  album: Pick<LibraryAlbum, "path" | "cover_version">,
+): string {
+  const path = encodeURIComponent(album.path);
+  return `${API_BASE_URL}/library/cover?path=${path}&v=${album.cover_version}`;
 }
 
 /**

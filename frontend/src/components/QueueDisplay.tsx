@@ -15,6 +15,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useQueueQuery } from "@/hooks/useQueueQuery";
+import { formatDuration } from "@/lib/format";
 import { useQueueActions } from "@/hooks/useQueueActions";
 import { CANCELLABLE_STATUSES, sortJobs } from "@/lib/queue";
 import {
@@ -22,18 +23,6 @@ import {
   type Job,
   type JobStatus,
 } from "@/lib/types";
-
-/** Format seconds into MM:SS or HH:MM:SS. */
-function formatDuration(seconds: number | null): string {
-  if (seconds == null) return "--:--";
-  const s = Math.round(seconds);
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  const mm = String(m).padStart(2, "0");
-  const ss = String(sec).padStart(2, "0");
-  return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
-}
 
 const STATUS_CONFIG: Record<
   JobStatus,

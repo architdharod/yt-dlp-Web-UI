@@ -55,3 +55,76 @@ export interface SSEEvent {
   job_id: string | null;
   data: Record<string, unknown>;
 }
+
+/**
+ * One audio file under the library root, as `GET /library` reports it.
+ *
+ * `path` is the POSIX path relative to `DOWNLOAD_PATH` and is the track's
+ * identity — the backend has no library table, so nothing else is stable.
+ * `title` falls back to the filename when the file carries no title tag;
+ * `error` holds the reason a tag read failed, and the row still renders.
+ */
+export interface LibraryTrack {
+  path: string;
+  name: string;
+  title: string;
+  artist: string | null;
+  album: string | null;
+  album_artist: string | null;
+  track_number: number | null;
+  disc_number: number | null;
+  duration: number | null;
+  format: string;
+  bitrate: number | null;
+  sample_rate: number | null;
+  size: number;
+  mtime: string;
+  has_embedded_art: boolean;
+  tags: Record<string, string[]>;
+  error: string | null;
+}
+
+/**
+ * A folder at depth 2. `cover_version` is an opaque change stamp over the
+ * folder, its sidecar images and its audio files -- not a timestamp -- so it
+ * busts the browser cache for the cover endpoint after a new `cover.jpg` or a
+ * tag write lands.
+ */
+export interface LibraryAlbum {
+  name: string;
+  path: string;
+  track_count: number;
+  cover_version: number;
+  has_cover: boolean;
+  tracks: LibraryTrack[];
+}
+
+/**
+ * A folder at depth 1, plus the synthetic root bucket.
+ *
+ * `singles` are the loose tracks sitting directly in the artist folder, which
+ * the domain model treats as legitimate rather than misfiled. The synthetic
+ * bucket (`synthetic: true`, `path: ""`, name "Unknown Artist") holds files
+ * found at the library root and only appears when there are any; the UI marks
+ * it as needing sorting. `cover_album_path` is the album whose art stands in
+ * for the artist, or null when there is no album to take it from.
+ */
+export interface LibraryArtist {
+  name: string;
+  path: string;
+  synthetic: boolean;
+  album_count: number;
+  track_count: number;
+  albums: LibraryAlbum[];
+  singles: LibraryTrack[];
+  cover_album_path: string | null;
+}
+
+/** The whole `GET /library` response: the scanned tree and its totals. */
+export interface LibraryResponse {
+  artists: LibraryArtist[];
+  artist_count: number;
+  album_count: number;
+  track_count: number;
+  scanned_at: string;
+}

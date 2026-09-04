@@ -9,9 +9,9 @@ export const queryKeys = {
   /** GET /queue — the in-flight and errored jobs. */
   queue: ["queue"] as const,
   /**
-   * GET /library — added in a later phase. The key already exists because the
-   * `library_changed` SSE event invalidates it; invalidating a key nothing
-   * subscribes to is a no-op, so the hook can land before the query does.
+   * GET /library — the scanned tree of artists, albums, and tracks.
+   * `useLibraryQuery` reads this key, and `queueCache` invalidates it when the
+   * `library_changed` SSE event says the folder on disk moved on.
    */
   library: ["library"] as const,
 };
