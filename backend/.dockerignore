@@ -4,3 +4,12 @@ __pycache__
 tests/
 requirements-dev.txt
 .git
+.venv
+.env
+*.egg-info
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov/
+Dockerfile
+.dockerignore

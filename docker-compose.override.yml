@@ -1,0 +1,17 @@
+# Development-only overlay. Compose merges this file into docker-compose.yml
+# automatically whenever it is present in the working directory, so
+# `docker compose up --build` builds both images from source instead of using
+# the prebuilt GHCR images. Do not copy this file to the homelab — there the
+# stack must run the published images.
+services:
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile

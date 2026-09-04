@@ -57,7 +57,8 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
       <CardHeader>
         <CardTitle>Download Audio</CardTitle>
         <CardDescription>
-          Paste a YouTube or SoundCloud URL to download audio
+          Paste a YouTube or SoundCloud URL to download audio. Single tracks
+          only — playlist and channel URLs are rejected.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -67,7 +68,7 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
             <Input
               id="url"
               type="url"
-              placeholder="https://youtube.com/watch?v=... or https://soundcloud.com/..."
+              placeholder="https://youtube.com/watch?v=... or https://soundcloud.com/... (single track)"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               required

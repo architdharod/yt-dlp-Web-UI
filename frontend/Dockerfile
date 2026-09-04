@@ -1,5 +1,5 @@
 # Stage 1: Build the React application
-FROM node:20-alpine AS build
+FROM node:20.19-alpine AS build
 
 WORKDIR /app
 
@@ -7,8 +7,8 @@ WORKDIR /app
 ARG VITE_API_BASE_URL=""
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 
-COPY package.json package-lock.json* ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
 COPY . .
 RUN npm run build

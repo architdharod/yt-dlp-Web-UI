@@ -1,0 +1,381 @@
+<title>Library View Mock</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --bg:#f6f7f8;--surface:#ffffff;--surface-2:#eef0f2;--border:#dfe2e6;--text:#1a1d21;--muted:#6b7280;
+  --accent:#1f7a6d;--accent-soft:#e2f1ee;--danger:#b93a3a;--danger-soft:#f8e7e7;--warn:#9a6b12;--warn-soft:#fbf1dc;
+  --ring:#1f7a6d;--radius:8px;--font:'Geist',system-ui,-apple-system,'Segoe UI',sans-serif;--mono:'Geist Mono',ui-monospace,Menlo,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#141619;--surface:#1c1f23;--surface-2:#242830;--border:#2f343b;--text:#e7e8e6;--muted:#9aa0a8;
+  --accent:#4fb3a2;--accent-soft:#1e3532;--danger:#e06c6c;--danger-soft:#3a2323;--warn:#d9a441;--warn-soft:#3a3020;--ring:#4fb3a2;
+}}
+:root[data-theme="dark"]{
+  --bg:#141619;--surface:#1c1f23;--surface-2:#242830;--border:#2f343b;--text:#e7e8e6;--muted:#9aa0a8;
+  --accent:#4fb3a2;--accent-soft:#1e3532;--danger:#e06c6c;--danger-soft:#3a2323;--warn:#d9a441;--warn-soft:#3a3020;--ring:#4fb3a2;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 var(--font)}
+.page{max-width:920px;margin:0 auto;padding:24px 20px 80px;display:flex;flex-direction:column;gap:18px}
+.note{font-size:12.5px;color:var(--muted);border:1px dashed var(--border);border-radius:var(--radius);padding:10px 12px}
+.note b{color:var(--text)}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border)}
+.tab{border:0;border-bottom:2px solid transparent;border-radius:0;padding:8px 14px;font-weight:500;color:var(--muted);display:flex;align-items:center;gap:8px}
+.tab:hover{background:none;color:var(--text)}
+.tab.on{color:var(--text);border-bottom-color:var(--accent)}
+.tab .badge{font-size:11px;background:var(--accent-soft);color:var(--accent);border-radius:999px;padding:0 7px;font-weight:600}
+.tab.trash .badge{background:var(--danger-soft);color:var(--danger)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius)}
+.card-h{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid var(--border)}
+.card-h h2{margin:0;font-size:15px;font-weight:600}
+.sub{color:var(--muted);font-size:12.5px}
+.card-b{padding:8px}
+button{font:inherit;color:inherit;background:none;border:1px solid var(--border);border-radius:6px;padding:5px 10px;cursor:pointer;line-height:1.3}
+button:hover{background:var(--surface-2)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--ring);outline-offset:1px}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.danger{background:var(--danger);border-color:var(--danger);color:#fff}
+button.ghost{border-color:transparent;padding:4px 7px;color:var(--muted)}
+button.ghost:hover{color:var(--text);background:var(--surface-2)}
+button.ghost.del:hover{color:var(--danger);background:var(--danger-soft)}
+button:disabled{opacity:.45;cursor:default}
+input[type=text]{font:inherit;color:inherit;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 10px;width:100%}
+.pill{display:inline-block;font-size:11px;font-weight:500;letter-spacing:.02em;padding:1px 7px;border-radius:999px;border:1px solid var(--border);color:var(--muted)}
+.pill.warn{color:var(--warn);border-color:var(--warn-soft);background:var(--warn-soft)}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12.5px;color:var(--muted)}
+.hidden{display:none!important}
+
+/* download tab */
+.form{display:grid;grid-template-columns:1fr;gap:10px;padding:14px 16px}
+.form .two{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+label.f{display:flex;flex-direction:column;gap:4px;font-size:12.5px;color:var(--muted)}
+.job{display:grid;grid-template-columns:40px 1fr auto auto;gap:12px;align-items:center;padding:10px 8px}
+.job+.job{border-top:1px solid var(--border)}
+.job .t{font-weight:500}.job .m{color:var(--muted);font-size:12.5px}
+.bar{height:4px;background:var(--surface-2);border-radius:2px;margin-top:6px;overflow:hidden}.bar i{display:block;height:100%;background:var(--accent);width:63%}
+
+/* art */
+.art{border-radius:6px;aspect-ratio:1;width:100%;display:flex;align-items:flex-end;padding:8px;color:#fff;font-weight:600;font-size:18px;text-shadow:0 1px 2px rgba(0,0,0,.4);background:var(--surface-2);position:relative;overflow:hidden}
+.art.sm{width:40px;font-size:11px;padding:4px;border-radius:5px}
+.art.stack::before{content:"";position:absolute;inset:-6px -6px auto auto;width:60%;height:60%;border-radius:6px;background:rgba(255,255,255,.18);transform:rotate(12deg)}
+.art.ph{background:repeating-linear-gradient(45deg,var(--surface-2) 0 6px,var(--border) 6px 12px);color:var(--muted);text-shadow:none}
+
+/* library */
+.toolbar{display:flex;gap:10px;align-items:center;padding:12px 12px 8px}
+.toolbar input{flex:1}
+.crumbs{display:flex;align-items:center;gap:6px;padding:4px 12px 10px;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.crumbs button{border:0;padding:2px 4px;color:var(--accent);font-weight:500}
+.crumbs button:hover{background:var(--accent-soft)}
+.crumbs .cur{color:var(--text);font-weight:600;font-size:15px}
+.crumbs .acts{margin-left:auto;display:flex;gap:4px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;padding:6px 12px 14px}
+.tile{display:flex;flex-direction:column;gap:6px;text-align:left;border:0;padding:6px;border-radius:8px;align-items:stretch}
+.tile:hover{background:var(--surface-2)}
+.tile .n{font-weight:500;line-height:1.25}
+.tile .c{color:var(--muted);font-size:12px}
+.tile.syn .n{color:var(--warn)}
+.list{padding:4px 8px 10px}
+.row{display:flex;align-items:center;gap:10px;padding:7px 8px;border-radius:6px;min-height:36px}
+.row:hover{background:var(--surface-2)}
+.row .num{width:22px;text-align:right}
+.row .name{flex:1}
+.row .acts{display:none;gap:2px}
+.row:hover .acts,.row:focus-within .acts{display:flex}
+.cb{width:15px;height:15px;accent-color:var(--accent);margin:0}
+.selbar{display:none;align-items:center;gap:10px;margin:0 8px 8px;padding:8px 12px;background:var(--accent-soft);border-radius:6px;font-size:13px}
+.selbar.on{display:flex}.selbar b{margin-right:auto}
+.section-h{padding:12px 16px 4px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.empty{color:var(--muted);padding:26px;text-align:center}
+
+/* trash */
+.trash .path{font-family:var(--mono);font-size:12.5px;flex:1}
+
+/* dialogs */
+dialog{border:1px solid var(--border);border-radius:10px;background:var(--surface);color:var(--text);padding:0;width:min(440px,92vw);box-shadow:0 20px 50px rgba(0,0,0,.25)}
+dialog::backdrop{background:rgba(10,12,14,.45)}
+.dh{padding:16px 18px 6px;font-weight:600;font-size:15px}
+.db{padding:6px 18px 14px;display:flex;flex-direction:column;gap:12px}
+.db p{margin:0;color:var(--muted)}
+.df{display:flex;justify-content:flex-end;gap:8px;padding:12px 18px 16px;border-top:1px solid var(--border)}
+.combo{position:relative}
+.combo ul{position:absolute;left:0;right:0;top:100%;margin:4px 0 0;padding:4px;list-style:none;background:var(--surface);border:1px solid var(--border);border-radius:6px;max-height:160px;overflow:auto;z-index:2;display:none}
+.combo.open ul{display:block}
+.combo li{padding:5px 8px;border-radius:4px;cursor:pointer}
+.combo li:hover{background:var(--surface-2)}
+.combo li.new{color:var(--accent)}
+.err{background:var(--danger-soft);color:var(--danger);padding:8px 10px;border-radius:6px;font-size:13px;display:none}
+.err.on{display:block}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:8px 14px;border-radius:6px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
+.toast.on{opacity:1}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="page">
+  <div class="note"><b>Prototype, not the app.</b> Revision 2. Tabs; Library is artist tiles, then album tiles, then tracks. Trash tab appears only when something is in it. Art is a generated placeholder standing in for the embedded cover. Try: open Bonobo, tick two tracks, Move with the Album left blank; Delete an album; open Trash and Restore.</div>
+
+  <div class="tabs">
+    <button class="tab" data-tab="download">Download <span class="badge">2</span></button>
+    <button class="tab on" data-tab="library">Library</button>
+    <button class="tab trash hidden" data-tab="trash">Trash <span class="badge" id="trashBadge">0</span></button>
+  </div>
+
+  <section id="tab-download" class="hidden" style="display:flex;flex-direction:column;gap:18px">
+    <div class="card">
+      <div class="card-h"><h2>Download</h2></div>
+      <div class="form">
+        <label class="f">URL<input type="text" value="https://www.youtube.com/watch?v=xKpN_pXt6f8"></label>
+        <div class="two"><label class="f">Artist (optional)<input type="text" placeholder="Bonobo"></label><label class="f">Album (optional)<input type="text" placeholder="Migration"></label></div>
+        <div><button class="primary" onclick="toast('Queued')">Download</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-h"><h2>In flight</h2><span class="sub">2 jobs</span></div>
+      <div class="card-b">
+        <div class="job"><div class="art sm" style="background:linear-gradient(135deg,#3b6b8f,#1c2f45)"></div><div><div class="t">Kerala</div><div class="m">Bonobo · Migration</div><div class="bar"><i></i></div></div><span class="pill">downloading 63%</span><button class="ghost" onclick="toast('Cancelled Kerala; partial file removed')">Cancel</button></div>
+        <div class="job"><div class="art sm" style="background:linear-gradient(135deg,#3b6b8f,#1c2f45)"></div><div><div class="t">Bambro Koyo Ganda</div><div class="m">Bonobo · Migration</div></div><span class="pill">queued</span><button class="ghost" onclick="toast('Removed from queue')">Cancel</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-library" class="card">
+    <div class="toolbar"><input type="text" id="filter" placeholder="Search artists, albums, tracks" oninput="render()"><span class="sub" id="libsub"></span><button class="ghost" onclick="toast('Refetched library')" title="Refresh">↻</button></div>
+    <div class="crumbs" id="crumbs"></div>
+    <div id="body"></div>
+  </section>
+
+  <section id="tab-trash" class="card trash hidden">
+    <div class="card-h"><h2>Trash <span class="sub" id="trashcnt"></span></h2><button class="ghost del" onclick="confirmEmpty()">Empty trash</button></div>
+    <div class="list" id="trash"></div>
+  </section>
+</div>
+
+<dialog id="moveDlg">
+  <div class="dh" id="moveTitle">Move</div>
+  <div class="db">
+    <p id="moveWhat"></p>
+    <label class="f">Artist<div class="combo"><input type="text" id="artistIn" autocomplete="off" placeholder="Pick an artist or type a new one"><ul id="artistList"></ul></div></label>
+    <label class="f" id="albumField">Album (optional, blank = loose track under the artist)<div class="combo"><input type="text" id="albumIn" autocomplete="off" placeholder="Pick an album, type a new one, or leave blank"><ul id="albumList"></ul></div></label>
+    <div class="err" id="moveErr"></div>
+    <p style="font-size:12.5px">ALBUMARTIST, ARTIST and ALBUM tags are rewritten to match. Folders left without audio are removed.</p>
+  </div>
+  <div class="df"><button onclick="moveDlg.close()">Cancel</button><button class="primary" onclick="doMove()">Move</button></div>
+</dialog>
+<dialog id="delDlg"><div class="dh">Move to trash?</div><div class="db"><p id="delWhat"></p><p style="font-size:12.5px">You can restore it from Trash until you empty it.</p></div><div class="df"><button onclick="delDlg.close()">Cancel</button><button class="danger" onclick="doDelete()">Delete</button></div></dialog>
+<dialog id="emptyDlg"><div class="dh">Empty trash?</div><div class="db"><p id="emptyWhat"></p><p style="font-size:12.5px">This permanently deletes the files.</p></div><div class="df"><button onclick="emptyDlg.close()">Cancel</button><button class="danger" onclick="doEmpty()">Empty trash</button></div></dialog>
+<div class="toast" id="toastEl"></div>
+
+<script>
+// lib[artist][album] = [[title,dur,fmt]]; album "" means loose tracks directly under the artist folder.
+let lib = {
+  "Bonobo": {
+    "Black Sands": [["Prelude","1:19","flac"],["Kiara","3:53","flac"],["Kong","4:33","flac"],["Eyesdown","5:45","flac"],["El Toro","3:38","flac"],["We Could Forever","4:50","flac"],["1009","4:05","flac"],["All in Forms","4:14","flac"],["The Keeper","4:40","flac"],["Stay the Same","5:17","flac"],["Animals","5:15","flac"],["Black Sands","5:22","flac"]],
+    "Migration": [["Migration","5:27","flac"],["Break Apart","4:07","flac"],["Outlier","7:46","flac"],["Grains","4:19","flac"],["Second Sun","4:31","flac"],["Surface","4:14","flac"],["Bambro Koyo Ganda","4:47","flac"],["Kerala","4:00","flac"],["Ontario","4:43","flac"],["No Reason","6:00","flac"],["7th Sevens","4:43","flac"],["Figures","4:39","flac"]],
+    "": [["Cirrus (Official Video)","5:46","flac"]]
+  },
+  "Four Tet": {
+    "There Is Love in You": [["Angel Echoes","4:08","flac"],["Love Cry","9:09","flac"],["Circling","4:34","flac"],["Sing","6:43","flac"],["This Unfolds","7:25","flac"]],
+    "Sixteen Oceans": [["School","3:46","flac"],["Baby","3:22","flac"],["Teenage Birdsong","3:28","mp3"],["Romantics","3:26","flac"]]
+  },
+  "Jon Hopkins": { "Immunity": [["We Disappear","5:44","flac"],["Open Eye Signal","7:48","flac"],["Breathe This Air","5:22","flac"],["Collider","9:46","flac"],["Abandon Window","4:56","flac"],["Immunity","9:57","flac"]] },
+  "Unknown Artist": { "": [["Tycho - Awake (Full Album)","36:40","flac"],["Nils Frahm - Says","8:26","m4a"]] }
+};
+const HUES = {"Black Sands":[28,72],"Migration":[205,60],"There Is Love in You":[340,55],"Sixteen Oceans":[190,50],"Immunity":[260,45]};
+let trash = [], sel = new Set(), pending = null;
+let view = {artist:null, album:null}; // album "" = loose tracks
+const $ = id => document.getElementById(id);
+const isSyn = a => a === "Unknown Artist";
+const cnt = a => Object.values(lib[a]).reduce((n,t)=>n+t.length,0);
+const albumsOf = a => Object.keys(lib[a]).filter(x=>x!=="").sort();
+const hasLoose = a => (lib[a][""]||[]).length>0;
+const looseLabel = "Singles";
+
+function artStyle(a,al){
+  if (isSyn(a) || al==="" ) return "";
+  const h = HUES[al] || [ (a.length*37)%360, 45 ];
+  return `background:linear-gradient(135deg,hsl(${h[0]} ${h[1]}% 42%),hsl(${(h[0]+40)%360} ${h[1]}% 22%))`;
+}
+function initials(s){ return s.split(/\s+/).slice(0,2).map(w=>w[0]||"").join("").toUpperCase(); }
+
+function render(){
+  const q = $("filter").value.trim().toLowerCase();
+  const body = $("body"), crumbs = $("crumbs");
+  body.innerHTML = ""; crumbs.innerHTML = "";
+  const artists = Object.keys(lib).sort();
+  $("libsub").textContent = `${artists.length} artists · ${artists.reduce((n,a)=>n+cnt(a),0)} tracks`;
+
+  if (q){ // flat search results across levels
+    crumbs.appendChild(el(`<span class="cur">Results for "${esc($("filter").value.trim())}"</span>`));
+    let n=0;
+    for (const a of artists){
+      if (a.toLowerCase().includes(q)){ body.appendChild(sectionHeader("Artist")); body.appendChild(tileGrid([artistTile(a)])); n++; }
+      const albs = albumsOf(a).filter(al=>al.toLowerCase().includes(q));
+      if (albs.length){ body.appendChild(sectionHeader(`Albums · ${a}`)); body.appendChild(tileGrid(albs.map(al=>albumTile(a,al)))); n++; }
+      for (const al of Object.keys(lib[a])){
+        const ts = lib[a][al].filter(t=>t[0].toLowerCase().includes(q));
+        if (ts.length){ body.appendChild(sectionHeader(`Tracks · ${a} / ${al||looseLabel}`)); body.appendChild(trackList(a,al,ts,false)); n++; }
+      }
+    }
+    if (!n) body.innerHTML = '<div class="empty">Nothing matches.</div>';
+    renderTrash(); return;
+  }
+
+  if (view.artist && !lib[view.artist]) view = {artist:null,album:null};
+  if (view.artist && view.album!==null && !lib[view.artist][view.album]) view.album=null;
+
+  if (!view.artist){
+    crumbs.appendChild(el(`<span class="cur">All artists</span>`));
+    body.appendChild(tileGrid(artists.map(artistTile)));
+  } else if (view.album===null){
+    const a = view.artist;
+    crumbs.appendChild(crumbBtn("All artists",()=>{view={artist:null,album:null};render();}));
+    crumbs.appendChild(el(`<span>/</span>`));
+    crumbs.appendChild(el(`<span class="cur ${isSyn(a)?"syn":""}">${esc(a)}</span>`));
+    crumbs.appendChild(el(`<span class="sub">${albumsOf(a).length} albums · ${cnt(a)} tracks</span>`));
+    const acts = el(`<span class="acts">${isSyn(a)?"":'<button class="ghost" data-act="rename">Rename</button>'}<button class="ghost del" data-act="del">Delete artist</button></span>`);
+    acts.querySelector('[data-act="rename"]')?.addEventListener("click",()=>openMove({kind:"artist",artist:a}));
+    acts.querySelector('[data-act="del"]').addEventListener("click",()=>openDelete({kind:"artist",artist:a}));
+    crumbs.appendChild(acts);
+    const albs = albumsOf(a);
+    if (albs.length) body.appendChild(tileGrid(albs.map(al=>albumTile(a,al))));
+    if (hasLoose(a)){ body.appendChild(sectionHeader(isSyn(a)?"Needs sorting":looseLabel)); body.appendChild(trackList(a,"",lib[a][""],true)); }
+    if (!albs.length && !hasLoose(a)) body.innerHTML='<div class="empty">No tracks.</div>';
+  } else {
+    const a=view.artist, al=view.album;
+    crumbs.appendChild(crumbBtn("All artists",()=>{view={artist:null,album:null};render();}));
+    crumbs.appendChild(el(`<span>/</span>`));
+    crumbs.appendChild(crumbBtn(a,()=>{view.album=null;render();}));
+    crumbs.appendChild(el(`<span>/</span>`));
+    crumbs.appendChild(el(`<span class="cur">${esc(al)}</span>`));
+    crumbs.appendChild(el(`<span class="sub">${lib[a][al].length} tracks</span>`));
+    const acts = el(`<span class="acts"><button class="ghost" data-act="move">Move album</button><button class="ghost del" data-act="del">Delete album</button></span>`);
+    acts.querySelector('[data-act="move"]').onclick=()=>openMove({kind:"album",artist:a,album:al});
+    acts.querySelector('[data-act="del"]').onclick=()=>openDelete({kind:"album",artist:a,album:al});
+    crumbs.appendChild(acts);
+    const head = el(`<div style="display:grid;grid-template-columns:120px 1fr;gap:16px;padding:6px 16px 10px;align-items:end"><div class="art ${artStyle(a,al)?"":"ph"}" style="${artStyle(a,al)}">${artStyle(a,al)?"":initials(al)}</div><div><div style="font-size:12px;color:var(--muted)">${esc(a)}</div><div style="font-size:20px;font-weight:600;text-wrap:balance">${esc(al)}</div><div class="sub">${lib[a][al].length} tracks</div></div></div>`);
+    body.appendChild(head);
+    body.appendChild(trackList(a,al,lib[a][al],true));
+  }
+  renderTrash();
+}
+function sectionHeader(t){ return el(`<div class="section-h">${esc(t)}</div>`); }
+function tileGrid(tiles){ const g=el('<div class="grid"></div>'); tiles.forEach(t=>g.appendChild(t)); return g; }
+function crumbBtn(t,fn){ const b=el(`<button>${esc(t)}</button>`); b.onclick=fn; return b; }
+function artistTile(a){
+  const first = albumsOf(a)[0];
+  const st = first ? artStyle(a,first) : "";
+  const t = el(`<button class="tile ${isSyn(a)?"syn":""}"><div class="art ${st?"stack":"ph"}" style="${st}">${st?"":initials(a)}</div><div class="n">${esc(a)}</div><div class="c">${albumsOf(a).length} album${albumsOf(a).length!==1?"s":""} · ${cnt(a)} tracks${isSyn(a)?" · needs sorting":""}</div></button>`);
+  t.onclick=()=>{ $("filter").value=""; view={artist:a,album:null}; render(); }; return t;
+}
+function albumTile(a,al){
+  const st = artStyle(a,al);
+  const t = el(`<button class="tile"><div class="art ${st?"":"ph"}" style="${st}">${st?"":initials(al)}</div><div class="n">${esc(al)}</div><div class="c">${lib[a][al].length} tracks</div></button>`);
+  t.onclick=()=>{ $("filter").value=""; view={artist:a,album:al}; render(); }; return t;
+}
+function trackList(a,al,ts,selectable){
+  const key=a+"/"+al, wrap=el('<div class="list"></div>');
+  ts.forEach((t,i)=>{
+    const id=key+"/"+t[0];
+    const r=el(`<div class="row" tabindex="0">${selectable?`<input type="checkbox" class="cb" ${sel.has(id)?"checked":""}>`:""}<span class="num mono">${al?i+1:""}</span><span class="name">${esc(t[0])}</span>${t[2]!=="flac"?`<span class="pill">${t[2].toUpperCase()}</span>`:""}<span class="mono">${t[1]}</span><span class="acts"><button class="ghost" data-act="move">Move</button><button class="ghost del" data-act="del">Delete</button></span></div>`);
+    if (selectable) r.querySelector(".cb").onchange=ev=>{ if(ev.target.checked){ for(const s of sel) if(!s.startsWith(key+"/")) sel.delete(s); sel.add(id);} else sel.delete(id); render(); };
+    r.querySelector('[data-act="move"]').onclick=()=>openMove({kind:"tracks",artist:a,album:al,tracks:[t[0]]});
+    r.querySelector('[data-act="del"]').onclick=()=>openDelete({kind:"tracks",artist:a,album:al,tracks:[t[0]]});
+    wrap.appendChild(r);
+  });
+  if (selectable){
+    const here=[...sel].filter(s=>s.startsWith(key+"/")).map(s=>s.slice(key.length+1));
+    const bar=el(`<div class="selbar ${here.length?"on":""}"><b>${here.length} selected</b><button data-act="move">Move selected</button><button data-act="del">Delete selected</button><button class="ghost" data-act="clear">Clear</button></div>`);
+    bar.querySelector('[data-act="move"]').onclick=()=>openMove({kind:"tracks",artist:a,album:al,tracks:here});
+    bar.querySelector('[data-act="del"]').onclick=()=>openDelete({kind:"tracks",artist:a,album:al,tracks:here});
+    bar.querySelector('[data-act="clear"]').onclick=()=>{sel.clear();render();};
+    wrap.appendChild(bar);
+  }
+  return wrap;
+}
+function el(h){ const d=document.createElement("div"); d.innerHTML=h.trim(); return d.firstChild; }
+function esc(s){ return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function toast(m){ const t=$("toastEl"); t.textContent=m; t.classList.add("on"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("on"),2600); }
+
+// tabs
+document.querySelectorAll(".tab").forEach(b=>b.onclick=()=>showTab(b.dataset.tab));
+function showTab(name){ document.querySelectorAll(".tab").forEach(b=>b.classList.toggle("on",b.dataset.tab===name)); ["download","library","trash"].forEach(t=>$("tab-"+t).classList.toggle("hidden",t!==name)); }
+
+// move dialog
+function openMove(p){
+  pending=p; $("moveErr").classList.remove("on");
+  const lbl = al => al||looseLabel;
+  $("moveTitle").textContent = p.kind==="artist"?"Rename artist":"Move";
+  $("moveWhat").textContent = p.kind==="artist" ? `Rename "${p.artist}"` : p.kind==="album" ? `Album "${p.album}" (${lib[p.artist][p.album].length} tracks) from ${p.artist}` : (p.tracks.length===1?`"${p.tracks[0]}"`:`${p.tracks.length} tracks`)+` from ${p.artist} / ${lbl(p.album)}`;
+  $("albumField").style.display = p.kind==="tracks"?"":"none";
+  $("artistIn").value=p.artist; $("albumIn").value=p.kind==="tracks"?p.album:"";
+  moveDlg.showModal(); $("artistIn").focus(); $("artistIn").select();
+}
+function combo(inputId,listId,options){
+  const inp=$(inputId), ul=$(listId), box=inp.parentElement;
+  const draw=()=>{ const q=inp.value.trim().toLowerCase(); const hits=options().filter(o=>o.toLowerCase().includes(q)); ul.innerHTML=""; for(const o of hits){ const li=document.createElement("li"); li.textContent=o; li.onmousedown=()=>{inp.value=o;box.classList.remove("open");inp.dispatchEvent(new Event("change"));}; ul.appendChild(li);} if(q&&!options().some(o=>o.toLowerCase()===q)){ const li=document.createElement("li"); li.className="new"; li.textContent=`Create "${inp.value.trim()}"`; li.onmousedown=()=>box.classList.remove("open"); ul.appendChild(li);} box.classList.toggle("open",hits.length>0||q.length>0); };
+  inp.onfocus=draw; inp.oninput=draw; inp.onblur=()=>setTimeout(()=>box.classList.remove("open"),120);
+}
+combo("artistIn","artistList",()=>Object.keys(lib).filter(a=>!isSyn(a)).sort());
+combo("albumIn","albumList",()=>{ const a=$("artistIn").value.trim(); return lib[a]?albumsOf(a):[]; });
+$("artistIn").addEventListener("change",()=>{ $("albumIn").value=""; });
+
+function doMove(){
+  const p=pending, na=$("artistIn").value.trim(), nal=$("albumIn").value.trim();
+  const err=m=>{ $("moveErr").textContent=m; $("moveErr").classList.add("on"); };
+  if(!na) return err("Artist is required.");
+  if([na,nal].some(x=>x==="."||x===".."||/[\\/]/.test(x))) return err("Names cannot contain / or \\ and cannot be . or ..");
+  if(p.kind==="artist"){
+    if(na===p.artist) return moveDlg.close();
+    if(lib[na]) return err(`"${na}" already exists. Move its albums instead.`);
+    lib[na]=lib[p.artist]; delete lib[p.artist]; view={artist:na,album:null}; toast(`Renamed to ${na}; tags rewritten in ${cnt(na)} files`);
+  } else if(p.kind==="album"){
+    lib[na] ??= {}; const src=lib[p.artist][p.album], dst=lib[na][p.album]??[];
+    const clash=src.filter(t=>dst.some(d=>d[0]===t[0])).map(t=>t[0]);
+    if(clash.length) return err(`Refused (409): ${na} / ${p.album} already has ${clash.join(", ")}. Nothing was moved.`);
+    lib[na][p.album]=dst.concat(src); delete lib[p.artist][p.album]; tidy(p.artist); view={artist:na,album:p.album};
+    toast(`Moved ${src.length} tracks to ${na} / ${p.album}`);
+  } else {
+    lib[na] ??= {}; lib[na][nal] ??= [];
+    const clash=p.tracks.filter(t=>lib[na][nal].some(d=>d[0]===t));
+    if(clash.length) return err(`Refused (409): ${na} / ${nal||looseLabel} already has ${clash.join(", ")}. Nothing was moved.`);
+    const src=lib[p.artist][p.album], moving=src.filter(t=>p.tracks.includes(t[0]));
+    lib[p.artist][p.album]=src.filter(t=>!p.tracks.includes(t[0])); lib[na][nal].push(...moving); tidy(p.artist,p.album);
+    toast(`Moved ${moving.length} track${moving.length>1?"s":""} to ${na}${nal?" / "+nal:" (loose)"}${nal?"":"; ALBUM tag cleared"}`);
+  }
+  sel.clear(); moveDlg.close(); render();
+}
+function tidy(a,al){ if(!lib[a]) return; if(al!==undefined && lib[a][al] && !lib[a][al].length) delete lib[a][al]; if(!Object.keys(lib[a]).length) delete lib[a]; }
+
+// delete / trash
+function openDelete(p){
+  pending=p;
+  const n = p.kind==="artist"?cnt(p.artist):p.kind==="album"?lib[p.artist][p.album].length:p.tracks.length;
+  const name = p.kind==="artist"?p.artist:p.kind==="album"?p.album:(p.tracks.length===1?p.tracks[0]:`${p.tracks.length} tracks`);
+  $("delWhat").textContent=`Move "${name}" (${n} track${n!==1?"s":""}) to trash?`; delDlg.showModal();
+}
+function doDelete(){
+  const p=pending, when=new Date().toISOString().slice(0,16).replace("T"," ");
+  if(p.kind==="artist"){ trash.push({when,path:p.artist,payload:{kind:"artist",artist:p.artist,data:lib[p.artist]},n:cnt(p.artist)}); delete lib[p.artist]; }
+  else if(p.kind==="album"){ trash.push({when,path:`${p.artist}/${p.album}`,payload:{kind:"album",artist:p.artist,album:p.album,data:lib[p.artist][p.album]},n:lib[p.artist][p.album].length}); delete lib[p.artist][p.album]; tidy(p.artist); }
+  else { const src=lib[p.artist][p.album]; for(const t of p.tracks){ const row=src.find(x=>x[0]===t); trash.push({when,path:`${p.artist}/${p.album?p.album+"/":""}${t}.${row[2]}`,payload:{kind:"track",artist:p.artist,album:p.album,data:row},n:1}); } lib[p.artist][p.album]=src.filter(x=>!p.tracks.includes(x[0])); tidy(p.artist,p.album); }
+  sel.clear(); delDlg.close(); toast("Moved to trash; Navidrome and Lidarr rescan requested"); render();
+}
+function renderTrash(){
+  const box=$("trash"); box.innerHTML="";
+  const tab=document.querySelector(".tab.trash");
+  tab.classList.toggle("hidden",!trash.length); $("trashBadge").textContent=trash.length;
+  $("trashcnt").textContent=`· ${trash.length} item${trash.length!==1?"s":""}`;
+  if(!trash.length){ if(!$("tab-trash").classList.contains("hidden")) showTab("library"); return; }
+  trash.forEach((e,i)=>{ const r=el(`<div class="row"><span class="path">${esc(e.path)}</span><span class="sub">${e.n} track${e.n!==1?"s":""} · deleted ${e.when}</span><button class="ghost">Restore</button></div>`); r.querySelector("button").onclick=()=>restore(i); box.appendChild(r); });
+}
+function restore(i){
+  const e=trash[i], p=e.payload;
+  if(p.kind==="artist"){ if(lib[p.artist]) return conflict(e.path); lib[p.artist]=p.data; }
+  else if(p.kind==="album"){ lib[p.artist]??={}; if(lib[p.artist][p.album]) return conflict(e.path); lib[p.artist][p.album]=p.data; }
+  else { lib[p.artist]??={}; lib[p.artist][p.album]??=[]; if(lib[p.artist][p.album].some(t=>t[0]===p.data[0])) return conflict(e.path); lib[p.artist][p.album].push(p.data); }
+  trash.splice(i,1); toast(`Restored ${e.path}`); render();
+}
+function conflict(path){ toast(`Refused (409): ${path} already exists. Use Move to restore elsewhere.`); }
+function confirmEmpty(){ const n=trash.reduce((s,e)=>s+e.n,0); $("emptyWhat").textContent=`Permanently delete ${trash.length} item${trash.length!==1?"s":""} (${n} track${n!==1?"s":""})?`; emptyDlg.showModal(); }
+function doEmpty(){ trash=[]; emptyDlg.close(); toast("Trash emptied"); render(); }
+render();
+</script>

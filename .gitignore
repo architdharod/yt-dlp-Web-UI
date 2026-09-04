@@ -46,3 +46,6 @@ frontend/build/
 # Traefik
 acme.json
 letsencrypt/
+
+# Build info
+frontend/tsconfig.tsbuildinfo

@@ -7,16 +7,56 @@ Artist and album are resolved using a priority chain:
     1. User-provided values (if given)
     2. yt-dlp extracted metadata (fallback)
     3. "Unknown Artist" / "Unknown Album" (final fallback)
+
+Every path component is sanitised so that user- or site-supplied names can
+never escape ``DOWNLOAD_PATH`` (no separators, no ``..``, no absolute paths).
 """
 
 import logging
 from pathlib import Path
+
+from yt_dlp.utils import sanitize_filename
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DOWNLOAD_PATH = "/data/music/downloads"
 FALLBACK_ARTIST = "Unknown Artist"
 FALLBACK_ALBUM = "Unknown Album"
+
+# Scratch directory inside DOWNLOAD_PATH where yt-dlp writes everything
+# unfinished, and the directory Phase 7 moves deleted tracks into.  Both are
+# hidden so music library scanners skip them, and both live here rather than in
+# the downloader because this module has to keep them out of artist/album names.
+TEMP_DIRNAME = ".tmp"
+TRASH_DIRNAME = ".trash"
+
+# Names that must never become a path component: "." and ".." mean "this
+# directory" and "parent directory", and the two housekeeping directories are
+# swept by the boot cleanup, which would happily delete an artist called ".tmp".
+# ``sanitize_filename`` leaves all of them alone, so we must not.  Compared
+# case-folded because the filesystem may well be case-insensitive.
+#
+# A leading dot on its own is fine: "...And You Will Know Us by the Trail of
+# Dead" is a real band.
+_RESERVED_NAMES = {".", "..", TEMP_DIRNAME, TRASH_DIRNAME}
+
+
+class UnsafePathError(ValueError):
+    """Raised when a resolved output path would fall outside DOWNLOAD_PATH."""
+
+
+def sanitize_component(value: str, fallback: str) -> str:
+    """Turn an arbitrary string into a single safe path component.
+
+    Path separators are replaced with look-alike characters by yt-dlp's
+    ``sanitize_filename``; empty results and the reserved names it leaves
+    untouched (see :data:`_RESERVED_NAMES`) fall back to *fallback*.
+    """
+    cleaned = sanitize_filename(value).strip()
+    if not cleaned or cleaned.casefold() in _RESERVED_NAMES:
+        logger.debug("Component %r is unsafe or empty, using fallback %r", value, fallback)
+        return fallback
+    return cleaned
 
 
 def _resolve(
@@ -60,10 +100,25 @@ def get_output_path(
 
     Returns:
         Path object: download_path / Artist / Album / track_filename
-    """
-    artist = _resolve("artist", user_artist, ytdlp_artist, FALLBACK_ARTIST)
-    album = _resolve("album", user_album, ytdlp_album, FALLBACK_ALBUM)
 
-    output = Path(download_path) / artist / album / track_filename
+    Raises:
+        UnsafePathError: If the resulting path would fall outside download_path.
+    """
+    artist = sanitize_component(
+        _resolve("artist", user_artist, ytdlp_artist, FALLBACK_ARTIST), FALLBACK_ARTIST
+    )
+    album = sanitize_component(
+        _resolve("album", user_album, ytdlp_album, FALLBACK_ALBUM), FALLBACK_ALBUM
+    )
+    filename = sanitize_component(track_filename, "Unknown Title.flac")
+
+    root = Path(download_path)
+    output = root / artist / album / filename
+
+    # Belt and braces: even after sanitising, refuse anything that resolves
+    # outside the download root.
+    if not output.resolve().is_relative_to(root.resolve()):
+        raise UnsafePathError(f"Output path {output} escapes download root {root}")
+
     logger.info("Resolved output path: %s", output)
     return output

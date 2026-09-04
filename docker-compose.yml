@@ -1,12 +1,14 @@
+# Homelab stack. This file pulls prebuilt images from GHCR and does not build
+# anything locally. For development, `docker-compose.override.yml` sits next to
+# this file and adds the `build:` blocks back, so `docker compose up --build`
+# builds from source. Do not copy the override file to the homelab.
 services:
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        VITE_API_BASE_URL: /api
+    image: ghcr.io/architdharod/music-for-arr-frontend:latest
     container_name: yt-dlp-web-ui-frontend
     restart: unless-stopped
+    depends_on:
+      - backend
     ports:
       - "${FRONTEND_PORT:-3033}:80"
     labels:
@@ -19,15 +21,19 @@ services:
       - homepage.weight=20
 
   backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/architdharod/music-for-arr-backend:latest
     container_name: yt-dlp-web-ui-backend
-    user: "1000:1000"
+    user: "${PUID:-1000}:${PGID:-1000}"
     restart: unless-stopped
     environment:
-      - DOWNLOAD_PATH=${DOWNLOAD_PATH}
-      - DOWNLOAD_TIMEOUT_SECONDS=${DOWNLOAD_TIMEOUT_SECONDS}
-      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS}
+      - DOWNLOAD_PATH=${DOWNLOAD_PATH:-/data/music/downloads}
+      - DOWNLOAD_TIMEOUT_SECONDS=${DOWNLOAD_TIMEOUT_SECONDS:-900}
+      - MAX_CONCURRENT_DOWNLOADS=${MAX_CONCURRENT_DOWNLOADS:-2}
+      - DATA_PATH=/config
+      - HOME=/tmp
     volumes:
-      - ${DOWNLOAD_PATH}:${DOWNLOAD_PATH}
+      - ${DOWNLOAD_PATH:-/data/music/downloads}:${DOWNLOAD_PATH:-/data/music/downloads}
+      - music-for-arr-data:/config
+
+volumes:
+  music-for-arr-data: {}

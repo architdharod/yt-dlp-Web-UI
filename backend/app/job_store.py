@@ -1,0 +1,403 @@
+"""SQLite persistence for the job queue.
+
+The queue itself stays in memory (``QueueManager`` owns the dispatcher and one
+asyncio task per job); this module is the write-through mirror that lets the
+queue survive a restart.  Every state transition is written here *before* its
+SSE event is emitted, so the table is never behind what a client has seen.
+
+Design notes:
+
+* **stdlib ``sqlite3``, no new dependency.**  One connection, guarded by a
+  ``threading.Lock`` and opened with ``check_same_thread=False`` because yt-dlp's
+  progress and postprocessor hooks run on executor threads and can trigger a
+  status change from there.  Every statement goes through :meth:`JobStore._execute`,
+  so the whole module could be moved behind ``asyncio.to_thread`` later if the
+  (currently tiny) blocking writes ever show up in SSE latency.
+* **WAL** so a reader never blocks the writer, and ``foreign_keys=ON`` so the
+  ``parent_id`` self-reference actually cascades when a bulk parent is deleted.
+* **Transactions**: the connection is opened with ``autocommit=True`` -- the
+  Python 3.12+ spelling of the old ``isolation_level=None`` -- because every
+  normal write is a single statement and a long-lived open transaction would
+  pin the WAL snapshot.  The multi-statement migration wraps itself in an
+  explicit ``BEGIN``/``COMMIT``.
+* **Schema versioning** is ``PRAGMA user_version`` against a numbered list of
+  migrations applied at open.  No Alembic.
+
+Timestamps are stored as ISO-8601 UTC strings.  Progress is deliberately *not*
+stored: after a restart an interrupted job re-runs from zero anyway.
+"""
+
+import logging
+import os
+import sqlite3
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+
+from app.models import Job, JobKind, JobStatus
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DATA_PATH = "/config"
+DB_FILENAME = "queue.db"
+
+# Statuses a job never comes back from and that the retention sweep may drop.
+# ``error`` is deliberately absent: an errored job stays until it is dismissed.
+TERMINAL_STATUSES: tuple[JobStatus, ...] = (JobStatus.DONE, JobStatus.CANCELLED)
+
+# Columns of the ``jobs`` table, in the order the row tuple carries them.
+_COLUMNS: tuple[str, ...] = (
+    "id",
+    "kind",
+    "parent_id",
+    "status",
+    "url",
+    "title",
+    "thumbnail_url",
+    "duration",
+    "artist",
+    "album",
+    "path",
+    "result_path",
+    "error",
+    "attempts",
+    "restart_attempts",
+    "created_at",
+    "updated_at",
+    "finished_at",
+)
+
+# Each entry is one schema version: the statements that take the database from
+# version N-1 to version N.  Never edit an entry that has shipped; append a new
+# one instead.  Migration 1 is Phase 1's schema and has not shipped yet, so it
+# is still being edited in place; from the first release onwards it is frozen.  The full column set is created in migration 1 even though later
+# phases (bulk parents, tagging jobs, cancel) are what fill most of it in --
+# adding columns later would mean a migration per phase for no benefit.
+_MIGRATIONS: tuple[tuple[str, ...], ...] = (
+    (
+        """
+        CREATE TABLE jobs (
+            id            TEXT PRIMARY KEY,
+            kind          TEXT NOT NULL CHECK(kind IN ('download', 'bulk', 'tagging')),
+            parent_id     TEXT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+            status        TEXT NOT NULL,
+            url           TEXT,
+            title         TEXT,
+            thumbnail_url TEXT,
+            duration      REAL,
+            artist        TEXT,
+            album         TEXT,
+            path          TEXT,
+            result_path   TEXT,
+            error         TEXT,
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            restart_attempts INTEGER NOT NULL DEFAULT 0,
+            created_at    TEXT NOT NULL,
+            updated_at    TEXT NOT NULL,
+            finished_at   TEXT NULL
+        )
+        """,
+        # load_active() filters on status; the retention sweep filters on
+        # status plus a timestamp; children are looked up by parent.
+        "CREATE INDEX idx_jobs_status ON jobs(status)",
+        "CREATE INDEX idx_jobs_parent_id ON jobs(parent_id)",
+        "CREATE INDEX idx_jobs_created_at ON jobs(created_at)",
+    ),
+)
+
+SCHEMA_VERSION = len(_MIGRATIONS)
+
+
+class JobStoreError(Exception):
+    """Raised when the job database cannot be opened or migrated."""
+
+
+def get_data_path() -> str:
+    """Return the configured ``DATA_PATH``, falling back to the default.
+
+    docker compose substitutes an unset variable with an empty string, so
+    ``""`` counts as unset rather than as the current directory.
+    """
+    return os.environ.get("DATA_PATH") or DEFAULT_DATA_PATH
+
+
+def get_db_path(data_path: str | None = None) -> Path:
+    """Return the path of ``queue.db`` inside *data_path* (or ``DATA_PATH``)."""
+    return Path(data_path or get_data_path()) / DB_FILENAME
+
+
+def _to_iso(value: datetime | None) -> str | None:
+    """Serialise a datetime as an ISO-8601 UTC string."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _from_iso(value: str | None) -> datetime | None:
+    """Parse an ISO-8601 string written by :func:`_to_iso`."""
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+class JobStore:
+    """Write-through SQLite store for :class:`~app.models.Job` rows.
+
+    Args:
+        db_path: Path of the database file.  Its parent directory must already
+            exist; the app validates ``DATA_PATH`` at startup so a missing or
+            read-only directory fails fast there rather than here.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self._db_path = Path(db_path)
+        self._lock = threading.Lock()
+        # Set by close(); writes after it are dropped rather than raising
+        # sqlite3.ProgrammingError from whatever thread got there last.
+        self._closed = False
+        try:
+            self._conn = sqlite3.connect(
+                self._db_path,
+                check_same_thread=False,
+                autocommit=True,
+            )
+        except sqlite3.Error as exc:
+            raise JobStoreError(f"Cannot open job database {self._db_path}: {exc}") from exc
+
+        self._conn.row_factory = sqlite3.Row
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._migrate()
+        except sqlite3.Error as exc:
+            self._conn.close()
+            raise JobStoreError(f"Cannot initialise job database {self._db_path}: {exc}") from exc
+
+        logger.info(
+            "Job store open at %s (schema version %s)", self._db_path, SCHEMA_VERSION
+        )
+
+    # ------------------------------------------------------------------
+    # Schema
+    # ------------------------------------------------------------------
+
+    def _migrate(self) -> None:
+        """Apply every migration the database has not seen yet."""
+        version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise JobStoreError(
+                f"Job database {self._db_path} is at schema version {version}, "
+                f"newer than this build understands ({SCHEMA_VERSION}). "
+                "Downgrading is not supported."
+            )
+        for target in range(version + 1, SCHEMA_VERSION + 1):
+            logger.info("Migrating job database to schema version %s", target)
+            self._conn.execute("BEGIN")
+            try:
+                for statement in _MIGRATIONS[target - 1]:
+                    self._conn.execute(statement)
+                # PRAGMA user_version does not accept a bound parameter, and
+                # `target` is a loop index over our own list, never user input.
+                self._conn.execute(f"PRAGMA user_version = {target}")
+            except sqlite3.Error:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+
+    @property
+    def schema_version(self) -> int:
+        """Return the ``user_version`` currently recorded in the database."""
+        with self._lock:
+            return self._conn.execute("PRAGMA user_version").fetchone()[0]
+
+    # ------------------------------------------------------------------
+    # Row <-> Job
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _to_row(job: Job) -> tuple:
+        """Flatten a Job into the column order of :data:`_COLUMNS`."""
+        return (
+            job.id,
+            job.kind.value,
+            job.parent_id,
+            job.status.value,
+            job.url,
+            job.title,
+            job.thumbnail_url,
+            job.duration,
+            job.artist,
+            job.album,
+            job.path,
+            job.result_path,
+            job.error,
+            job.attempts,
+            job.restart_attempts,
+            _to_iso(job.created_at),
+            _to_iso(job.updated_at),
+            _to_iso(job.finished_at),
+        )
+
+    @staticmethod
+    def _to_job(row: sqlite3.Row) -> Job:
+        """Rebuild a Job from a database row.
+
+        ``progress`` is not a column: an interrupted job re-runs from zero, and
+        a restored terminal job has no progress worth showing.
+        """
+        return Job(
+            id=row["id"],
+            kind=JobKind(row["kind"]),
+            parent_id=row["parent_id"],
+            status=JobStatus(row["status"]),
+            url=row["url"],
+            title=row["title"],
+            thumbnail_url=row["thumbnail_url"],
+            duration=row["duration"],
+            artist=row["artist"],
+            album=row["album"],
+            path=row["path"],
+            result_path=row["result_path"],
+            error=row["error"],
+            attempts=row["attempts"],
+            restart_attempts=row["restart_attempts"],
+            created_at=_from_iso(row["created_at"]),
+            updated_at=_from_iso(row["updated_at"]),
+            finished_at=_from_iso(row["finished_at"]),
+        )
+
+    # ------------------------------------------------------------------
+    # Operations
+    # ------------------------------------------------------------------
+
+    def upsert(self, job: Job) -> None:
+        """Insert *job*, or update the stored row if its id already exists.
+
+        Deliberately ``ON CONFLICT ... DO UPDATE`` rather than
+        ``INSERT OR REPLACE``: with ``foreign_keys=ON`` a REPLACE *deletes* the
+        old row first, which fires ``ON DELETE CASCADE`` and would wipe a bulk
+        parent's children every time the parent's status changed.
+
+        One statement, so the connection's autocommit mode makes it durable as
+        soon as it returns -- which is what "written before the event is
+        emitted" relies on.
+
+        ``created_at`` is insert-only, like ``id``: restore dispatches jobs in
+        ``created_at`` order, so an update must not be able to move a job to the
+        back of the queue.
+        """
+        placeholders = ", ".join("?" for _ in _COLUMNS)
+        columns = ", ".join(_COLUMNS)
+        updates = ", ".join(
+            f"{column} = excluded.{column}"
+            for column in _COLUMNS
+            if column not in ("id", "created_at")
+        )
+        with self._lock:
+            if self._closed:
+                # Shutdown races an executor thread's last write; there is
+                # nothing to persist to any more and nothing to report.
+                logger.debug("Job store closed, dropping write for job %s", job.id)
+                return
+            self._conn.execute(
+                f"INSERT INTO jobs ({columns}) VALUES ({placeholders}) "
+                f"ON CONFLICT(id) DO UPDATE SET {updates}",
+                self._to_row(job),
+            )
+
+    def delete(self, job_id: str) -> bool:
+        """Delete one job row (and, via ``ON DELETE CASCADE``, its children).
+
+        Returns ``True`` if a row was actually removed.
+        """
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, dropping delete of job %s", job_id)
+                return False
+            cursor = self._conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        return cursor.rowcount > 0
+
+    def load_active(self) -> list[Job]:
+        """Return every non-terminal row plus errored rows, oldest first.
+
+        "Active" here means everything the queue still has to show or act on:
+        ``queued``, ``downloading``, ``converting``, ``tagging`` and ``error``.
+        ``done`` and ``cancelled`` rows are left to the retention sweep.
+        """
+        terminal = [status.value for status in TERMINAL_STATUSES]
+        placeholders = ", ".join("?" for _ in terminal)
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, returning no active jobs")
+                return []
+            rows = self._conn.execute(
+                f"SELECT * FROM jobs WHERE status NOT IN ({placeholders}) "
+                "ORDER BY created_at ASC",
+                terminal,
+            ).fetchall()
+        return [self._to_job(row) for row in rows]
+
+    def get(self, job_id: str) -> Job | None:
+        """Return one job by id, or ``None``.  Used by tests and diagnostics."""
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, cannot read job %s", job_id)
+                return None
+            row = self._conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+        return self._to_job(row) if row is not None else None
+
+    def prune_terminal(self, older_than: datetime) -> list[str]:
+        """Delete ``done``/``cancelled`` rows that finished before *older_than*.
+
+        Returns the ids removed so the caller can drop the same jobs from its
+        in-memory mirror.  ``finished_at`` should always be set on a terminal
+        row; ``updated_at`` is the fallback for rows written by an older build.
+
+        Note: deleting a row cascades to its children, so reaping a bulk parent
+        reaps its child downloads with it.  Phase 10 has to decide when a bulk
+        parent counts as terminal before any parent row is ever stored.
+        """
+        cutoff = _to_iso(older_than)
+        terminal = [status.value for status in TERMINAL_STATUSES]
+        placeholders = ", ".join("?" for _ in terminal)
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, skipping retention sweep")
+                return []
+            rows = self._conn.execute(
+                f"SELECT id FROM jobs WHERE status IN ({placeholders}) "
+                "AND COALESCE(finished_at, updated_at) < ?",
+                (*terminal, cutoff),
+            ).fetchall()
+            removed = [row["id"] for row in rows]
+            if removed:
+                ids = ", ".join("?" for _ in removed)
+                self._conn.execute(f"DELETE FROM jobs WHERE id IN ({ids})", removed)
+        if removed:
+            logger.info("Retention sweep removed %d finished job(s)", len(removed))
+        return removed
+
+    def close(self) -> None:
+        """Close the connection.
+
+        Idempotent by construction: the ``_closed`` flag makes a second call a
+        no-op, and it also makes any :meth:`upsert`/:meth:`delete` that an
+        executor thread issues after shutdown a silently dropped write rather
+        than a ``sqlite3.ProgrammingError`` traceback per SSE event.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._conn.close()
+            except sqlite3.Error as exc:  # pragma: no cover - defensive
+                logger.warning("Error closing job database: %s", exc)
+        logger.info("Job store at %s closed", self._db_path)

@@ -8,6 +8,8 @@ Covers all combinations of the artist/album priority chain:
 
 from pathlib import Path
 
+import pytest
+
 from app.file_organizer import (
     DEFAULT_DOWNLOAD_PATH,
     FALLBACK_ALBUM,
@@ -245,3 +247,102 @@ class TestOutputStructure:
             download_path=DOWNLOAD,
         )
         assert result.name == fancy_name
+
+
+class TestPathTraversalIsImpossible:
+    """User-supplied artist/album/filename must never escape DOWNLOAD_PATH.
+
+    ``pathlib`` does not normalise ``..`` and an absolute component silently
+    replaces the base, so every component is sanitised and the final path is
+    checked against the root.
+    """
+
+    def _assert_contained(self, result: Path) -> None:
+        relative = result.relative_to(DOWNLOAD)
+        assert len(relative.parts) == 3
+        assert ".." not in relative.parts
+        assert "." not in relative.parts
+        assert not any(part.startswith("/") for part in relative.parts)
+        # And it really stays inside the root once symlinks/.. are resolved.
+        assert result.resolve().is_relative_to(Path(DOWNLOAD).resolve())
+
+    def test_dot_dot_traversal_in_artist_and_album(self):
+        result = get_output_path(
+            TRACK,
+            user_artist="../../etc",
+            user_album="/tmp/evil",
+            download_path=DOWNLOAD,
+        )
+        self._assert_contained(result)
+
+    def test_bare_parent_artist_falls_back(self):
+        result = get_output_path(TRACK, user_artist="..", download_path=DOWNLOAD)
+        assert result.parts[-3] == FALLBACK_ARTIST
+        self._assert_contained(result)
+
+    def test_bare_dot_artist_falls_back(self):
+        result = get_output_path(TRACK, user_artist=".", download_path=DOWNLOAD)
+        assert result.parts[-3] == FALLBACK_ARTIST
+        self._assert_contained(result)
+
+    def test_bare_parent_album_falls_back(self):
+        result = get_output_path(TRACK, user_album="..", download_path=DOWNLOAD)
+        assert result.parts[-2] == FALLBACK_ALBUM
+        self._assert_contained(result)
+
+    def test_separator_becomes_a_single_component(self):
+        result = get_output_path(TRACK, user_artist="a/b", download_path=DOWNLOAD)
+        relative = result.relative_to(DOWNLOAD)
+        assert len(relative.parts) == 3
+        assert "/" not in relative.parts[0]
+        assert relative.parts[0] != "a"
+        self._assert_contained(result)
+
+    def test_traversal_in_ytdlp_values_is_also_sanitised(self):
+        """Site metadata is no more trustworthy than user input."""
+        result = get_output_path(
+            TRACK,
+            ytdlp_artist="../../../root",
+            ytdlp_album="..",
+            download_path=DOWNLOAD,
+        )
+        assert result.parts[-2] == FALLBACK_ALBUM
+        self._assert_contained(result)
+
+    def test_parent_filename_falls_back(self):
+        result = get_output_path("..", user_artist="A", user_album="B", download_path=DOWNLOAD)
+        assert result.name == "Unknown Title.flac"
+        self._assert_contained(result)
+
+    def test_filename_with_separator_stays_one_component(self):
+        result = get_output_path(
+            "../../evil.flac", user_artist="A", user_album="B", download_path=DOWNLOAD
+        )
+        self._assert_contained(result)
+
+
+class TestHousekeepingDirectoriesAreReserved:
+    """``.tmp`` and ``.trash`` are swept by the app, so no album may live there.
+
+    ``sanitize_filename`` passes them straight through, and the boot sweep
+    rmtrees whatever it finds in ``.tmp`` -- an artist called ".tmp" would have
+    its albums deleted.
+    """
+
+    @pytest.mark.parametrize("name", [".tmp", ".TMP", ".Tmp", ".trash", ".TRASH"])
+    def test_reserved_artist_falls_back(self, name):
+        result = get_output_path(TRACK, user_artist=name, download_path=DOWNLOAD)
+        assert result.parts[-3] == FALLBACK_ARTIST
+
+    @pytest.mark.parametrize("name", [".tmp", ".TMP", ".trash"])
+    def test_reserved_album_falls_back(self, name):
+        result = get_output_path(
+            TRACK, user_artist="A", user_album=name, download_path=DOWNLOAD
+        )
+        assert result.parts[-2] == FALLBACK_ALBUM
+
+    def test_a_leading_dot_is_otherwise_fine(self):
+        """"...And You Will Know Us by the Trail of Dead" is a real band."""
+        artist = "...And You Will Know Us by the Trail of Dead"
+        result = get_output_path(TRACK, user_artist=artist, download_path=DOWNLOAD)
+        assert result.parts[-3] == artist

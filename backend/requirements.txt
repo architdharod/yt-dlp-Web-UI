@@ -1,7 +1,7 @@
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-yt-dlp>=2024.12.23
-mutagen>=1.47.0
-python-multipart==0.0.20
-pydantic==2.10.4
-sse-starlette==2.2.1
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+yt-dlp>=2026.8.19
+mutagen==1.48.1
+python-multipart==0.0.32
+pydantic==2.13.5
+sse-starlette==3.4.10

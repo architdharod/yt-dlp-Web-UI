@@ -2,10 +2,43 @@ import type { DownloadRequest, Job, SSEEvent } from "./types";
 
 /**
  * Backend base URL — configurable via VITE_API_BASE_URL env var.
- * Defaults to empty string (same-origin) for production behind Traefik,
- * or can be set to e.g. "http://localhost:8000" for local development.
+ * Defaults to empty string (same-origin) — in production nginx serves the
+ * built app and proxies "/api" to the backend, so the app is same-origin.
+ * For local development against a standalone backend set it to e.g.
+ * "http://localhost:8000".
  */
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
+
+/**
+ * Extract a human-readable message from an error response body.
+ *
+ * FastAPI returns `{"detail": "..."}` for HTTPException and
+ * `{"detail": [{"msg": "...", ...}, ...]}` for request validation errors (422).
+ */
+async function parseErrorDetail(res: Response): Promise<string> {
+  try {
+    const body: unknown = await res.json();
+    if (body && typeof body === "object" && "detail" in body) {
+      const detail = (body as { detail: unknown }).detail;
+      if (typeof detail === "string" && detail.trim().length > 0) {
+        return detail;
+      }
+      if (Array.isArray(detail)) {
+        const messages = detail
+          .map((item) =>
+            item && typeof item === "object" && typeof (item as { msg?: unknown }).msg === "string"
+              ? ((item as { msg: string }).msg)
+              : null,
+          )
+          .filter((msg): msg is string => msg !== null);
+        if (messages.length > 0) return messages.join("; ");
+      }
+    }
+  } catch {
+    // Body was not JSON — fall through to the status text.
+  }
+  return res.statusText;
+}
 
 /**
  * Submit a URL for download. Synchronously extracts metadata on the backend
@@ -19,8 +52,7 @@ export async function submitDownload(request: DownloadRequest): Promise<Job> {
   });
 
   if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Download submission failed: ${detail}`);
+    throw new Error(await parseErrorDetail(res));
   }
 
   return res.json() as Promise<Job>;
@@ -48,8 +80,7 @@ export async function retryJob(jobId: string): Promise<Job> {
   });
 
   if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(`Retry failed: ${detail}`);
+    throw new Error(await parseErrorDetail(res));
   }
 
   return res.json() as Promise<Job>;
@@ -63,6 +94,7 @@ export async function retryJob(jobId: string): Promise<Job> {
 export function connectQueueStream(
   onEvent: (event: SSEEvent) => void,
   onError?: (error: Event) => void,
+  onOpen?: () => void,
 ): () => void {
   const eventSource = new EventSource(`${API_BASE_URL}/queue/stream`);
 
@@ -77,6 +109,10 @@ export function connectQueueStream(
       }
     });
   }
+
+  eventSource.onopen = () => {
+    onOpen?.();
+  };
 
   eventSource.onerror = (e) => {
     onError?.(e);

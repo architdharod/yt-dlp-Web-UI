@@ -5,11 +5,18 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import type { Job, JobStatus } from "@/lib/types";
 
-/** Sort jobs: active (downloading/converting) first, then newest-to-oldest by created_at. */
+/** Statuses that keep a job at the top of the queue. */
+const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
+  "queued",
+  "downloading",
+  "converting",
+]);
+
+/** Sort jobs: active (queued/downloading/converting) first, then newest-to-oldest by created_at. */
 function sortJobs(jobs: Job[]): Job[] {
   return [...jobs].sort((a, b) => {
-    const aActive = a.status === "downloading" || a.status === "converting";
-    const bActive = b.status === "downloading" || b.status === "converting";
+    const aActive = ACTIVE_STATUSES.has(a.status);
+    const bActive = ACTIVE_STATUSES.has(b.status);
 
     // Active jobs always come first
     if (aActive && !bActive) return -1;
@@ -99,7 +106,9 @@ function ProgressBar({ progress }: { progress: number }) {
 }
 
 function JobItem({ job, onRetry }: { job: Job; onRetry: (id: string) => void }) {
-  const showProgress = job.status === "downloading" || job.status === "converting";
+  // Progress is only meaningful while downloading; the converting phase
+  // (ffmpeg encode) reports nothing, so it shows a spinning badge instead.
+  const showProgress = job.status === "downloading";
 
   return (
     <div className="flex gap-3 rounded-lg border p-3">

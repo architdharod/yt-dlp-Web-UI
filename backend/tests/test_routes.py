@@ -9,6 +9,9 @@ with mocked downloader and controlled queue behavior.  Covers:
 """
 
 import asyncio
+import os
+import sqlite3
+import threading
 import time
 from unittest.mock import patch
 
@@ -16,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.downloader import DownloadError, TrackMetadata
+from app.job_store import SCHEMA_VERSION, JobStore
 from app.models import Job, JobStatus, SSEEvent
 from app.queue_manager import QueueManager
 
@@ -34,6 +38,21 @@ def _make_metadata(**overrides) -> TrackMetadata:
     }
     defaults.update(overrides)
     return TrackMetadata(**defaults)
+
+
+def _blocking_download(release: threading.Event):
+    """Return a download_audio stand-in that parks until *release* is set.
+
+    GET /queue only lists in-flight and errored jobs, so a test that wants to
+    see its jobs there has to keep them from finishing first.  The autouse
+    stub in conftest returns instantly, which is right for every other test.
+    """
+
+    def fake_download(job, *args, **kwargs):
+        release.wait(timeout=5)
+        return "/data/music/output.flac"
+
+    return fake_download
 
 
 def _make_job(**overrides) -> Job:
@@ -153,10 +172,9 @@ class TestPostDownload:
         resp = client.post("/download", json={"url": "https://youtube.com/watch?v=abc"})
         job_id = resp.json()["id"]
 
-        # Job should now be in the queue
-        jobs = qm.get_jobs()
-        assert len(jobs) == 1
-        assert jobs[0].id == job_id
+        # Looked up by id rather than through get_jobs(): the stubbed download
+        # can finish first, and get_jobs() omits finished jobs.
+        assert qm.get_job(job_id) is not None
 
     def test_missing_url_returns_422(self, client):
         resp = client.post("/download", json={})
@@ -188,18 +206,29 @@ class TestPostDownload:
         assert data["thumbnail_url"] is None
         assert data["duration"] is None
         assert data["url"] == "https://youtube.com/watch?v=invalid"
-        assert len(qm.get_jobs()) == 1
+        # By id: the stubbed download may already have finished the job, and
+        # get_jobs() omits finished ones.
+        assert qm.get_job(data["id"]) is not None
 
+    @patch("app.queue_manager.download_audio")
     @patch("app.main.extract_metadata")
-    def test_multiple_submissions_create_separate_jobs(self, mock_extract, client_and_qm):
+    def test_multiple_submissions_create_separate_jobs(
+        self, mock_extract, mock_download, client_and_qm
+    ):
         client, qm = client_and_qm
         mock_extract.return_value = _make_metadata()
+        # GET /queue omits finished jobs, so both have to stay in flight.
+        release = threading.Event()
+        mock_download.side_effect = _blocking_download(release)
 
-        resp1 = client.post("/download", json={"url": "https://youtube.com/watch?v=a"})
-        resp2 = client.post("/download", json={"url": "https://youtube.com/watch?v=b"})
+        try:
+            resp1 = client.post("/download", json={"url": "https://youtube.com/watch?v=a"})
+            resp2 = client.post("/download", json={"url": "https://youtube.com/watch?v=b"})
 
-        assert resp1.json()["id"] != resp2.json()["id"]
-        assert len(qm.get_jobs()) == 2
+            assert resp1.json()["id"] != resp2.json()["id"]
+            assert len(qm.get_jobs()) == 2
+        finally:
+            release.set()
 
     @patch("app.main.extract_metadata")
     def test_response_includes_all_job_fields(self, mock_extract, client):
@@ -235,33 +264,49 @@ class TestGetQueue:
         assert resp.status_code == 200
         assert resp.json() == []
 
+    @patch("app.queue_manager.download_audio")
     @patch("app.main.extract_metadata")
-    def test_queue_returns_all_submitted_jobs(self, mock_extract, client_and_qm):
+    def test_queue_returns_all_submitted_jobs(
+        self, mock_extract, mock_download, client_and_qm
+    ):
         client, qm = client_and_qm
         mock_extract.return_value = _make_metadata()
+        release = threading.Event()
+        mock_download.side_effect = _blocking_download(release)
 
-        client.post("/download", json={"url": "https://youtube.com/watch?v=a"})
-        client.post("/download", json={"url": "https://youtube.com/watch?v=b"})
+        try:
+            client.post("/download", json={"url": "https://youtube.com/watch?v=a"})
+            client.post("/download", json={"url": "https://youtube.com/watch?v=b"})
 
-        resp = client.get("/queue")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert len(data) == 2
+            resp = client.get("/queue")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert len(data) == 2
+        finally:
+            release.set()
 
+    @patch("app.queue_manager.download_audio")
     @patch("app.main.extract_metadata")
-    def test_queue_returns_current_job_state(self, mock_extract, client_and_qm):
+    def test_queue_returns_current_job_state(
+        self, mock_extract, mock_download, client_and_qm
+    ):
         client, qm = client_and_qm
         mock_extract.return_value = _make_metadata()
+        release = threading.Event()
+        mock_download.side_effect = _blocking_download(release)
 
-        client.post("/download", json={"url": "https://youtube.com/watch?v=a"})
+        try:
+            client.post("/download", json={"url": "https://youtube.com/watch?v=a"})
 
-        resp = client.get("/queue")
-        data = resp.json()
-        assert len(data) == 1
-        assert data[0]["url"] == "https://youtube.com/watch?v=a"
-        assert data[0]["title"] == "Never Gonna Give You Up"
-        # Status could be queued or already progressing (downloading)
-        assert data[0]["status"] in ["queued", "downloading", "converting", "done", "error"]
+            resp = client.get("/queue")
+            data = resp.json()
+            assert len(data) == 1
+            assert data[0]["url"] == "https://youtube.com/watch?v=a"
+            assert data[0]["title"] == "Never Gonna Give You Up"
+            # Status could be queued or already progressing (downloading)
+            assert data[0]["status"] in ["queued", "downloading", "converting"]
+        finally:
+            release.set()
 
 
 # ===========================================================================
@@ -382,7 +427,11 @@ class TestSSEStream:
                 main_module._sse_clients.remove(q2)
 
     async def test_broadcast_handles_full_queue_gracefully(self):
-        """If a client queue is full, the event is dropped without error."""
+        """A full client queue loses its OLDEST event, not the newest.
+
+        Dropping the newest would lose the terminal done/error event and
+        leave the card stuck at "Downloading 100%" forever.
+        """
         import app.main as main_module
 
         q_full: asyncio.Queue[SSEEvent] = asyncio.Queue(maxsize=1)
@@ -396,8 +445,11 @@ class TestSSEStream:
             event = SSEEvent(event="status_change", job_id="test-2", data={"status": "done"})
             # Should not raise
             await main_module._broadcast_event(event)
-            # Queue still has the original event, not the new one
+            # Still bounded, and the stale filler was the one discarded.
             assert q_full.qsize() == 1
+            kept = q_full.get_nowait()
+            assert kept.job_id == "test-2"
+            assert kept.event == "status_change"
         finally:
             async with main_module._sse_clients_lock:
                 main_module._sse_clients.remove(q_full)
@@ -556,29 +608,35 @@ class TestSSEStream:
 class TestFullFlow:
     """End-to-end integration tests verifying the submit → metadata → download flow."""
 
+    _blocking_download = staticmethod(_blocking_download)
+
     @patch("app.queue_manager.download_audio")
     @patch("app.main.extract_metadata")
     def test_submit_then_check_queue(self, mock_extract, mock_download, client_and_qm):
         """Submit a URL, verify it appears in the queue with correct metadata."""
         client, qm = client_and_qm
         mock_extract.return_value = _make_metadata()
-        mock_download.return_value = "/data/music/output.flac"
+        release = threading.Event()
+        mock_download.side_effect = self._blocking_download(release)
 
-        # Submit
-        submit_resp = client.post(
-            "/download",
-            json={"url": "https://youtube.com/watch?v=flow", "artist": "Test Artist"},
-        )
-        assert submit_resp.status_code == 200
-        job_id = submit_resp.json()["id"]
+        try:
+            # Submit
+            submit_resp = client.post(
+                "/download",
+                json={"url": "https://youtube.com/watch?v=flow", "artist": "Test Artist"},
+            )
+            assert submit_resp.status_code == 200
+            job_id = submit_resp.json()["id"]
 
-        # Check queue immediately
-        queue_resp = client.get("/queue")
-        jobs = queue_resp.json()
-        assert len(jobs) == 1
-        assert jobs[0]["id"] == job_id
-        assert jobs[0]["title"] == "Never Gonna Give You Up"
-        assert jobs[0]["artist"] == "Test Artist"
+            # Check queue while the job is still in flight
+            queue_resp = client.get("/queue")
+            jobs = queue_resp.json()
+            assert len(jobs) == 1
+            assert jobs[0]["id"] == job_id
+            assert jobs[0]["title"] == "Never Gonna Give You Up"
+            assert jobs[0]["artist"] == "Test Artist"
+        finally:
+            release.set()
 
     @patch("app.queue_manager.download_audio")
     @patch("app.main.extract_metadata")
@@ -629,16 +687,427 @@ class TestFullFlow:
         """Submit multiple URLs and verify each is tracked independently."""
         client, qm = client_and_qm
         mock_extract.return_value = _make_metadata()
+        release = threading.Event()
+        mock_download.side_effect = self._blocking_download(release)
+
+        try:
+            ids = []
+            for i in range(3):
+                resp = client.post("/download", json={"url": f"https://youtube.com/watch?v={i}"})
+                ids.append(resp.json()["id"])
+
+            # All should be unique
+            assert len(set(ids)) == 3
+
+            # Queue should have all 3 while they are still in flight
+            queue_resp = client.get("/queue")
+            assert {job["id"] for job in queue_resp.json()} == set(ids)
+        finally:
+            release.set()
+
+
+# ===========================================================================
+# URL validation at the API edge
+# ===========================================================================
+
+
+class TestUrlValidation:
+    """yt-dlp's generic extractor would happily fetch anything on the
+    container network, so unsupported URLs never reach it."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://example.com/x",
+            "http://localhost:8000/health",
+            "http://192.168.1.1/",
+            "file:///etc/passwd",
+            "ftp://youtube.com/watch?v=abc",
+        ],
+    )
+    def test_unsupported_url_returns_422(self, url, client):
+        resp = client.post("/download", json={"url": url})
+        assert resp.status_code == 422
+
+    @patch("app.main.extract_metadata")
+    def test_supported_url_is_accepted(self, mock_extract, client):
+        mock_extract.return_value = _make_metadata()
+        resp = client.post("/download", json={"url": "https://youtu.be/abc"})
+        assert resp.status_code == 200
+
+
+# ===========================================================================
+# Duplicate submissions
+# ===========================================================================
+
+
+class TestDuplicateSubmission:
+    """Submitting the same URL twice would put two yt-dlp runs on one file."""
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_duplicate_in_flight_url_returns_409(
+        self, mock_extract, mock_download, client_and_qm
+    ):
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata()
+
+        release = threading.Event()
+
+        def blocking_download(job, on_progress, cancel_event=None, on_phase=None):
+            release.wait(5)
+            return "/data/music/output.flac"
+
+        mock_download.side_effect = blocking_download
+
+        url = "https://www.youtube.com/watch?v=dupe"
+        try:
+            first = client.post("/download", json={"url": url})
+            assert first.status_code == 200
+
+            second = client.post("/download", json={"url": url})
+            assert second.status_code == 409
+            assert "already in the queue" in second.json()["detail"]
+
+            assert len(qm.get_jobs()) == 1
+        finally:
+            release.set()
+
+        job_id = first.json()["id"]
+        for _ in range(100):
+            if qm.get_job(job_id).status == JobStatus.DONE:
+                break
+            time.sleep(0.05)
+        assert qm.get_job(job_id).status == JobStatus.DONE
+
+
+# ===========================================================================
+# Metadata probe timeout
+# ===========================================================================
+
+
+class TestMetadataTimeout:
+    """A slow probe must not hold POST /download open past nginx's timeout."""
+
+    @patch("app.main.extract_metadata")
+    def test_slow_metadata_still_enqueues_the_job(self, mock_extract, client_and_qm):
+        client, qm = client_and_qm
+
+        def slow_extract(url):
+            time.sleep(0.5)
+            return _make_metadata()
+
+        mock_extract.side_effect = slow_extract
+
+        with patch("app.main.METADATA_TIMEOUT_SECONDS", 0.05):
+            resp = client.post("/download", json={"url": "https://youtube.com/watch?v=slow"})
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "queued"
+        assert data["title"] is None
+        assert data["duration"] is None
+        assert len(qm.get_jobs()) == 1
+
+
+# ===========================================================================
+# Startup configuration check
+# ===========================================================================
+
+
+class TestStartupChecks:
+    """A misconfigured DOWNLOAD_PATH or DATA_PATH must fail the container.
+
+    Failing at startup beats turning every job (or every queue write) into a
+    permission-denied traceback later.
+    """
+
+    def test_missing_download_path_fails_startup(self, monkeypatch, tmp_path):
+        import app.main as main_module
+
+        monkeypatch.setenv("DOWNLOAD_PATH", str(tmp_path / "does-not-exist"))
+
+        with pytest.raises(RuntimeError, match="does not exist"):
+            with TestClient(main_module.app):
+                pass
+
+    def test_unwritable_download_path_fails_startup(self, monkeypatch, tmp_path):
+        import app.main as main_module
+
+        readonly = tmp_path / "readonly"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        monkeypatch.setenv("DOWNLOAD_PATH", str(readonly))
+
+        try:
+            with pytest.raises(RuntimeError, match="not writable"):
+                with TestClient(main_module.app):
+                    pass
+        finally:
+            readonly.chmod(0o700)
+
+    def test_a_plain_file_as_download_path_fails_startup(self, monkeypatch, tmp_path):
+        """A writable regular file passed os.access but is not a directory."""
+        import app.main as main_module
+
+        not_a_dir = tmp_path / "a-file"
+        not_a_dir.write_text("x")
+        monkeypatch.setenv("DOWNLOAD_PATH", str(not_a_dir))
+
+        with pytest.raises(RuntimeError, match="not a directory"):
+            with TestClient(main_module.app):
+                pass
+
+    def test_a_plain_file_as_data_path_fails_startup(self, monkeypatch, tmp_path):
+        import app.main as main_module
+
+        not_a_dir = tmp_path / "config-file"
+        not_a_dir.write_text("x")
+        monkeypatch.setenv("DATA_PATH", str(not_a_dir))
+
+        with pytest.raises(RuntimeError, match="not a directory"):
+            with TestClient(main_module.app):
+                pass
+
+    def test_writable_download_path_starts_up(self, client):
+        assert client.get("/health").status_code == 200
+
+
+# ===========================================================================
+# CORS
+# ===========================================================================
+
+
+class TestCors:
+    """Production is same-origin through nginx; CORS is opt-in for vite dev."""
+
+    def test_no_origins_configured_by_default(self, monkeypatch):
+        import app.main as main_module
+
+        monkeypatch.delenv("CORS_ORIGINS", raising=False)
+        assert main_module._cors_origins() == []
+
+    def test_empty_value_counts_as_unset(self, monkeypatch):
+        import app.main as main_module
+
+        monkeypatch.setenv("CORS_ORIGINS", "")
+        assert main_module._cors_origins() == []
+
+    def test_comma_separated_origins_are_parsed(self, monkeypatch):
+        import app.main as main_module
+
+        monkeypatch.setenv(
+            "CORS_ORIGINS", "http://localhost:5173, http://127.0.0.1:5173 ,"
+        )
+        assert main_module._cors_origins() == [
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ]
+
+    def test_no_cors_middleware_installed_by_default(self):
+        import app.main as main_module
+        from fastapi.middleware.cors import CORSMiddleware
+
+        assert not any(
+            m.cls is CORSMiddleware for m in main_module.app.user_middleware
+        )
+
+    def test_response_carries_no_wildcard_origin_header(self, client):
+        resp = client.get("/health", headers={"Origin": "https://evil.example"})
+        assert resp.status_code == 200
+        assert "access-control-allow-origin" not in resp.headers
+
+
+class TestDataPathStartupChecks:
+    """DATA_PATH holds queue.db, so it gets the same fail-fast treatment."""
+
+    def test_missing_data_path_fails_startup(self, monkeypatch, tmp_path):
+        import app.main as main_module
+
+        monkeypatch.setenv("DATA_PATH", str(tmp_path / "does-not-exist"))
+
+        with pytest.raises(RuntimeError, match="DATA_PATH.*does not exist"):
+            with TestClient(main_module.app):
+                pass
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0, reason="root ignores directory permissions"
+    )
+    def test_unwritable_data_path_fails_startup(self, monkeypatch, tmp_path):
+        import app.main as main_module
+
+        readonly = tmp_path / "readonly-config"
+        readonly.mkdir()
+        readonly.chmod(0o500)
+        monkeypatch.setenv("DATA_PATH", str(readonly))
+
+        try:
+            with pytest.raises(RuntimeError, match="DATA_PATH.*not writable"):
+                with TestClient(main_module.app):
+                    pass
+        finally:
+            # Restore write permission so pytest can clean tmp_path up.
+            readonly.chmod(0o700)
+
+
+class TestQueueDatabaseLifecycle:
+    """The store is opened, restored from, and closed by the app lifespan."""
+
+    def test_startup_creates_the_database(self, client, isolated_paths):
+        _, data_dir = isolated_paths
+
+        assert client.get("/health").status_code == 200
+        assert (data_dir / "queue.db").exists()
+
+    def test_schema_version_is_stamped(self, client, isolated_paths):
+        _, data_dir = isolated_paths
+
+        conn = sqlite3.connect(data_dir / "queue.db")
+        try:
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        finally:
+            conn.close()
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_a_submitted_job_is_written_to_the_database(
+        self, mock_extract, mock_download, client_and_qm, isolated_paths
+    ):
+        client, qm = client_and_qm
+        _, data_dir = isolated_paths
+        mock_extract.return_value = _make_metadata()
+        release = threading.Event()
+        mock_download.side_effect = TestFullFlow._blocking_download(release)
+
+        try:
+            resp = client.post("/download", json={"url": "https://youtube.com/watch?v=persist"})
+            job_id = resp.json()["id"]
+
+            store = JobStore(data_dir / "queue.db")
+            try:
+                assert store.get(job_id) is not None
+            finally:
+                store.close()
+        finally:
+            release.set()
+
+    @patch("app.main.extract_metadata")
+    def test_a_queued_job_reappears_after_a_restart(
+        self, mock_extract, fresh_app, isolated_paths
+    ):
+        """The acceptance criterion: restart, and the queue is still there."""
+        app, qm = fresh_app
+        _, data_dir = isolated_paths
+        mock_extract.return_value = _make_metadata()
+        release = threading.Event()
+
+        with patch("app.queue_manager.download_audio") as mock_download:
+            mock_download.side_effect = TestFullFlow._blocking_download(release)
+            with TestClient(app) as client:
+                job_id = client.post(
+                    "/download", json={"url": "https://youtube.com/watch?v=restart"}
+                ).json()["id"]
+                assert len(client.get("/queue").json()) == 1
+            # Shutting the client down "kills" the process mid-download.
+            release.set()
+
+        # A brand new manager, as after a real restart: nothing in memory.
+        import app.main as main_module
+
+        restarted_qm = QueueManager(
+            max_concurrent=2, timeout=10, on_event=main_module._on_queue_event
+        )
+        main_module.queue_manager = restarted_qm
+
+        with patch("app.queue_manager.download_audio") as mock_download:
+            mock_download.return_value = "/data/music/output.flac"
+            with TestClient(app) as client:
+                job = restarted_qm.get_job(job_id)
+                assert job is not None
+                # It was interrupted mid-download, so it is re-queued with a
+                # spent attempt rather than lost.
+                assert job.attempts == 1
+                assert job.restart_attempts == 1
+
+
+class TestQueueViewOmitsFinishedJobs:
+    """GET /queue is the in-flight view, not a history."""
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_done_jobs_are_omitted(self, mock_extract, mock_download, client_and_qm):
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata()
         mock_download.return_value = "/data/music/output.flac"
 
-        ids = []
-        for i in range(3):
-            resp = client.post("/download", json={"url": f"https://youtube.com/watch?v={i}"})
-            ids.append(resp.json()["id"])
+        job_id = client.post(
+            "/download", json={"url": "https://youtube.com/watch?v=done"}
+        ).json()["id"]
 
-        # All should be unique
-        assert len(set(ids)) == 3
+        for _ in range(100):
+            job = qm.get_job(job_id)
+            if job and job.status == JobStatus.DONE:
+                break
+            time.sleep(0.05)
+        assert qm.get_job(job_id).status == JobStatus.DONE
 
-        # Queue should have all 3
-        queue_resp = client.get("/queue")
-        assert len(queue_resp.json()) == 3
+        assert client.get("/queue").json() == []
+
+    def test_cancelled_jobs_are_omitted(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["cancelled"] = _make_job(id="cancelled", status=JobStatus.CANCELLED)
+
+        assert client.get("/queue").json() == []
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_error_jobs_are_listed(self, mock_extract, mock_download, client_and_qm):
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata()
+        mock_download.side_effect = DownloadError("boom")
+
+        job_id = client.post(
+            "/download", json={"url": "https://youtube.com/watch?v=fails"}
+        ).json()["id"]
+
+        for _ in range(100):
+            job = qm.get_job(job_id)
+            if job and job.status == JobStatus.ERROR:
+                break
+            time.sleep(0.05)
+
+        assert [job["id"] for job in client.get("/queue").json()] == [job_id]
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_a_done_url_can_be_resubmitted(self, mock_extract, mock_download, client_and_qm):
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata()
+        mock_download.return_value = "/data/music/output.flac"
+        url = "https://youtube.com/watch?v=again"
+
+        first = client.post("/download", json={"url": url}).json()["id"]
+        for _ in range(100):
+            job = qm.get_job(first)
+            if job and job.status == JobStatus.DONE:
+                break
+            time.sleep(0.05)
+
+        assert client.post("/download", json={"url": url}).status_code == 200
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_an_in_flight_url_is_rejected(self, mock_extract, mock_download, client_and_qm):
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata()
+        release = threading.Event()
+        mock_download.side_effect = TestFullFlow._blocking_download(release)
+        url = "https://youtube.com/watch?v=busy"
+
+        try:
+            assert client.post("/download", json={"url": url}).status_code == 200
+            resp = client.post("/download", json={"url": url})
+            assert resp.status_code == 409
+            assert "already in the queue" in resp.json()["detail"]
+        finally:
+            release.set()

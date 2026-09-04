@@ -60,6 +60,64 @@ class TestDownloadRequest:
         assert restored == req
 
 
+class TestDownloadUrlValidation:
+    """The URL is the only untrusted input yt-dlp is handed, so the API edge
+    rejects anything that is not an http(s) URL on a supported music host."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://www.youtube.com/watch?v=abc",
+            "https://music.youtube.com/watch?v=abc",
+            "https://youtu.be/abc",
+            "http://youtube.com/watch?v=abc",
+            "https://soundcloud.com/artist/track",
+            "https://on.soundcloud.com/abcdef",
+            "https://m.soundcloud.com/artist/track",
+        ],
+    )
+    def test_accepted_hosts(self, url):
+        assert DownloadRequest(url=url).url == url
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "ftp://youtube.com/watch?v=abc",
+            "file:///etc/passwd",
+            "http://192.168.1.1/",
+            "http://[::1]/",
+            "http://localhost:8000/health",
+            "http://example.com/x",
+            "http://evilyoutube.com/",
+            "http://youtube.com.evil.test/watch?v=abc",
+            "www.youtube.com/watch?v=abc",
+            "not a url at all",
+        ],
+    )
+    def test_rejected_urls(self, url):
+        with pytest.raises(ValidationError) as exc_info:
+            DownloadRequest(url=url)
+        assert any(e["loc"] == ("url",) for e in exc_info.value.errors())
+
+    def test_surrounding_whitespace_is_stripped(self):
+        req = DownloadRequest(url="  https://youtu.be/abc  ")
+        assert req.url == "https://youtu.be/abc"
+
+    def test_overlong_artist_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DownloadRequest(url="https://youtu.be/abc", artist="A" * 201)
+        assert any(e["loc"] == ("artist",) for e in exc_info.value.errors())
+
+    def test_overlong_album_rejected(self):
+        with pytest.raises(ValidationError) as exc_info:
+            DownloadRequest(url="https://youtu.be/abc", album="B" * 201)
+        assert any(e["loc"] == ("album",) for e in exc_info.value.errors())
+
+    def test_max_length_artist_accepted(self):
+        req = DownloadRequest(url="https://youtu.be/abc", artist="A" * 200)
+        assert len(req.artist) == 200
+
+
 # ---------------------------------------------------------------------------
 # JobStatus enum tests
 # ---------------------------------------------------------------------------
@@ -69,7 +127,15 @@ class TestJobStatus:
     """Verify JobStatus enum values and string behavior."""
 
     def test_all_statuses_exist(self):
-        expected = {"queued", "downloading", "converting", "done", "error"}
+        expected = {
+            "queued",
+            "downloading",
+            "converting",
+            "tagging",
+            "done",
+            "error",
+            "cancelled",
+        }
         actual = {s.value for s in JobStatus}
         assert actual == expected
 

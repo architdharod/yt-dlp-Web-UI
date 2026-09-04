@@ -32,39 +32,116 @@ The frontend's nginx container proxies all `/api/` requests to the backend conta
 | Backend  | Python 3.12, FastAPI, yt-dlp, ffmpeg, Mutagen    |
 | Infra    | Docker Compose, nginx                            |
 
-## Getting Started
+## Getting Started (development)
+
+This is the path for working on the code locally. It builds both images from
+source: `docker-compose.override.yml` is merged automatically by Compose and
+supplies the `build:` blocks.
 
 ```bash
 # Clone the repository
-git clone <repo-url> && cd yt-dlp-web-ui
+git clone <repo-url> && cd music-for-arr
 
 # Configure environment
 cp .env.example .env
 # Edit .env with your settings (see Configuration below)
 
-# Start the stack
-docker compose up -d
+# Build and start the stack
+docker compose up --build -d
 ```
 
 The application is available at `http://localhost:3033` (configurable via `FRONTEND_PORT`). Place a reverse proxy in front for HTTPS access.
+
+## Deploying to the homelab
+
+The homelab runs the prebuilt images that CI publishes to GHCR. It never builds
+anything, and it never needs a checkout of this repository.
+
+**Images are private.** They live at `ghcr.io/architdharod/music-for-arr-backend`
+and `ghcr.io/architdharod/music-for-arr-frontend`, so the host must authenticate
+before it can pull.
+
+1. Create a fine-grained personal access token on GitHub under
+   *Settings > Developer settings > Personal access tokens > Fine-grained tokens*.
+   Give it access to this repository and the single permission
+   **Packages: Read-only** (`read:packages`). Nothing else is required.
+2. Log in on the homelab host:
+
+   ```bash
+   docker login ghcr.io -u <github-user>
+   # paste the token as the password
+   ```
+
+3. Copy **only** `docker-compose.yml` and your `.env` to the host. Do not clone
+   the repo, and do not copy `docker-compose.override.yml` — its `build:` blocks
+   would make Compose try to build from sources that are not there.
+4. First start:
+
+   ```bash
+   docker compose pull && docker compose up -d
+   ```
+
+Updating is the same two commands. Every push to `main` republishes `latest`,
+and a scheduled job rebuilds both images every Monday morning so `latest` always
+carries a recent yt-dlp — the pin in `backend/requirements.txt` is a floor
+(`yt-dlp>=...`), so each rebuild picks up the newest release. That weekly rebuild
+is the mechanism that keeps downloads working when YouTube changes something.
+
+**Rollback.** Every build is also tagged immutably: `sha-<short commit sha>` for
+pushes to `main`, and `weekly-<YYYYMMDD>` for the Monday rebuilds. To go back,
+edit the `image:` line in `docker-compose.yml` on the host to the tag you want
+and re-run `docker compose up -d`:
+
+```yaml
+image: ghcr.io/architdharod/music-for-arr-backend:weekly-20260817
+```
+
+**Data.** The backend gets a named volume `music-for-arr-data` mounted at
+`/config`, pointed at by `DATA_PATH`. This is where `queue.db` lives: the job
+queue is persisted to SQLite, so restarting or updating the backend does not
+lose it. Queued jobs come back queued; a job that was mid-download when the
+process stopped has its partial files cleaned up and is retried automatically
+(three interrupted attempts and it is marked failed instead). Finished and
+cancelled jobs are pruned after seven days; failed ones stay until dismissed.
+The volume is separate from `DOWNLOAD_PATH` on purpose, so app state never sits
+in the tree Navidrome and Lidarr scan. Downloads themselves are unaffected:
+they go to the `DOWNLOAD_PATH` bind mount.
 
 ## Configuration
 
 All configuration is via environment variables in `.env`:
 
-| Variable                   | Default                 | Description                                |
-| -------------------------- | ----------------------- | ------------------------------------------ |
-| `FRONTEND_PORT`            | `3033`                  | Host port for the web UI                   |
-| `DOWNLOAD_PATH`            | `/data/music/downloads` | Directory where FLAC files are saved       |
-| `DOWNLOAD_TIMEOUT_SECONDS` | `900`                   | Per-job timeout in seconds (15 min default)|
-| `MAX_CONCURRENT_DOWNLOADS` | `2`                     | Maximum simultaneous downloads             |
+| Variable                   | Default                 | Description                                              |
+| -------------------------- | ----------------------- | -------------------------------------------------------- |
+| `FRONTEND_PORT`            | `3033`                  | Host port for the web UI                                 |
+| `DOWNLOAD_PATH`            | `/data/music/downloads` | Directory where FLAC files are saved                     |
+| `DOWNLOAD_TIMEOUT_SECONDS` | `900`                   | Per-job timeout in seconds (15 min)                      |
+| `DATA_PATH`                | `/config`               | Directory holding `queue.db`, the persistent job queue; leave as-is under compose, it is a named volume |
+| `MAX_CONCURRENT_DOWNLOADS` | `2`                     | Maximum simultaneous downloads                           |
+| `PUID`                     | `1000`                  | UID the backend container runs as                        |
+| `PGID`                     | `1000`                  | GID the backend container runs as                        |
+| `CORS_ORIGINS`             | unset                   | Dev only: comma-separated browser origins allowed to call the API directly. Not needed for the compose stack, where the UI is same-origin behind nginx. |
 
-The `DOWNLOAD_PATH` must be writable by the backend container. The container runs as UID/GID 1000 by default.
+These are the effective defaults: `docker-compose.yml` substitutes them when a
+variable is unset or empty, so an incomplete `.env` no longer breaks the stack.
+`.env.example` ships the same values.
+
+`DOWNLOAD_PATH` must already exist on the host and be writable by `PUID:PGID`
+(default `1000:1000`). The backend checks this at startup and **refuses to
+start** if the directory is missing or not writable, rather than failing on the
+first download. If Docker creates the directory for you it will be owned by
+`root`, so create it yourself and `chown` it first.
+
+`DATA_PATH` (the queue database) is checked the same way. The backend image
+pre-creates `/config` world-writable, so the named volume compose mounts there
+inherits that mode and is writable whatever `PUID:PGID` you run as. If you
+replace the named volume with a bind mount of a host directory, that directory
+must exist and be writable by `PUID:PGID` yourself.
 
 ## Limitations
 
-- **Single tracks only** — no playlist or album URL support.
-- **YouTube and SoundCloud only** — no Spotify, Bandcamp, or other sources.
+- **Single tracks only** — playlist and channel URLs are rejected with an error; only the single track behind a URL is ever downloaded.
+- **YouTube and SoundCloud only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com` and their subdomains, and rejects everything else with a validation error. No Spotify, Bandcamp, or other sources.
+- **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
 - **No authentication** — designed for private/internal networks.
-- **No persistent queue** — job state lives in memory; restarting the backend clears it.
 - **FLAC only** — lossy sources are losslessly wrapped in FLAC for consistent output.
