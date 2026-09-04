@@ -1,5 +1,26 @@
-/** Job lifecycle states matching backend JobStatus enum. */
-export type JobStatus = "queued" | "downloading" | "converting" | "done" | "error";
+/**
+ * Job lifecycle states matching backend JobStatus enum.
+ *
+ * A download runs queued -> downloading -> converting -> tagging -> done;
+ * "error" and "cancelled" are terminal and reachable from any of the others.
+ * "tagging" has its own label and icon in the queue.
+ */
+export type JobStatus =
+  | "queued"
+  | "downloading"
+  | "converting"
+  | "tagging"
+  | "done"
+  | "error"
+  | "cancelled";
+
+/**
+ * Prefix of the error a job carries when its target file already exists in the
+ * library. Mirrors ALREADY_IN_LIBRARY_PREFIX in backend/app/downloader.py — the
+ * backend ends such a job as "error", but it is a skip rather than a failure,
+ * so the queue renders it neutrally and offers no Retry. Keep the two in sync.
+ */
+export const ALREADY_IN_LIBRARY_PREFIX = "already in library: ";
 
 /** A download job as returned by the backend API. */
 export interface Job {

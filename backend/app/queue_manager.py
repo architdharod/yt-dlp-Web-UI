@@ -7,19 +7,33 @@ with the downloader module to execute downloads.
 State machine::
 
     queued ──► downloading ──► converting ──► [tagging] ──► done
-                     │              │             │
-                     └──────────────┴─────────────┴──► error  (failure / timeout)
-                                    │
-                                    └──────────────────► cancelled
+       │             │              │             │
+       │             └──────────────┴─────────────┴──► error  (failure / timeout)
+       │             │              │             │
+       └─────────────┴──────────────┴─────────────┴──► cancelled  (user)
 
     error ──► queued  (retry)
+    error ──► gone    (dismiss)
 
-``converting`` is reported by the downloader when ffmpeg actually starts;
-a download whose conversion is instantaneous may go straight to ``done``.
-``tagging`` and ``cancelled`` are part of the persisted status vocabulary from
-the first schema version but nothing enters them yet: the tagging worker
-arrives in phase 8 and cancel in phase 2.  Restore already treats ``tagging``
-as an interrupted state so it does not need a special case then.
+``converting`` is reported by the downloader immediately before it starts
+ffmpeg.  ``tagging`` is part of the persisted status vocabulary from the first
+schema version but nothing enters it yet -- the tagging worker arrives in phase
+8; cancel already treats it like ``converting`` so it will not need a special
+case then.
+
+Cancel is cooperative and asymmetric, because the two things a running job can
+be doing are interruptible in opposite directions: yt-dlp only stops when its
+own progress hook raises, ffmpeg only stops when its process is signalled.
+Both live behind one :class:`~app.downloader.CancelToken` per run.  A queued
+job never reaches either -- it is moved straight to ``cancelled``, and
+:meth:`QueueManager._process_job` re-checks the status after acquiring its
+concurrency slot, so a job cancelled while it was waiting for a slot never
+starts.  A running job is only *signalled*; its thread decides the outcome,
+so a cancel that arrives after the file has already been filed loses the race
+and the job finishes ``done`` with its file, rather than being reported as
+``cancelled`` with a track sitting in the library.  The request itself is
+persisted as it is made, so a restart during those seconds finishes the job as
+``cancelled`` rather than re-queuing a download the user stopped.
 
 Persistence
 -----------
@@ -44,16 +58,21 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
 from app.downloader import (
+    FFMPEG_TERMINATE_GRACE_SECONDS,
+    CancelToken,
     DownloadError,
+    FiledTrack,
     download_audio,
     remove_job_temp_dir,
     remove_orphan_temp_dirs,
+    unfile_track,
 )
 from app.file_organizer import DEFAULT_DOWNLOAD_PATH
 from app.job_store import JobStore
@@ -74,6 +93,20 @@ RETENTION_DAYS = 7
 MAX_RESTART_ATTEMPTS = 3
 RESTART_GIVE_UP_MESSAGE = f"interrupted by restart {MAX_RESTART_ATTEMPTS} times"
 
+# How long a timed-out job's thread may take to unwind before its concurrency
+# slot is released anyway.  Cancelling the run signals ffmpeg, which its thread
+# then gives FFMPEG_TERMINATE_GRACE_SECONDS to exit before killing it, so the
+# grace is that plus a moment for the unwinding itself.  Bounded because a
+# thread that is somehow stuck must not take the whole queue down with it.
+THREAD_DRAIN_GRACE_SECONDS = FFMPEG_TERMINATE_GRACE_SECONDS + 1
+
+# How often the drain wait looks at the thread it is waiting for.  Polling from
+# the event loop rather than parking a worker on `finished.wait`: that wait
+# would run in the same default executor as the download threads themselves
+# (and as `extract_metadata`), so with every worker busy the wait could not
+# start, and the slot it is guarding would be held for the whole grace anyway.
+_DRAIN_POLL_SECONDS = 0.05
+
 _IN_FLIGHT = (
     JobStatus.QUEUED,
     JobStatus.DOWNLOADING,
@@ -84,6 +117,9 @@ _IN_FLIGHT = (
 # Statuses that only a running process can be in.  Finding one of these in the
 # database at boot means the process died mid-job.
 _INTERRUPTED = (JobStatus.DOWNLOADING, JobStatus.CONVERTING, JobStatus.TAGGING)
+
+# Statuses no in-flight transition may leave.
+_TERMINAL = (JobStatus.DONE, JobStatus.ERROR, JobStatus.CANCELLED)
 
 # Statuses the retention sweep may drop.  Mirrors JobStore.TERMINAL_STATUSES.
 _SWEEPABLE = (JobStatus.DONE, JobStatus.CANCELLED)
@@ -100,19 +136,47 @@ def _env_int(name: str, default: int) -> int:
 
 
 class QueueError(Exception):
-    """Raised for queue-level errors (invalid retry, missing job, etc.)."""
+    """Raised for queue-level errors (invalid retry, wrong state, etc.).
+
+    Routes map this to 400: it always means the caller asked for something the
+    job's current state does not allow.
+    """
+
+
+class JobNotFound(QueueError):
+    """Raised when an operation names a job id the queue does not know.
+
+    A subclass so a route can tell "no such job" (404) from "not in a state
+    that allows this" (400) without inspecting the message.
+    """
 
 
 @dataclass
 class _ActiveRun:
     """Bookkeeping for one download thread.
 
-    ``cancel_event`` tells the downloader to abort at its next progress
-    callback; ``finished`` is set by the thread when it has fully exited.
+    ``cancel`` is the run's stop button, shared with the downloader: it aborts
+    yt-dlp at its next progress callback and signals a running ffmpeg, which
+    the thread then kills if it does not go.
+    ``finished`` is set by the thread when it has fully exited.
+
+    ``lock``, ``filed`` and ``disowned`` are the hand-off between the thread and
+    the event loop over the one thing both can touch: a track that has already
+    been moved into the library.  The thread publishes it in ``filed``; the loop
+    sets ``disowned`` when it has given the job a final status without waiting
+    for the thread (the timeout path).  Both read the other's field inside
+    ``lock`` in the same critical section they write their own, so whichever
+    happens second sees the first and exactly one of them takes the track back
+    out of the library -- never both, and never neither.  ``disowned`` doubles
+    as "the loop's verdict is already written", which is how a thread's
+    ``DownloadError`` is told from a user's Cancel.
     """
 
-    cancel_event: threading.Event = field(default_factory=threading.Event)
+    cancel: CancelToken = field(default_factory=CancelToken)
     finished: threading.Event = field(default_factory=threading.Event)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    filed: FiledTrack | None = None
+    disowned: bool = False
 
 
 class QueueManager:
@@ -148,6 +212,8 @@ class QueueManager:
         self._store = store
         # Download threads that are, or may still be, running per job id.
         self._active_runs: dict[str, _ActiveRun] = {}
+        # Strong references to the dispatcher tasks; see _dispatch.
+        self._tasks: set[asyncio.Task] = set()
 
     def attach_store(self, store: JobStore) -> None:
         """Attach the persistence layer after construction.
@@ -192,7 +258,7 @@ class QueueManager:
             job.album,
             job.title,
         )
-        asyncio.create_task(self._process_job(job.id))
+        self._dispatch(job.id)
         return job
 
     def find_in_flight(self, url: str) -> Job | None:
@@ -244,7 +310,7 @@ class QueueManager:
         """
         job = self._jobs.get(job_id)
         if job is None:
-            raise QueueError(f"Job {job_id!r} not found")
+            raise JobNotFound(f"Job {job_id!r} not found")
         if job.status != JobStatus.ERROR:
             raise QueueError(
                 f"Job {job_id!r} is in {job.status.value!r} status, only ERROR jobs can be retried"
@@ -264,12 +330,89 @@ class QueueManager:
         # budget back.  Not reset anywhere else -- resetting on every boot
         # would let a job that crashes the process resume forever.
         job.restart_attempts = 0
+        # The previous attempt may have been cancelled and have failed for some
+        # other reason first; a job the user has just asked to run again is not
+        # a job the user has asked to stop.
+        job.cancel_requested = False
         self._persist(job)
         self._emit_event("status_change", job)
 
         logger.info("Job %s retried, re-queued for processing", job.id)
-        asyncio.create_task(self._process_job(job.id))
+        self._dispatch(job.id)
         return job
+
+    def cancel_job(self, job_id: str) -> Job:
+        """Stop a queued or running job and end it in ``cancelled``.
+
+        A ``queued`` job has no thread yet, so it goes straight to ``cancelled``
+        here; :meth:`_process_job` re-reads the status after acquiring its
+        concurrency slot, which is what stops a job that was cancelled while it
+        was waiting for one from ever starting.
+
+        A ``downloading``, ``converting`` or ``tagging`` job is only signalled:
+        its thread has files open and a child process running, and only it knows
+        when both are gone.  The status therefore changes when the thread
+        reports back in :meth:`_process_job`, not here, so the queue never shows
+        ``cancelled`` while an ffmpeg is still writing.  ``tagging`` is handled
+        with the others so phase 8 does not have to revisit this.
+
+        Terminal jobs are refused rather than silently accepted: a Cancel on a
+        job that just finished is a stale UI, and answering "done" to it would
+        leave the user believing a track was not filed when it was.
+
+        Raises:
+            JobNotFound: If no such job exists.
+            QueueError: If the job is already done, errored or cancelled.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise JobNotFound(f"Job {job_id!r} not found")
+        if job.status not in _IN_FLIGHT:
+            raise QueueError(
+                f"Job {job_id!r} is in {job.status.value!r} status, "
+                "only queued or running jobs can be cancelled"
+            )
+
+        if job.status == JobStatus.QUEUED:
+            self._finish_cancelled(job_id)
+            return job
+
+        logger.info("Job %s: cancel requested while %s", job_id, job.status.value)
+        self._cancel_run(job_id)
+        return job
+
+    def dismiss_job(self, job_id: str) -> None:
+        """Forget an errored job entirely: no row, no queue entry, no history.
+
+        Only ``error`` jobs can be dismissed, because they are the only ones the
+        retention sweep never drops -- they sit in the queue until somebody says
+        they have been seen.  Everything else either leaves on its own or is
+        still running.
+
+        Raises:
+            JobNotFound: If no such job exists.
+            QueueError: If the job is not in ``error``.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise JobNotFound(f"Job {job_id!r} not found")
+        if job.status != JobStatus.ERROR:
+            raise QueueError(
+                f"Job {job_id!r} is in {job.status.value!r} status, "
+                "only errored jobs can be dismissed"
+            )
+
+        self._jobs.pop(job_id, None)
+        self._active_runs.pop(job_id, None)
+        if self._store is not None:
+            try:
+                self._store.delete(job_id)
+            except Exception:
+                # The row outliving the dict costs one stale entry after the
+                # next restart, which is a great deal better than a 500 on a
+                # button whose whole purpose is tidying up.
+                logger.exception("Could not delete job %s from the store", job_id)
+        logger.info("Job %s dismissed", job_id)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -283,8 +426,11 @@ class QueueManager:
         ``GET /queue`` both see the restored rows immediately.
 
         ``queued`` and ``error`` rows are loaded as they are.  Rows still in
-        ``downloading``, ``converting`` or ``tagging`` mean the process died
-        mid-job: their scratch directory is removed, ``attempts`` and
+        ``downloading``, ``converting`` or ``tagging`` with ``cancel_requested``
+        set were being cancelled when the process died: the restart is what
+        their cancel was waiting for, so they are finished as ``cancelled``.
+        The rest mean the process died mid-job: their scratch directory is
+        removed, ``attempts`` and
         ``restart_attempts`` are incremented, and they go back to ``queued`` --
         or to ``error`` once a restart has interrupted them
         :data:`MAX_RESTART_ATTEMPTS` times, so a job that crashes the process
@@ -319,7 +465,7 @@ class QueueManager:
         # The user's original queue order is preserved across the restart.
         for job in restored:
             if job.status == JobStatus.QUEUED:
-                asyncio.create_task(self._process_job(job.id))
+                self._dispatch(job.id)
 
         if restored:
             logger.info(
@@ -330,8 +476,25 @@ class QueueManager:
         return restored
 
     def _recover_interrupted(self, job: Job) -> None:
-        """Re-queue *job*, or give up on it after too many interruptions."""
+        """Re-queue *job*, or give up on it after too many interruptions.
+
+        A job the user had already asked to stop is finished as ``cancelled``
+        instead: the restart did what the cancel was waiting for the thread to
+        do, so re-queuing it would resurrect a download nobody wants and the
+        restart is not the job's fault either, so it costs no attempt.
+        """
         remove_job_temp_dir(job.id)
+        if job.cancel_requested:
+            logger.info(
+                "Job %s was being cancelled when the process stopped, "
+                "finishing it as cancelled",
+                job.id,
+            )
+            job.status = JobStatus.CANCELLED
+            job.error = None
+            job.progress = 0.0
+            self._persist(job)
+            return
         job.attempts += 1
         job.restart_attempts += 1
         if job.restart_attempts >= MAX_RESTART_ATTEMPTS:
@@ -390,6 +553,31 @@ class QueueManager:
     # Internal processing
     # ------------------------------------------------------------------
 
+    def _dispatch(self, job_id: str) -> None:
+        """Start :meth:`_process_job` for *job_id* as a tracked task.
+
+        asyncio keeps only a weak reference to a running task, so a task nobody
+        holds can be garbage-collected mid-await and the job would silently stop
+        moving.  The done callback is the other half: an exception that escaped
+        ``_process_job`` is otherwise reported only when the task object is
+        finalised, in a message that does not say which job it was.
+        """
+        task = asyncio.create_task(self._process_job(job_id))
+        self._tasks.add(task)
+
+        def _done(finished: asyncio.Task) -> None:
+            self._tasks.discard(finished)
+            if finished.cancelled():
+                return
+            error = finished.exception()
+            if error is not None:
+                logger.error(
+                    "Job %s: its processing task raised %r", job_id, error,
+                    exc_info=error,
+                )
+
+        task.add_done_callback(_done)
+
     async def _process_job(self, job_id: str) -> None:
         """Acquire a concurrency slot, run the download with timeout,
         and transition the job through the state machine.
@@ -405,55 +593,104 @@ class QueueManager:
             if job is None or job.status != JobStatus.QUEUED:
                 return
 
+            # The run's stop button exists before the job is advertised as
+            # running, so a Cancel that arrives in the same tick as the status
+            # change has something to signal.  Registering it after the
+            # transition would leave a window in which Cancel silently did
+            # nothing and the job kept downloading.
+            run = _ActiveRun()
+            self._active_runs[job_id] = run
+
             # ---- downloading ----
             self._update_status(job_id, JobStatus.DOWNLOADING)
 
             try:
                 await asyncio.wait_for(
-                    self._run_download(job_id),
+                    self._run_download(job_id, run),
                     timeout=self._timeout,
                 )
+
+                # The thread has exited without the loop disowning it, so the
+                # track it filed is the job's result.  Recorded before the DONE
+                # transition, whose _persist writes the row before the SSE event
+                # a client would follow to read it.
+                with run.lock:
+                    filed = run.filed
+                if filed is not None:
+                    self._record_result_path(job, filed.path)
 
                 # ---- done ---- (converting is reported by the downloader)
                 self._update_status(job_id, JobStatus.DONE)
 
             except asyncio.TimeoutError:
                 logger.warning("Job %s timed out after %ss", job_id, self._timeout)
-                # Releasing the semaphore slot (on leaving this block) does not
-                # stop the thread: the cancel event is only checked from the
-                # progress hook, so a job that timed out while ffmpeg was
-                # converting keeps a yt-dlp thread busy until ffmpeg returns.
-                # The next queued job therefore starts against transiently more
-                # than `max_concurrent` running downloads.  Bounded by one
-                # conversion and self-correcting; phase 2 makes converting
-                # killable, which removes it.
-                self._cancel_run(job_id)
+                # Cancelling the token aborts yt-dlp at its next progress
+                # callback and signals a running ffmpeg, so the thread stops
+                # within a moment rather than holding a core until a conversion
+                # happens to finish.
+                self._cancel_run(job_id, timed_out=True)
                 self._fail(job_id, f"Download timed out after {self._timeout} seconds")
+                # The verdict is written, so the run is no longer ours: from
+                # here on whatever it files is taken back out of the library,
+                # by whichever side of the hand-off gets there second.
+                await self._disown_run(job_id, run)
+                # The job is failed, but its thread is still unwinding and still
+                # holds a temp directory and possibly an ffmpeg.  Waiting for it
+                # here, inside the semaphore, is what keeps the number of
+                # download threads at max_concurrent instead of letting the next
+                # job start alongside a dying one.  Bounded: a thread that
+                # outlives the grace is logged and abandoned rather than allowed
+                # to stall the queue.
+                deadline = time.monotonic() + THREAD_DRAIN_GRACE_SECONDS
+                while not run.finished.is_set() and time.monotonic() < deadline:
+                    await asyncio.sleep(_DRAIN_POLL_SECONDS)
+                if not run.finished.is_set():
+                    logger.warning(
+                        "Job %s: its download thread was still running %ss after "
+                        "the timeout; releasing its slot anyway",
+                        job_id,
+                        THREAD_DRAIN_GRACE_SECONDS,
+                    )
 
             except DownloadError as exc:
-                logger.warning("Job %s failed: %s", job_id, exc)
-                self._fail(job_id, str(exc))
+                if run.cancel.is_set() and not run.disowned:
+                    # The thread stopped because the user asked it to.  The
+                    # downloader guarantees nothing was left in the library, so
+                    # this is a clean cancellation, not a failure.
+                    logger.info("Job %s stopped after a cancel request", job_id)
+                    self._finish_cancelled(job_id)
+                else:
+                    logger.warning("Job %s failed: %s", job_id, exc)
+                    self._fail(job_id, str(exc))
+                await self._disown_run(job_id, run)
 
             except Exception as exc:
                 logger.exception("Job %s encountered unexpected error", job_id)
                 self._fail(job_id, f"Unexpected error: {exc}")
+                await self._disown_run(job_id, run)
 
-    async def _run_download(self, job_id: str) -> None:
+    async def _run_download(self, job_id: str, run: _ActiveRun) -> None:
         """Run the synchronous ``download_audio`` call in a thread executor
         so it doesn't block the event loop.
 
-        The thread is tracked in ``_active_runs`` so a timeout can signal it
-        to stop and a retry can refuse to start while it is still alive.
+        *run* is created by the caller, before the job is advertised as
+        running, and is what a Cancel or a timeout signals; a retry refuses to
+        start while its ``finished`` event is still clear.
         """
         job = self._jobs[job_id]
-        run = _ActiveRun()
-        self._active_runs[job_id] = run
         last_whole_percent = -1
 
+        # Both callbacks run on the download thread, which the timeout path does
+        # not wait for before writing the job's verdict, so each starts by
+        # checking that the job it is reporting on is still running.  The cancel
+        # flag alone is not enough: it is read a moment before the callback acts
+        # on it, and a job can reach a terminal status in between.
         def on_progress(percentage: float) -> None:
             nonlocal last_whole_percent
-            if run.cancel_event.is_set():
-                return  # job already failed; don't resurrect its progress
+            if job.status in _TERMINAL:
+                return  # the job is over; nothing it reports now is news
+            if run.cancel.is_set():
+                return  # job is stopping; don't resurrect its progress
             job.progress = percentage
             # yt-dlp calls this per chunk; only emit when the visible
             # percentage changes to keep SSE traffic sane.
@@ -464,7 +701,13 @@ class QueueManager:
             self._emit_event("progress", job)
 
         def on_phase(phase: str) -> None:
-            if run.cancel_event.is_set():
+            if job.status in _TERMINAL:
+                # A late `metadata` would re-stamp finished_at on a job that has
+                # already ended; a late `converting` is dropped in
+                # _update_status too, but there is no reason to write a row to
+                # find that out.
+                return
+            if run.cancel.is_set():
                 return
             if phase == "converting":
                 self._update_status(job_id, JobStatus.CONVERTING)
@@ -474,41 +717,55 @@ class QueueManager:
                 self._persist(job)
                 self._emit_event("metadata", job)
 
+        def note_filed(track: FiledTrack) -> None:
+            """Publish the move to the event loop, or undo it if it is too late.
+
+            The loop reads ``filed`` under the same lock it sets ``disowned``
+            in, so seeing ``disowned`` here means the job already has a final
+            status the loop reached without this track -- an error row from the
+            timeout path.  Leaving the file would mean a track in the library
+            that no queue entry admits to and that the user was told had failed,
+            so this thread, which is the only one that knows about it, removes
+            it again.
+            """
+            with run.lock:
+                run.filed = track
+                disowned = run.disowned
+            if disowned:
+                logger.warning(
+                    "Job %s filed %s after the queue had given up on it; taking "
+                    "it back out of the library",
+                    job_id,
+                    track.path,
+                )
+                unfile_track(track)
+
         def runner() -> None:
             try:
-                result = download_audio(
+                if run.cancel.is_set():
+                    # Cancelled between the status change and this thread being
+                    # scheduled: nothing has been fetched, so there is nothing
+                    # to unwind beyond reporting it.
+                    raise DownloadError("Download cancelled")
+                download_audio(
                     job,
                     on_progress,
-                    cancel_event=run.cancel_event,
+                    cancel=run.cancel,
                     on_phase=on_phase,
+                    on_filed=note_filed,
                 )
-                if run.cancel_event.is_set():
-                    # A timeout already failed the job and persisted its error
-                    # row; recording a result now would put a path on a job the
-                    # user is looking at as failed, and would diverge from the
-                    # database.  The file itself is left alone: it may have
-                    # replaced a track that was already in the library.
-                    logger.warning(
-                        "Job %s finished after it was cancelled; %s is a stray file",
-                        job_id,
-                        result,
-                    )
-                else:
-                    # Recorded here rather than after the await so the DONE
-                    # transition's _persist writes it before the SSE event.
-                    self._record_result_path(job, result)
             finally:
-                # Cleanup belongs to the thread that owns the temp directory.
-                # Doing it in _process_job's `finally` would race this thread,
-                # which is still converting and moving files after a timeout has
-                # already given up waiting for it.
-                #
-                # Phase 2: once cancel runs ffmpeg as our own subprocess we can
-                # kill it, so conversion becomes cancellable and the stray-file
-                # case above disappears.
+                # Cleanup belongs to the thread that owns the temp directory:
+                # it is the only one that knows yt-dlp and ffmpeg are done with
+                # it.  This is the `finally` that guarantees no partial, .part
+                # or temp file survives a cancel, a timeout or a crash.
                 remove_job_temp_dir(job_id)
-                if self._active_runs.get(job_id) is run:
-                    self._active_runs.pop(job_id, None)
+                # The entry deliberately outlives the thread: _process_job reads
+                # `cancel`/`disowned` off it to tell a user's Cancel from a
+                # genuine failure, and it is the exception's unwinding that gets
+                # it there, i.e. after this `finally`.  A retry replaces the
+                # entry and the retention sweep and dismiss drop it, so it lives
+                # exactly as long as the job does.
                 run.finished.set()
 
         loop = asyncio.get_running_loop()
@@ -518,11 +775,74 @@ class QueueManager:
     # Helpers
     # ------------------------------------------------------------------
 
-    def _cancel_run(self, job_id: str) -> None:
-        """Ask the download thread for *job_id* (if any) to stop."""
+    def _cancel_run(self, job_id: str, timed_out: bool = False) -> None:
+        """Ask the download thread for *job_id* (if any) to stop.
+
+        Returns immediately.  Cancelling the token raises out of yt-dlp's next
+        progress callback and signals a running ffmpeg, but the thread still has
+        to unwind and delete its scratch directory, so the job's final status is
+        written when it reports back, not here.
+        """
         run = self._active_runs.get(job_id)
-        if run is not None:
-            run.cancel_event.set()
+        if run is None:
+            return
+        job = self._jobs.get(job_id)
+        if job is not None and not timed_out:
+            # Written before the token is signalled, and before the thread can
+            # report back: a restart in the seconds a cancel takes would
+            # otherwise find a `downloading` row and re-queue a job the user
+            # stopped.  Only a user's cancel sets it -- a timeout has already
+            # failed the job, and marking that row cancel_requested would have
+            # a restart finish it as `cancelled` instead of `error`.
+            job.cancel_requested = True
+            self._persist(job)
+        run.cancel.cancel()
+
+    async def _disown_run(self, job_id: str, run: _ActiveRun) -> None:
+        """Give up ownership of *run* now that its job has a final status.
+
+        Called from the event loop immediately after ``_fail`` or
+        ``_finish_cancelled``, which is the only moment at which the loop and
+        the run's thread can disagree about a track: the thread may have moved
+        the file into the library in the instant before the verdict was written,
+        or may be about to.  Setting the flag and reading ``filed`` in one
+        critical section decides that race once -- whatever the thread had
+        already filed is removed here, and anything it files afterwards is
+        removed by :func:`note_filed`, which sees the flag.
+
+        The unlink runs off the loop: it is a filesystem call on a path that may
+        be a slow network mount, and no request should wait on it.
+        """
+        with run.lock:
+            run.disowned = True
+            track = run.filed
+        if track is None:
+            return
+        logger.warning(
+            "Job %s had already filed %s when the queue gave up on it; taking "
+            "it back out of the library",
+            job_id,
+            track.path,
+        )
+        await asyncio.to_thread(unfile_track, track)
+
+    def _finish_cancelled(self, job_id: str) -> None:
+        """Move a job to CANCELLED and emit its status change.
+
+        No ``error`` event and no error text: a cancellation is something the
+        user did, not something that went wrong, and the job leaves the queue
+        view either way.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        old_status = job.status.value
+        job.status = JobStatus.CANCELLED
+        job.error = None
+        job.progress = 0.0
+        self._persist(job)
+        logger.info("Job %s: %s -> %s", job_id, old_status, JobStatus.CANCELLED.value)
+        self._emit_event("status_change", job)
 
     def _record_result_path(self, job: Job, result: Path | str | None) -> None:
         """Remember where the finished file landed, relative to DOWNLOAD_PATH.
@@ -575,8 +895,15 @@ class QueueManager:
         never behind the event a client just received.
         """
         job.updated_at = datetime.now(timezone.utc)
-        if job.status in (JobStatus.DONE, JobStatus.ERROR, JobStatus.CANCELLED):
+        if job.status in _TERMINAL:
             job.finished_at = job.updated_at
+        if job.status in (JobStatus.DONE, JobStatus.ERROR):
+            # A cancel that lost its race is not a fact about the finished job:
+            # the track is in the library, or the job failed for its own reason,
+            # and the flag would only tell a later reader the user had stopped
+            # something that ran to the end.  A `cancelled` row keeps it, where
+            # it is the record of why the job ended that way.
+            job.cancel_requested = False
         if self._store is None:
             return
         try:
@@ -589,12 +916,34 @@ class QueueManager:
     def _update_status(self, job_id: str, status: JobStatus) -> None:
         """Update a job's status, persist it, and emit a status_change event.
 
-        A transition to the status the job is already in is dropped: yt-dlp
-        calls each postprocessor hook twice per postprocessor, so ``converting``
-        would otherwise be written and broadcast twice for one conversion.
+        A transition to the status the job is already in is dropped.  Nothing
+        reports a phase twice today, but the phase callbacks run on the download
+        thread and this is one comparison against a duplicate row write and a
+        duplicate SSE event for every client.
+
+        A terminal status is absorbing here.  The phase callbacks run on the
+        download thread and cannot check the status atomically, so the timeout
+        path -- which fails the job without waiting for its thread -- leaves a
+        window in which the thread reports ``converting`` a moment after the
+        verdict was written.  Letting that through would overwrite the terminal
+        status in memory and in the row, emit ``status_change converting``
+        after ``error``, and strand the job in a running state that retry and
+        dismiss both refuse until the next restart.
+
+        The two legitimate exits from a terminal state -- :meth:`retry_job` and
+        :meth:`_recover_interrupted` -- deliberately assign ``job.status``
+        directly rather than come through here.
         """
         job = self._jobs.get(job_id)
         if job is None or job.status == status:
+            return
+        if job.status in _TERMINAL:
+            logger.debug(
+                "Job %s: ignoring late %s from its download thread; already %s",
+                job_id,
+                status.value,
+                job.status.value,
+            )
             return
         old_status = job.status.value
         job.status = status

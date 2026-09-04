@@ -62,6 +62,7 @@ _COLUMNS: tuple[str, ...] = (
     "error",
     "attempts",
     "restart_attempts",
+    "cancel_requested",
     "created_at",
     "updated_at",
     "finished_at",
@@ -70,9 +71,11 @@ _COLUMNS: tuple[str, ...] = (
 # Each entry is one schema version: the statements that take the database from
 # version N-1 to version N.  Never edit an entry that has shipped; append a new
 # one instead.  Migration 1 is Phase 1's schema and has not shipped yet, so it
-# is still being edited in place; from the first release onwards it is frozen.  The full column set is created in migration 1 even though later
-# phases (bulk parents, tagging jobs, cancel) are what fill most of it in --
-# adding columns later would mean a migration per phase for no benefit.
+# is still being edited in place -- Phase 2 added `cancel_requested` to it
+# rather than appending a migration; from the first release onwards it is
+# frozen.  The full column set is created in migration 1 even though later
+# phases (bulk parents, tagging jobs) are what fill most of it in -- adding
+# columns later would mean a migration per phase for no benefit.
 _MIGRATIONS: tuple[tuple[str, ...], ...] = (
     (
         """
@@ -92,6 +95,7 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
             error         TEXT,
             attempts      INTEGER NOT NULL DEFAULT 0,
             restart_attempts INTEGER NOT NULL DEFAULT 0,
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
             created_at    TEXT NOT NULL,
             updated_at    TEXT NOT NULL,
             finished_at   TEXT NULL
@@ -177,6 +181,13 @@ class JobStore:
         except sqlite3.Error as exc:
             self._conn.close()
             raise JobStoreError(f"Cannot initialise job database {self._db_path}: {exc}") from exc
+        except BaseException:
+            # Not every failure in here is a sqlite3.Error: _migrate raises
+            # JobStoreError itself on a downgrade.  A constructor that raises
+            # leaves nobody holding the store, so the connection it opened has
+            # to be closed on the way out whatever the reason was.
+            self._conn.close()
+            raise
 
         logger.info(
             "Job store open at %s (schema version %s)", self._db_path, SCHEMA_VERSION
@@ -211,8 +222,16 @@ class JobStore:
 
     @property
     def schema_version(self) -> int:
-        """Return the ``user_version`` currently recorded in the database."""
+        """Return the ``user_version`` currently recorded in the database.
+
+        After :meth:`close` the connection cannot be read, so the version this
+        build migrated the file to is reported instead of raising: a diagnostic
+        must not be the thing that brings a shutting-down process down.
+        """
         with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, reporting the built-in schema version")
+                return SCHEMA_VERSION
             return self._conn.execute("PRAGMA user_version").fetchone()[0]
 
     # ------------------------------------------------------------------
@@ -238,6 +257,7 @@ class JobStore:
             job.error,
             job.attempts,
             job.restart_attempts,
+            int(job.cancel_requested),
             _to_iso(job.created_at),
             _to_iso(job.updated_at),
             _to_iso(job.finished_at),
@@ -266,6 +286,7 @@ class JobStore:
             error=row["error"],
             attempts=row["attempts"],
             restart_attempts=row["restart_attempts"],
+            cancel_requested=bool(row["cancel_requested"]),
             created_at=_from_iso(row["created_at"]),
             updated_at=_from_iso(row["updated_at"]),
             finished_at=_from_iso(row["finished_at"]),

@@ -6,22 +6,28 @@ mock the downloader module -- no real network calls or downloads.
 """
 
 import asyncio
+import logging
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.downloader import DownloadError
+from app.downloader import DownloadError, FiledTrack, unfile_track
 from app.job_store import JobStore
 from app.models import Job, JobStatus, SSEEvent
 from app.queue_manager import (
     DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     DEFAULT_MAX_CONCURRENT_DOWNLOADS,
     MAX_RESTART_ATTEMPTS,
+    THREAD_DRAIN_GRACE_SECONDS,
     RESTART_GIVE_UP_MESSAGE,
     RETENTION_DAYS,
+    JobNotFound,
     QueueError,
     QueueManager,
 )
@@ -174,7 +180,7 @@ class TestStateTransitionsHappyPath:
         events should be emitted via the on_event hook."""
         events = []
 
-        def fake_download(job, on_progress, cancel_event=None, on_phase=None):
+        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             on_progress(25.0)
             on_progress(50.0)
             on_progress(100.0)
@@ -196,7 +202,7 @@ class TestStateTransitionsHappyPath:
     async def test_job_progress_updated_on_callback(self, mock_download):
         recorded_progresses = []
 
-        def fake_download(job, on_progress, cancel_event=None, on_phase=None):
+        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             on_progress(42.0)
             recorded_progresses.append(job.progress)
             return "/data/music/Artist/Album/track.flac"
@@ -316,7 +322,7 @@ class TestConcurrencyControl:
         # Patch _run_download to use our async controlled version
         original_run_download = qm._run_download
 
-        async def patched_run_download(job_id):
+        async def patched_run_download(job_id, run):
             job = qm._jobs[job_id]
             await controlled_download(job, None)
 
@@ -356,7 +362,7 @@ class TestConcurrencyControl:
         for i in range(3):
             proceed_events[f"job-{i}"] = asyncio.Event()
 
-        async def patched_run_download(job_id):
+        async def patched_run_download(job_id, run):
             slot_events.append(("start", job_id))
             await proceed_events[job_id].wait()
             slot_events.append(("end", job_id))
@@ -411,8 +417,13 @@ class TestTimeoutEnforcement:
     async def test_slow_download_is_timed_out(self):
         qm = QueueManager(max_concurrent=2, timeout=1)  # 1 second timeout
 
-        async def slow_download(job_id):
-            await asyncio.sleep(10)  # Way longer than timeout
+        async def slow_download(job_id, run):
+            try:
+                await asyncio.sleep(10)  # Way longer than timeout
+            finally:
+                # The real _run_download sets this when its thread exits, and
+                # the timeout path waits for it before releasing the slot.
+                run.finished.set()
 
         qm._run_download = slow_download
 
@@ -428,8 +439,11 @@ class TestTimeoutEnforcement:
     async def test_timeout_error_message_includes_duration(self):
         qm = QueueManager(max_concurrent=2, timeout=1)
 
-        async def slow_download(job_id):
-            await asyncio.sleep(10)
+        async def slow_download(job_id, run):
+            try:
+                await asyncio.sleep(10)
+            finally:
+                run.finished.set()
 
         qm._run_download = slow_download
 
@@ -445,8 +459,11 @@ class TestTimeoutEnforcement:
         events = []
         qm = QueueManager(max_concurrent=2, timeout=1, on_event=lambda e: events.append(e))
 
-        async def slow_download(job_id):
-            await asyncio.sleep(10)
+        async def slow_download(job_id, run):
+            try:
+                await asyncio.sleep(10)
+            finally:
+                run.finished.set()
 
         qm._run_download = slow_download
 
@@ -480,15 +497,18 @@ class TestTimeoutEnforcement:
 
         call_count = 0
 
-        async def patched_run_download(job_id):
+        async def patched_run_download(job_id, run):
             nonlocal call_count
             call_count += 1
-            if job_id == "job-0":
-                # This one will time out
-                await asyncio.sleep(10)
-            else:
-                # This one completes quickly
-                await proceed_event.wait()
+            try:
+                if job_id == "job-0":
+                    # This one will time out
+                    await asyncio.sleep(10)
+                else:
+                    # This one completes quickly
+                    await proceed_event.wait()
+            finally:
+                run.finished.set()
 
         qm._run_download = patched_run_download
 
@@ -565,12 +585,14 @@ class TestRetryLogic:
 
         first_call = True
 
-        async def patched_run_download(job_id):
+        async def patched_run_download(job_id, run):
             nonlocal first_call
             if first_call:
                 first_call = False
                 await asyncio.sleep(10)  # Will time out
-            # Second call succeeds immediately
+            # Second call succeeds immediately.  The real _run_download sets
+            # this from its thread's `finally`; the retry guard waits on it.
+            run.finished.set()
 
         qm._run_download = patched_run_download
 
@@ -580,6 +602,9 @@ class TestRetryLogic:
         await _wait_for_job_status(qm, "job-1", JobStatus.ERROR, timeout=5.0)
         assert "timed out" in qm.get_job("job-1").error.lower()
 
+        # The timed-out attempt is a zombie coroutine here, so release the
+        # guard the way its thread would have.
+        qm._active_runs["job-1"].finished.set()
         qm.retry_job("job-1")
 
         await _wait_for_job_status(qm, "job-1", JobStatus.DONE, timeout=5.0)
@@ -763,7 +788,7 @@ class TestPhaseReporting:
     async def test_converting_phase_emits_status_change(self, mock_download):
         events = []
 
-        def fake(job, on_progress, cancel_event=None, on_phase=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             on_progress(100.0)
             on_phase("converting")
             return "/data/music/Artist/Album/track.flac"
@@ -782,7 +807,7 @@ class TestPhaseReporting:
     async def test_metadata_phase_emits_metadata_event(self, mock_download):
         events = []
 
-        def fake(job, on_progress, cancel_event=None, on_phase=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             job.title = "Backfilled Title"
             job.duration = 99.0
             on_phase("metadata")
@@ -813,7 +838,7 @@ class TestProgressThrottling:
     async def test_only_whole_percent_changes_are_emitted(self, mock_download):
         events = []
 
-        def fake(job, on_progress, cancel_event=None, on_phase=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             on_progress(10.2)
             on_progress(10.7)
             on_progress(11.0)
@@ -833,7 +858,7 @@ class TestProgressThrottling:
     async def test_job_progress_still_tracks_every_callback(self, mock_download):
         """Throttling is about SSE traffic, not about the job's own state."""
 
-        def fake(job, on_progress, cancel_event=None, on_phase=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             on_progress(10.2)
             on_progress(10.7)
             return "/data/music/Artist/Album/track.flac"
@@ -859,16 +884,16 @@ class TestTimeoutCancellation:
     waiting for it -- otherwise it keeps writing files and emitting events."""
 
     @patch("app.queue_manager.download_audio")
-    async def test_timeout_sets_cancel_event_and_silences_progress(self, mock_download):
+    async def test_timeout_cancels_the_run_and_silences_progress(self, mock_download):
         import threading
 
         events = []
         release = threading.Event()
         seen = {}
 
-        def fake(job, on_progress, cancel_event=None, on_phase=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             release.wait(5)
-            seen["cancelled"] = cancel_event.is_set()
+            seen["cancelled"] = cancel.is_set()
             # A zombie thread must not be able to resurrect the job's progress.
             on_progress(50.0)
             seen["progress_events_after_cancel"] = [
@@ -909,7 +934,7 @@ class TestRetryGuard:
 
         release = threading.Event()
 
-        def fake(job, on_progress, cancel_event=None, on_phase=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             release.wait(5)
             return "/data/music/Artist/Album/track.flac"
 
@@ -953,7 +978,7 @@ class TestDuplicateUrls:
 
         release = threading.Event()
 
-        def fake(job, on_progress, cancel_event=None, on_phase=None):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             release.wait(5)
             return "/data/music/Artist/Album/track.flac"
 
@@ -1519,13 +1544,14 @@ class TestTimeoutDoesNotRaceTheDownloadThread:
         download_dir, _ = isolated_paths
         temp_dir = download_dir / ".tmp" / self.JOB_ID
         result = download_dir / "Artist" / "Album" / "Title.flac"
-        def slow_download(job, *args, **kwargs):
+        def slow_download(job, *args, on_filed=None, **kwargs):
             """Still converting and moving when the timeout has given up."""
             time.sleep(0.5)
             temp_dir.mkdir(parents=True, exist_ok=True)
             (temp_dir / "leftover.part").write_text("x")
             result.parent.mkdir(parents=True, exist_ok=True)
             result.write_text("flac")
+            on_filed(FiledTrack(result, frozenset({result.parent, result.parent.parent})))
             return result
 
         mock_download.side_effect = slow_download
@@ -1542,8 +1568,238 @@ class TestTimeoutDoesNotRaceTheDownloadThread:
         assert qm.get_job(self.JOB_ID).result_path is None
         assert store.get(self.JOB_ID).result_path is None
         assert not temp_dir.exists()
-        # The file itself stays: it may have replaced a pre-existing track.
-        assert result.exists()
+        # The track goes back out of the library: the user was told the job
+        # failed, and nothing in the queue would ever point at this file.
+        assert not result.exists()
+        assert not (download_dir / "Artist").exists()
+
+    @staticmethod
+    def _unfile_spy(callers: list[int]):
+        """Wrap ``unfile_track``, recording which thread each call came from.
+
+        Which side of the hand-off removed the track is the whole point of the
+        two orderings below, and the thread id is what tells them apart from
+        the outside.
+        """
+
+        def spy(filed: FiledTrack) -> None:
+            callers.append(threading.get_ident())
+            unfile_track(filed)
+
+        return spy
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_track_filed_before_the_verdict_is_taken_back_by_the_loop(
+        self, mock_download, store, isolated_paths
+    ):
+        """Ordering (a): the thread files, and only then does the timeout fire."""
+        download_dir, _ = isolated_paths
+        result = download_dir / "Artist" / "Album" / "Title.flac"
+        may_return = threading.Event()
+        worker: dict[str, int] = {}
+        callers: list[int] = []
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            worker["ident"] = threading.get_ident()
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("flac")
+            on_filed(
+                FiledTrack(result, frozenset({result.parent, result.parent.parent}))
+            )
+            # Still inside download_audio when the timeout gives up on the job.
+            may_return.wait(5)
+            return result
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=0.2, store=store)
+        with patch("app.queue_manager.unfile_track", self._unfile_spy(callers)):
+            qm.add_job(_make_job(id=self.JOB_ID))
+            await _wait_for_job_status(qm, self.JOB_ID, JobStatus.ERROR)
+            while not callers:
+                await asyncio.sleep(0.01)
+
+        assert callers != [worker["ident"]], "the parked thread cannot have unfiled it"
+        assert not result.exists()
+        assert store.get(self.JOB_ID).result_path is None
+        may_return.set()
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_track_filed_after_the_verdict_is_taken_back_by_the_thread(
+        self, mock_download, store, isolated_paths
+    ):
+        """Ordering (b): the timeout fails the job, and only then does it file."""
+        download_dir, _ = isolated_paths
+        result = download_dir / "Artist" / "Album" / "Title.flac"
+        may_file = threading.Event()
+        worker: dict[str, int] = {}
+        callers: list[int] = []
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            worker["ident"] = threading.get_ident()
+            may_file.wait(5)  # released only once the job has already errored
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("flac")
+            on_filed(
+                FiledTrack(result, frozenset({result.parent, result.parent.parent}))
+            )
+            return result
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=0.2, store=store)
+        with patch("app.queue_manager.unfile_track", self._unfile_spy(callers)):
+            qm.add_job(_make_job(id=self.JOB_ID))
+            await _wait_for_job_status(qm, self.JOB_ID, JobStatus.ERROR)
+            may_file.set()
+            while not callers:
+                await asyncio.sleep(0.01)
+
+        assert callers == [worker["ident"]], "the thread has to undo its own move"
+        assert not result.exists()
+        assert store.get(self.JOB_ID).result_path is None
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_track_filed_after_the_drain_grace_is_still_taken_back(
+        self, mock_download, store, isolated_paths, caplog
+    ):
+        """The slot is released on a bound; the hand-off has none."""
+        download_dir, _ = isolated_paths
+        result = download_dir / "Artist" / "Album" / "Title.flac"
+        may_file = threading.Event()
+        callers: list[int] = []
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            may_file.wait(5)
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("flac")
+            on_filed(
+                FiledTrack(result, frozenset({result.parent, result.parent.parent}))
+            )
+            return result
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=0.2, store=store)
+        with patch("app.queue_manager.unfile_track", self._unfile_spy(callers)):
+            with caplog.at_level(logging.WARNING, logger="app.queue_manager"):
+                with patch("app.queue_manager.THREAD_DRAIN_GRACE_SECONDS", 0.1):
+                    qm.add_job(_make_job(id=self.JOB_ID))
+                    await _wait_for_job_status(qm, self.JOB_ID, JobStatus.ERROR)
+                    # The grace expires with the thread still inside the fake.
+                    while "still running" not in caplog.text:
+                        await asyncio.sleep(0.01)
+            may_file.set()
+            while not callers:
+                await asyncio.sleep(0.01)
+
+        assert not result.exists()
+        assert store.get(self.JOB_ID).result_path is None
+
+
+# ===========================================================================
+# A terminal status is absorbing
+# ===========================================================================
+
+
+class TestTerminalStatusIsAbsorbing:
+    """The timeout path fails a job without waiting for its thread, so the
+    thread can report a phase a moment after the verdict was written.  Letting
+    that through stranded the job in ``converting``: retry and dismiss both
+    refuse that status, and cancel only signalled a token nobody was reading."""
+
+    JOB_ID = str(uuid.uuid4())
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_late_converting_does_not_overwrite_the_error(
+        self, mock_download, store
+    ):
+        events: list[SSEEvent] = []
+        reported = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            # The pre-check in on_phase reads the cancel flag a moment before it
+            # acts on it; a stale False is what the download thread saw in the
+            # real race, and pinning it here makes that instant reproducible.
+            cancel.is_set = lambda: False
+            while job.status != JobStatus.ERROR:
+                time.sleep(0.01)
+            on_phase("converting")
+            reported.set()
+            return "/data/music/Artist/Album/Title.flac"
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=0.2, on_event=events.append, store=store
+        )
+        qm.add_job(_make_job(id=self.JOB_ID))
+        await _wait_for_job_status(qm, self.JOB_ID, JobStatus.ERROR)
+        while not reported.is_set():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+        assert qm.get_job(self.JOB_ID).status == JobStatus.ERROR
+        assert store.get(self.JOB_ID).status == JobStatus.ERROR
+
+        kinds = [event.event for event in events]
+        after_error = [
+            event
+            for event in events[kinds.index("error") + 1 :]
+            if event.event == "status_change"
+        ]
+        assert after_error == []
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_late_progress_or_metadata_is_dropped_too(
+        self, mock_download, store
+    ):
+        """A late `metadata` persist would re-stamp finished_at on a job that
+        has already ended, and a late `progress` would put a bar back on it."""
+        events: list[SSEEvent] = []
+        reported = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            cancel.is_set = lambda: False
+            while job.status != JobStatus.ERROR:
+                time.sleep(0.01)
+            on_progress(42.0)
+            on_phase("metadata")
+            reported.set()
+            return "/data/music/Artist/Album/Title.flac"
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=0.2, on_event=events.append, store=store
+        )
+        qm.add_job(_make_job(id=self.JOB_ID))
+        await _wait_for_job_status(qm, self.JOB_ID, JobStatus.ERROR)
+        finished_at = store.get(self.JOB_ID).finished_at
+        while not reported.is_set():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+        kinds = [event.event for event in events]
+        assert kinds[kinds.index("error") + 1 :] == []
+        assert store.get(self.JOB_ID).finished_at == finished_at
+        assert qm.get_job(self.JOB_ID).finished_at == finished_at
+
+
+def _files(result) -> "callable":
+    """A fake download that reports the move the way the real one does.
+
+    ``result_path`` is read off what the run filed, not off the return value,
+    because that is the value the timeout hand-off arbitrates -- so a stand-in
+    for ``download_audio`` has to call ``on_filed`` like the real one.
+    """
+
+    def fake(job, on_progress=None, cancel=None, on_phase=None, on_filed=None):
+        path = Path(result)
+        on_filed(FiledTrack(path, frozenset({path.parent, path.parent.parent})))
+        return path
+
+    return fake
 
 
 class TestResultPath:
@@ -1554,7 +1810,7 @@ class TestResultPath:
         self, mock_download, store, isolated_paths
     ):
         download_dir, _ = isolated_paths
-        mock_download.return_value = (
+        mock_download.side_effect = _files(
             download_dir / "Artist" / "Album" / "Title.flac"
         )
 
@@ -1569,7 +1825,7 @@ class TestResultPath:
     async def test_a_path_outside_the_root_leaves_result_path_unset(
         self, mock_download, store
     ):
-        mock_download.return_value = "/somewhere/else/Title.flac"
+        mock_download.side_effect = _files("/somewhere/else/Title.flac")
 
         qm = QueueManager(max_concurrent=2, timeout=10, store=store)
         qm.add_job(_make_job(id="job-1"))
@@ -1729,3 +1985,745 @@ class TestQueueViewFiltering:
             qm._jobs[status.value] = _make_job(id=status.value, status=status)
 
         assert len(qm.get_jobs()) == 4
+
+
+# ===========================================================================
+# Cancel
+# ===========================================================================
+
+
+class TestCancelQueued:
+    """A queued job has no thread to interrupt, so it just stops existing."""
+
+    async def test_a_queued_job_is_cancelled_immediately(self, store):
+        events: list[SSEEvent] = []
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        job = _make_job()
+        qm._jobs[job.id] = job  # not dispatched: no task to race with
+
+        qm.cancel_job(job.id)
+
+        assert job.status == JobStatus.CANCELLED
+        assert job.error is None
+        assert [e.event for e in events] == ["status_change"]
+
+    async def test_the_row_is_written_before_the_event(self, store):
+        """Write-through: a client that reads the table sees what it was told."""
+        seen: list[str | None] = []
+        qm = QueueManager(
+            max_concurrent=1,
+            timeout=10,
+            on_event=lambda e: seen.append(store.get(e.job_id).status.value),
+            store=store,
+        )
+        job = _make_job()
+        qm._jobs[job.id] = job
+        qm._persist(job)
+
+        qm.cancel_job(job.id)
+
+        assert seen == [JobStatus.CANCELLED.value]
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_job_cancelled_while_waiting_for_a_slot_never_starts(
+        self, mock_download
+    ):
+        """The status re-check after acquiring the semaphore is what stops it."""
+        import threading
+
+        release = threading.Event()
+        started: list[str] = []
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            started.append(job.id)
+            release.wait(5)
+            return "/data/music/Artist/Album/track.flac"
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=10)
+        qm.add_job(_make_job(id="job-running"))
+        qm.add_job(_make_job(id="job-waiting"))
+        await _wait_for_job_status(qm, "job-running", JobStatus.DOWNLOADING)
+
+        qm.cancel_job("job-waiting")
+        assert qm.get_job("job-waiting").status == JobStatus.CANCELLED
+
+        release.set()
+        await _wait_for_job_status(qm, "job-running", JobStatus.DONE, timeout=5.0)
+        await asyncio.sleep(0.1)  # give the freed slot time to dispatch anything
+
+        assert started == ["job-running"]
+
+    async def test_a_cancelled_job_leaves_the_queue_view(self, store):
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        job = _make_job()
+        qm._jobs[job.id] = job
+
+        qm.cancel_job(job.id)
+
+        assert qm.get_jobs() == []
+        assert qm.get_job(job.id).status == JobStatus.CANCELLED
+
+    async def test_a_cancelled_job_cannot_be_retried(self, store):
+        """The user resubmits instead, so the duplicate check runs again."""
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        job = _make_job()
+        qm._jobs[job.id] = job
+        qm.cancel_job(job.id)
+
+        with pytest.raises(QueueError, match="only ERROR jobs"):
+            qm.retry_job(job.id)
+
+    async def test_cancelling_an_unknown_job_is_not_found(self):
+        qm = QueueManager(max_concurrent=1, timeout=10)
+
+        with pytest.raises(JobNotFound):
+            qm.cancel_job("no-such-job")
+
+    @pytest.mark.parametrize(
+        "status", [JobStatus.DONE, JobStatus.ERROR, JobStatus.CANCELLED]
+    )
+    async def test_cancelling_a_terminal_job_is_refused(self, status):
+        """A Cancel on a finished job means the client's view is stale."""
+        qm = QueueManager(max_concurrent=1, timeout=10)
+        job = _make_job(status=status)
+        qm._jobs[job.id] = job
+
+        with pytest.raises(QueueError, match="only queued or running"):
+            qm.cancel_job(job.id)
+
+        assert qm.get_job(job.id).status == status
+
+
+class TestCancelRunning:
+    """A running job is signalled; its own thread decides the outcome."""
+
+    @patch("app.queue_manager.download_audio")
+    async def test_cancelling_a_download_ends_it_cancelled_not_errored(
+        self, mock_download, store
+    ):
+        import threading
+
+        cancelled_seen = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            for _ in range(500):
+                if cancel.is_set():
+                    cancelled_seen.set()
+                    raise DownloadError("Download cancelled")
+                time.sleep(0.01)
+            raise AssertionError("the cancel never reached the downloader")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30, store=store)
+        qm.add_job(_make_job())
+        await _wait_for_job_status(qm, "job-1", JobStatus.DOWNLOADING)
+
+        qm.cancel_job("job-1")
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.CANCELLED, timeout=5.0)
+        assert cancelled_seen.is_set()
+        job = qm.get_job("job-1")
+        assert job.error is None
+        assert job.result_path is None
+        assert store.get("job-1").status == JobStatus.CANCELLED
+
+    @patch("app.queue_manager.download_audio")
+    async def test_the_stop_button_exists_before_the_job_says_downloading(
+        self, mock_download
+    ):
+        """Otherwise a Cancel in that window signals nothing and is lost."""
+        mock_download.return_value = "/data/music/Artist/Album/track.flac"
+        cancellable_when_announced: list[bool] = []
+
+        def watch(event: SSEEvent) -> None:
+            if event.data.get("status") == JobStatus.DOWNLOADING.value:
+                cancellable_when_announced.append(
+                    qm._active_runs.get(event.job_id) is not None
+                )
+
+        qm = QueueManager(max_concurrent=1, timeout=30, on_event=watch)
+        qm.add_job(_make_job())
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.DONE, timeout=5.0)
+        assert cancellable_when_announced == [True]
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_run_cancelled_before_its_thread_starts_downloads_nothing(
+        self, mock_download
+    ):
+        """The thread re-reads the stop button before it fetches a byte."""
+        from app.queue_manager import _ActiveRun
+
+        qm = QueueManager(max_concurrent=1, timeout=30)
+        job = _make_job()
+        qm._jobs[job.id] = job
+        run = _ActiveRun()
+        run.cancel.cancel()
+
+        with pytest.raises(DownloadError, match="cancelled"):
+            await qm._run_download(job.id, run)
+
+        mock_download.assert_not_called()
+        assert run.finished.is_set()
+
+    @patch("app.queue_manager.download_audio")
+    async def test_the_status_only_changes_once_the_thread_has_stopped(
+        self, mock_download
+    ):
+        """The queue must not say `cancelled` while ffmpeg is still writing."""
+        import threading
+
+        release = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            release.wait(5)
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30)
+        qm.add_job(_make_job())
+        await _wait_for_job_status(qm, "job-1", JobStatus.DOWNLOADING)
+
+        qm.cancel_job("job-1")
+        await asyncio.sleep(0.1)
+        assert qm.get_job("job-1").status == JobStatus.DOWNLOADING
+
+        release.set()
+        await _wait_for_job_status(qm, "job-1", JobStatus.CANCELLED, timeout=5.0)
+
+    @patch("app.queue_manager.download_audio")
+    async def test_cancelling_during_converting_is_allowed(self, mock_download):
+        import threading
+
+        release = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            on_phase("converting")
+            release.wait(5)
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30)
+        qm.add_job(_make_job())
+        await _wait_for_job_status(qm, "job-1", JobStatus.CONVERTING)
+
+        qm.cancel_job("job-1")
+        release.set()
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.CANCELLED, timeout=5.0)
+
+    @patch("app.queue_manager.download_audio")
+    async def test_the_scratch_directory_is_gone_after_a_cancel(
+        self, mock_download, isolated_paths
+    ):
+        import threading
+
+        download_dir, _ = isolated_paths
+        temp_dir = download_dir / ".tmp" / "job-1"
+        release = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            (temp_dir / "job-1.webm.part").write_text("half a download")
+            release.wait(5)
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30)
+        qm.add_job(_make_job())
+        await _wait_for_job_status(qm, "job-1", JobStatus.DOWNLOADING)
+        assert temp_dir.exists()
+
+        qm.cancel_job("job-1")
+        release.set()
+        await _wait_for_job_status(qm, "job-1", JobStatus.CANCELLED, timeout=5.0)
+
+        assert not temp_dir.exists()
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_genuine_failure_is_still_an_error_not_a_cancellation(
+        self, mock_download
+    ):
+        mock_download.side_effect = DownloadError("HTTP Error 403: Forbidden")
+
+        qm = QueueManager(max_concurrent=1, timeout=30)
+        qm.add_job(_make_job())
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.ERROR, timeout=5.0)
+        assert "403" in qm.get_job("job-1").error
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_cancel_that_loses_the_race_leaves_the_job_done_with_its_file(
+        self, mock_download, store, isolated_paths
+    ):
+        """Never `cancelled` with a track sitting in the library."""
+        import threading
+
+        download_dir, _ = isolated_paths
+        result = download_dir / "Artist" / "Album" / "Title.flac"
+        filed = threading.Event()
+        may_return = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_bytes(b"flac")
+            on_filed(FiledTrack(result, frozenset({result.parent})))
+            filed.set()
+            may_return.wait(5)  # the cancel lands in here, after the move
+            return result
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30, store=store)
+        qm.add_job(_make_job())
+        await _wait_for_job_status(qm, "job-1", JobStatus.DOWNLOADING)
+        while not filed.is_set():
+            await asyncio.sleep(0.01)
+
+        qm.cancel_job("job-1")
+        may_return.set()
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.DONE, timeout=5.0)
+        assert qm.get_job("job-1").result_path == "Artist/Album/Title.flac"
+        assert result.exists()
+
+
+# ===========================================================================
+# Dismiss
+# ===========================================================================
+
+
+class TestDismiss:
+    """Errored jobs are the only ones the sweep never drops, so this is how
+    they leave."""
+
+    async def test_an_errored_job_is_removed_from_the_dict_and_the_table(self, store):
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        job = _make_job(status=JobStatus.ERROR, error="boom")
+        qm._jobs[job.id] = job
+        qm._persist(job)
+
+        qm.dismiss_job(job.id)
+
+        assert qm.get_job(job.id) is None
+        assert store.get(job.id) is None
+        assert qm.get_jobs() == []
+
+    async def test_dismissing_an_unknown_job_is_not_found(self, store):
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+
+        with pytest.raises(JobNotFound):
+            qm.dismiss_job("no-such-job")
+
+    @pytest.mark.parametrize(
+        "status",
+        [
+            JobStatus.QUEUED,
+            JobStatus.DOWNLOADING,
+            JobStatus.CONVERTING,
+            JobStatus.DONE,
+            JobStatus.CANCELLED,
+        ],
+    )
+    async def test_only_errored_jobs_can_be_dismissed(self, status, store):
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        job = _make_job(status=status)
+        qm._jobs[job.id] = job
+
+        with pytest.raises(QueueError, match="only errored jobs"):
+            qm.dismiss_job(job.id)
+
+        assert qm.get_job(job.id) is not None
+
+    async def test_a_dismissed_job_does_not_come_back_after_a_restart(self, store):
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        job = _make_job(status=JobStatus.ERROR, error="boom")
+        qm._jobs[job.id] = job
+        qm._persist(job)
+        qm.dismiss_job(job.id)
+
+        restarted = QueueManager(max_concurrent=1, timeout=10, store=store)
+        assert restarted.restore_from_store() == []
+
+    async def test_the_url_of_a_dismissed_job_can_be_submitted_again(self, store):
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        job = _make_job(status=JobStatus.ERROR, error="boom")
+        qm._jobs[job.id] = job
+        qm._persist(job)
+
+        qm.dismiss_job(job.id)
+
+        assert qm.find_in_flight(job.url) is None
+
+
+class TestTimeoutStopsTheConverter:
+    """The timeout used to be able to give up waiting while ffmpeg carried on."""
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_timeout_during_converting_cancels_the_run(self, mock_download):
+        import threading
+
+        release = threading.Event()
+        seen = {}
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            on_phase("converting")
+            # Real code is blocked in ffmpeg's communicate() here; the token is
+            # what reaches into that and signals the process.
+            for _ in range(500):
+                if cancel.is_set():
+                    seen["cancelled_while_converting"] = True
+                    break
+                time.sleep(0.01)
+            release.set()
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=2, timeout=0.3)
+        qm.add_job(_make_job())
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.ERROR, timeout=5.0)
+        assert "timed out" in qm.get_job("job-1").error.lower()
+
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        assert seen.get("cancelled_while_converting") is True
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_timed_out_job_stays_errored_when_its_thread_stops(
+        self, mock_download
+    ):
+        """The thread's DownloadError must not turn a timeout into a cancel."""
+        import threading
+
+        stopped = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            while not cancel.is_set():
+                time.sleep(0.01)
+            stopped.set()
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=2, timeout=0.3)
+        qm.add_job(_make_job())
+
+        await _wait_for_job_status(qm, "job-1", JobStatus.ERROR, timeout=5.0)
+        while not stopped.is_set():
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+
+        assert qm.get_job("job-1").status == JobStatus.ERROR
+
+
+# ===========================================================================
+# Cancel: what it costs the event loop, and what a restart makes of it
+# ===========================================================================
+
+
+class TestCancelDoesNotBlockTheEventLoop:
+    """Cancel is a route handler: it may not park the loop on a child process."""
+
+    @patch("app.queue_manager.download_audio")
+    async def test_cancelling_a_wedged_ffmpeg_returns_at_once(self, mock_download):
+        """The grace an ffmpeg that ignores SIGTERM is entitled to is waited
+        out by the download thread, not by whoever pressed Cancel."""
+        from tests.conftest import FakeFfmpegProcess
+
+        registered = threading.Event()
+        gate = threading.Event()  # never set: the fake encode hangs
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            process = FakeFfmpegProcess(
+                ["ffmpeg"], gate, 0, b"", ignore_terminate=True
+            )
+            cancel.register_process(process)
+            registered.set()
+            while not cancel.is_set():
+                time.sleep(0.005)
+            process.kill()  # what _run_ffmpeg does once the grace expires
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30)
+        qm.add_job(_make_job())
+        await _wait_for_job_status(qm, "job-1", JobStatus.DOWNLOADING)
+        assert registered.wait(5), "the fake ffmpeg was never registered"
+
+        before = time.monotonic()
+        qm.cancel_job("job-1")
+        elapsed = time.monotonic() - before
+
+        assert elapsed < 0.1, f"cancel_job blocked the loop for {elapsed:.2f}s"
+        await _wait_for_job_status(qm, "job-1", JobStatus.CANCELLED, timeout=5.0)
+
+
+class TestCancelSurvivesARestart:
+    """A cancel takes as long as the thread takes; a restart in that window
+    must finish the job, not resurrect it."""
+
+    JOB_ID = str(uuid.uuid4())
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_restart_mid_cancel_finishes_the_job_cancelled(
+        self, mock_download, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        release = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            release.wait(5)  # the thread is still working when we "restart"
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30, store=store)
+        qm.add_job(_make_job(id=self.JOB_ID))
+        await _wait_for_job_status(qm, self.JOB_ID, JobStatus.DOWNLOADING)
+
+        qm.cancel_job(self.JOB_ID)
+
+        # The request is on disk before the thread has reported anything back.
+        row = store.get(self.JOB_ID)
+        assert row.cancel_requested is True
+        assert row.status == JobStatus.DOWNLOADING
+
+        # The process dies here: a fresh manager reloads the same database.
+        restarted = QueueManager(max_concurrent=1, timeout=30, store=store)
+        restarted.restore_from_store()
+
+        assert restarted.get_job(self.JOB_ID).status == JobStatus.CANCELLED
+        assert store.get(self.JOB_ID).status == JobStatus.CANCELLED
+        mock_download.reset_mock()
+        await asyncio.sleep(0.05)
+        mock_download.assert_not_called()  # nothing was re-queued
+
+        release.set()
+
+    @patch("app.queue_manager.download_audio")
+    async def test_the_restart_costs_the_cancelled_job_no_attempt(
+        self, mock_download, store, isolated_paths
+    ):
+        """It is not a failed attempt: the restart did what the cancel asked."""
+        download_dir, _ = isolated_paths
+        temp_dir = download_dir / ".tmp" / self.JOB_ID
+        temp_dir.mkdir(parents=True)
+        (temp_dir / "Test Track.webm.part").write_text("x")
+        store.upsert(
+            _make_job(
+                id=self.JOB_ID,
+                status=JobStatus.DOWNLOADING,
+                cancel_requested=True,
+                attempts=1,
+            )
+        )
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.restore_from_store()
+
+        job = qm.get_job(self.JOB_ID)
+        assert job.status == JobStatus.CANCELLED
+        assert job.attempts == 1
+        assert job.restart_attempts == 0
+        assert job.finished_at is not None
+        assert not temp_dir.exists()
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_cancel_that_lost_its_race_is_not_left_on_the_done_row(
+        self, mock_download, store, isolated_paths
+    ):
+        """Otherwise a restart would read the flag as "the user stopped this"."""
+        download_dir, _ = isolated_paths
+        result = download_dir / "Artist" / "Album" / "Title.flac"
+        filed = threading.Event()
+        may_return = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("flac")
+            on_filed(FiledTrack(result, frozenset({result.parent})))
+            filed.set()
+            may_return.wait(5)  # the cancel lands in here, after the move
+            return result
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=30, store=store)
+        qm.add_job(_make_job(id=self.JOB_ID))
+        await _wait_for_job_status(qm, self.JOB_ID, JobStatus.DOWNLOADING)
+        while not filed.is_set():
+            await asyncio.sleep(0.01)
+
+        qm.cancel_job(self.JOB_ID)
+        assert store.get(self.JOB_ID).cancel_requested is True
+        may_return.set()
+
+        await _wait_for_job_status(qm, self.JOB_ID, JobStatus.DONE, timeout=5.0)
+        assert store.get(self.JOB_ID).cancel_requested is False
+        assert qm.get_job(self.JOB_ID).cancel_requested is False
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_retried_job_is_no_longer_a_job_the_user_asked_to_stop(
+        self, mock_download, store
+    ):
+        """A cancel can lose to a genuine failure; the row would keep the flag."""
+        mock_download.side_effect = DownloadError("boom")
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_job(_make_job(id=self.JOB_ID))
+        await _wait_for_job_status(qm, self.JOB_ID, JobStatus.ERROR)
+        qm.get_job(self.JOB_ID).cancel_requested = True
+
+        mock_download.side_effect = None
+        mock_download.return_value = "/data/music/Artist/Album/track.flac"
+        qm.retry_job(self.JOB_ID)
+
+        assert store.get(self.JOB_ID).cancel_requested is False
+
+
+# ===========================================================================
+# The timeout does not release a slot the thread is still using
+# ===========================================================================
+
+
+class TestTimeoutWaitsForItsThread:
+    """The semaphore counts download threads, so it may not be handed on while
+    the timed-out one is still holding its scratch directory and its ffmpeg."""
+
+    @patch("app.queue_manager.download_audio")
+    async def test_the_next_job_waits_for_the_timed_out_thread_to_stop(
+        self, mock_download
+    ):
+        release = threading.Event()
+        started: list[str] = []
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            started.append(job.id)
+            release.wait(5)  # ignores the cancel, like a wedged conversion
+            return "/data/music/Artist/Album/track.flac"
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=0.2)
+        qm.add_job(_make_job(id="job-0"))
+        qm.add_job(_make_job(id="job-1"))
+        await _wait_for_job_status(qm, "job-0", JobStatus.ERROR, timeout=5.0)
+
+        await asyncio.sleep(0.2)
+        assert qm.get_job("job-1").status == JobStatus.QUEUED
+        assert started == ["job-0"]
+
+        release.set()
+        await _wait_for_job_status(qm, "job-1", JobStatus.DONE, timeout=5.0)
+        assert started == ["job-0", "job-1"]
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_thread_that_outlives_the_grace_does_not_stall_the_queue(
+        self, mock_download, caplog
+    ):
+        """Bounded: one stuck thread must not close the queue for good."""
+        release = threading.Event()
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            release.wait(10)
+            return "/data/music/Artist/Album/track.flac"
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=0.2)
+        with caplog.at_level(logging.WARNING, logger="app.queue_manager"):
+            with patch("app.queue_manager.THREAD_DRAIN_GRACE_SECONDS", 0.2):
+                qm.add_job(_make_job(id="job-0"))
+                qm.add_job(_make_job(id="job-1"))
+                await _wait_for_job_status(
+                    qm, "job-1", JobStatus.DOWNLOADING, timeout=5.0
+                )
+
+        assert "still running" in caplog.text
+        release.set()
+
+    @patch("app.queue_manager.download_audio")
+    async def test_the_drain_does_not_need_a_free_executor_thread(self, mock_download):
+        """It used to wait in the same pool the download threads run in, so a
+        full pool meant the wait could not start and the slot never came back."""
+        release = threading.Event()
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=1)
+        )
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            release.wait(10)  # the pool's only worker, and it ignores the cancel
+            return "/data/music/Artist/Album/track.flac"
+
+        mock_download.side_effect = fake
+
+        qm = QueueManager(max_concurrent=1, timeout=0.2)
+        try:
+            with patch("app.queue_manager.THREAD_DRAIN_GRACE_SECONDS", 0.2):
+                qm.add_job(_make_job(id="job-0"))
+                qm.add_job(_make_job(id="job-1"))
+                await _wait_for_job_status(
+                    qm, "job-1", JobStatus.DOWNLOADING, timeout=2.0
+                )
+        finally:
+            release.set()
+
+    def test_the_grace_covers_the_worker_killing_a_wedged_ffmpeg(self):
+        """Otherwise the slot would be released while ffmpeg was still alive."""
+        from app.downloader import FFMPEG_TERMINATE_GRACE_SECONDS
+
+        assert THREAD_DRAIN_GRACE_SECONDS > FFMPEG_TERMINATE_GRACE_SECONDS
+
+
+# ===========================================================================
+# Dispatching a job's processing task
+# ===========================================================================
+
+
+class TestDispatch:
+    """asyncio keeps only a weak reference to a running task."""
+
+    async def test_a_running_task_is_held_and_released_when_it_finishes(self):
+        qm = QueueManager(max_concurrent=1, timeout=10)
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def parked(job_id: str) -> None:
+            started.set()
+            await finish.wait()
+
+        qm._process_job = parked
+
+        qm._dispatch("job-1")
+        await started.wait()
+        assert len(qm._tasks) == 1
+
+        finish.set()
+        await asyncio.sleep(0.05)
+        assert qm._tasks == set()
+
+    async def test_an_exception_that_escapes_processing_names_its_job(self, caplog):
+        qm = QueueManager(max_concurrent=1, timeout=10)
+
+        async def explode(job_id: str) -> None:
+            raise RuntimeError("boom")
+
+        qm._process_job = explode
+
+        with caplog.at_level(logging.ERROR, logger="app.queue_manager"):
+            qm._dispatch("job-1")
+            await asyncio.sleep(0.05)
+
+        assert "job-1" in caplog.text
+        assert "boom" in caplog.text

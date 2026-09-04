@@ -87,6 +87,39 @@ export async function retryJob(jobId: string): Promise<Job> {
 }
 
 /**
+ * Cancel a queued or running job.
+ *
+ * A queued job comes back already "cancelled"; a running one comes back in the
+ * state it is still in and reaches "cancelled" over the SSE stream once its
+ * thread has stopped ffmpeg and cleaned up. 400 when the job already finished.
+ */
+export async function cancelJob(jobId: string): Promise<Job> {
+  const res = await fetch(`${API_BASE_URL}/queue/${jobId}/cancel`, {
+    method: "POST",
+  });
+
+  if (!res.ok) {
+    throw new Error(await parseErrorDetail(res));
+  }
+
+  return res.json() as Promise<Job>;
+}
+
+/**
+ * Dismiss an errored job: the backend deletes it outright, so there is no job
+ * left to return and the response is a 204 with no body.
+ */
+export async function dismissJob(jobId: string): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}/queue/${jobId}/dismiss`, {
+    method: "POST",
+  });
+
+  if (!res.ok) {
+    throw new Error(await parseErrorDetail(res));
+  }
+}
+
+/**
  * Open an SSE connection to the queue stream endpoint.
  * Calls the provided handler for each parsed SSE event.
  * Returns a function to close the connection.

@@ -1,16 +1,39 @@
 import { useMemo } from "react";
-import { RotateCw, Music, AlertCircle, Clock, Loader2, CheckCircle2 } from "lucide-react";
+import {
+  RotateCw,
+  Music,
+  AlertCircle,
+  Clock,
+  Loader2,
+  CheckCircle2,
+  X,
+  Tags,
+  Ban,
+  SkipForward,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import type { Job, JobStatus } from "@/lib/types";
+import {
+  ALREADY_IN_LIBRARY_PREFIX,
+  type Job,
+  type JobStatus,
+} from "@/lib/types";
 
 /** Statuses that keep a job at the top of the queue. */
 const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
   "queued",
   "downloading",
   "converting",
+  "tagging",
 ]);
+
+/**
+ * Statuses the backend accepts a cancel on. Anything else is terminal and the
+ * endpoint answers 400, so offering the button there would only ever produce
+ * an error the user cannot act on.
+ */
+const CANCELLABLE_STATUSES: ReadonlySet<JobStatus> = ACTIVE_STATUSES;
 
 /** Sort jobs: active (queued/downloading/converting) first, then newest-to-oldest by created_at. */
 function sortJobs(jobs: Job[]): Job[] {
@@ -29,7 +52,11 @@ function sortJobs(jobs: Job[]): Job[] {
 
 interface QueueDisplayProps {
   jobs: Job[];
+  /** Ids whose cancel request is still in flight — their button is disabled. */
+  cancelling: ReadonlySet<string>;
   onRetry: (jobId: string) => void;
+  onCancel: (jobId: string) => void;
+  onDismiss: (jobId: string) => void;
 }
 
 /** Format seconds into MM:SS or HH:MM:SS. */
@@ -67,6 +94,11 @@ const STATUS_CONFIG: Record<
     variant: "default",
     icon: <Loader2 className="size-3 animate-spin" />,
   },
+  tagging: {
+    label: "Tagging",
+    variant: "default",
+    icon: <Tags className="size-3" />,
+  },
   done: {
     label: "Done",
     variant: "outline",
@@ -76,6 +108,11 @@ const STATUS_CONFIG: Record<
     label: "Error",
     variant: "destructive",
     icon: <AlertCircle className="size-3" />,
+  },
+  cancelled: {
+    label: "Cancelled",
+    variant: "outline",
+    icon: <Ban className="size-3" />,
   },
 };
 
@@ -105,10 +142,27 @@ function ProgressBar({ progress }: { progress: number }) {
   );
 }
 
-function JobItem({ job, onRetry }: { job: Job; onRetry: (id: string) => void }) {
+function JobItem({
+  job,
+  cancelPending,
+  onRetry,
+  onCancel,
+  onDismiss,
+}: {
+  job: Job;
+  cancelPending: boolean;
+  onRetry: (id: string) => void;
+  onCancel: (id: string) => void;
+  onDismiss: (id: string) => void;
+}) {
   // Progress is only meaningful while downloading; the converting phase
   // (ffmpeg encode) reports nothing, so it shows a spinning badge instead.
   const showProgress = job.status === "downloading";
+  const canCancel = CANCELLABLE_STATUSES.has(job.status);
+  // The backend ends a download whose target file already exists as an error,
+  // but nothing went wrong and retrying would fail the same way — so it reads
+  // as a neutral "Skipped" with the reason in muted text and no Retry.
+  const skipped = job.error?.startsWith(ALREADY_IN_LIBRARY_PREFIX) ?? false;
 
   return (
     <div className="flex gap-3 rounded-lg border p-3">
@@ -140,27 +194,72 @@ function JobItem({ job, onRetry }: { job: Job; onRetry: (id: string) => void }) 
               {job.album && ` \u00B7 ${job.album}`}
             </p>
           </div>
-          <StatusBadge status={job.status} />
+          <div className="flex shrink-0 items-center gap-1.5">
+            {skipped ? (
+              <Badge variant="outline" className="gap-1">
+                <SkipForward className="size-3" />
+                Skipped
+              </Badge>
+            ) : (
+              <StatusBadge status={job.status} />
+            )}
+            {canCancel && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Cancel download"
+                title="Cancel download"
+                disabled={cancelPending}
+                onClick={() => onCancel(job.id)}
+              >
+                <X className="size-3" />
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Progress bar */}
         {showProgress && <ProgressBar progress={job.progress} />}
 
-        {/* Error message + retry */}
-        {job.status === "error" && (
+        {/*
+          The message shows whenever the job carries one, not just in the error
+          state: a failed Cancel or Dismiss writes into job.error while the job
+          is still queued or running, and that has to be visible. Retry and
+          Dismiss stay gated on the error state, since that is the only one the
+          backend accepts them in.
+        */}
+        {(job.error !== null || job.status === "error") && (
           <div className="flex items-center gap-2">
-            <p className="min-w-0 flex-1 truncate text-xs text-destructive">
+            <p
+              className={`min-w-0 flex-1 truncate text-xs ${
+                skipped ? "text-muted-foreground" : "text-destructive"
+              }`}
+            >
               {job.error ?? "An error occurred"}
             </p>
-            <Button
-              variant="outline"
-              size="xs"
-              onClick={() => onRetry(job.id)}
-              className="shrink-0"
-            >
-              <RotateCw className="size-3" data-icon="inline-start" />
-              Retry
-            </Button>
+            {job.status === "error" && !skipped && (
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={() => onRetry(job.id)}
+                className="shrink-0"
+              >
+                <RotateCw className="size-3" data-icon="inline-start" />
+                Retry
+              </Button>
+            )}
+            {job.status === "error" && (
+              <Button
+                variant="ghost"
+                size="xs"
+                onClick={() => onDismiss(job.id)}
+                className="shrink-0"
+                title="Remove this job from the queue"
+              >
+                <X className="size-3" data-icon="inline-start" />
+                Dismiss
+              </Button>
+            )}
           </div>
         )}
       </div>
@@ -168,7 +267,13 @@ function JobItem({ job, onRetry }: { job: Job; onRetry: (id: string) => void }) 
   );
 }
 
-export function QueueDisplay({ jobs, onRetry }: QueueDisplayProps) {
+export function QueueDisplay({
+  jobs,
+  cancelling,
+  onRetry,
+  onCancel,
+  onDismiss,
+}: QueueDisplayProps) {
   const sorted = useMemo(() => sortJobs(jobs), [jobs]);
 
   if (sorted.length === 0) return null;
@@ -181,7 +286,14 @@ export function QueueDisplay({ jobs, onRetry }: QueueDisplayProps) {
       <CardContent className="min-h-0 flex-1 overflow-y-auto queue-scroll">
         <div className="flex flex-col gap-3">
           {sorted.map((job) => (
-            <JobItem key={job.id} job={job} onRetry={onRetry} />
+            <JobItem
+              key={job.id}
+              job={job}
+              cancelPending={cancelling.has(job.id)}
+              onRetry={onRetry}
+              onCancel={onCancel}
+              onDismiss={onDismiss}
+            />
           ))}
         </div>
       </CardContent>

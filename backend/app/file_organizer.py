@@ -80,6 +80,28 @@ def _resolve(
     return fallback
 
 
+def resolve_artist_album(
+    user_artist: str | None = None,
+    user_album: str | None = None,
+    ytdlp_artist: str | None = None,
+    ytdlp_album: str | None = None,
+) -> tuple[str, str]:
+    """Return the sanitised ``(artist, album)`` a download will be filed under.
+
+    Split out of :func:`get_output_path` so the tagger can write exactly the
+    names the folders carry.  A FLAC whose ``ALBUMARTIST`` disagrees with the
+    folder it sits in is what makes Navidrome and Lidarr file the same track
+    twice, so both must come from one resolution and not be resolved twice.
+    """
+    artist = sanitize_component(
+        _resolve("artist", user_artist, ytdlp_artist, FALLBACK_ARTIST), FALLBACK_ARTIST
+    )
+    album = sanitize_component(
+        _resolve("album", user_album, ytdlp_album, FALLBACK_ALBUM), FALLBACK_ALBUM
+    )
+    return artist, album
+
+
 def get_output_path(
     track_filename: str,
     user_artist: str | None = None,
@@ -104,11 +126,8 @@ def get_output_path(
     Raises:
         UnsafePathError: If the resulting path would fall outside download_path.
     """
-    artist = sanitize_component(
-        _resolve("artist", user_artist, ytdlp_artist, FALLBACK_ARTIST), FALLBACK_ARTIST
-    )
-    album = sanitize_component(
-        _resolve("album", user_album, ytdlp_album, FALLBACK_ALBUM), FALLBACK_ALBUM
+    artist, album = resolve_artist_album(
+        user_artist, user_album, ytdlp_artist, ytdlp_album
     )
     filename = sanitize_component(track_filename, "Unknown Title.flac")
 

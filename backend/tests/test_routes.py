@@ -5,6 +5,8 @@ with mocked downloader and controlled queue behavior.  Covers:
   - POST /download (happy path, validation, metadata extraction failure)
   - GET /queue (empty, populated)
   - POST /queue/{id}/retry (happy path, errors)
+  - POST /queue/{id}/cancel (queued, running, terminal, unknown)
+  - POST /queue/{id}/dismiss (errored, wrong state, unknown)
   - GET /queue/stream SSE (event emission)
 """
 
@@ -348,9 +350,10 @@ class TestRetryEndpoint:
         assert data["error"] is None
         assert data["progress"] == 0.0
 
-    def test_retry_nonexistent_job_returns_400(self, client):
+    def test_retry_nonexistent_job_returns_404(self, client):
+        """An unknown id is a missing resource, not a bad state."""
         resp = client.post("/queue/nonexistent-id/retry")
-        assert resp.status_code == 400
+        assert resp.status_code == 404
         assert "not found" in resp.json()["detail"].lower()
 
     @patch("app.queue_manager.download_audio")
@@ -754,7 +757,7 @@ class TestDuplicateSubmission:
 
         release = threading.Event()
 
-        def blocking_download(job, on_progress, cancel_event=None, on_phase=None):
+        def blocking_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
             release.wait(5)
             return "/data/music/output.flac"
 
@@ -1111,3 +1114,136 @@ class TestQueueViewOmitsFinishedJobs:
             assert "already in the queue" in resp.json()["detail"]
         finally:
             release.set()
+
+
+# ===========================================================================
+# POST /queue/{id}/cancel
+# ===========================================================================
+
+
+class TestCancelEndpoint:
+    """Cancel is the only way to stop a job that is already running."""
+
+    def test_cancelling_a_queued_job_returns_it_cancelled(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["job-1"] = _make_job()
+
+        resp = client.post("/queue/job-1/cancel")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "cancelled"
+
+    def test_a_cancelled_job_is_gone_from_the_queue(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["job-1"] = _make_job()
+
+        client.post("/queue/job-1/cancel")
+
+        assert client.get("/queue").json() == []
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_cancelling_a_running_job_reaches_cancelled(
+        self, mock_extract, mock_download, client_and_qm
+    ):
+        """The response comes back at once; the state follows the thread."""
+        client, qm = client_and_qm
+        mock_extract.return_value = _make_metadata()
+        release = threading.Event()
+
+        def fake_download(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            release.wait(timeout=5)
+            raise DownloadError("Download cancelled")
+
+        mock_download.side_effect = fake_download
+
+        job_id = client.post(
+            "/download", json={"url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"}
+        ).json()["id"]
+        for _ in range(200):
+            if qm.get_job(job_id).status == JobStatus.DOWNLOADING:
+                break
+            time.sleep(0.01)
+
+        resp = client.post(f"/queue/{job_id}/cancel")
+        assert resp.status_code == 200
+
+        release.set()
+        for _ in range(500):
+            if qm.get_job(job_id).status == JobStatus.CANCELLED:
+                break
+            time.sleep(0.01)
+        assert qm.get_job(job_id).status == JobStatus.CANCELLED
+        assert qm.get_job(job_id).error is None
+
+    def test_cancelling_an_unknown_job_returns_404(self, client):
+        resp = client.post("/queue/nonexistent-id/cancel")
+        assert resp.status_code == 404
+        assert "not found" in resp.json()["detail"].lower()
+
+    @pytest.mark.parametrize("status", ["done", "error", "cancelled"])
+    def test_cancelling_a_terminal_job_returns_400(self, status, client_and_qm):
+        """A stale UI, not a valid request: the answer must not be "fine"."""
+        client, qm = client_and_qm
+        qm._jobs["job-1"] = _make_job(status=JobStatus(status))
+
+        resp = client.post("/queue/job-1/cancel")
+
+        assert resp.status_code == 400
+        assert "cancelled" in resp.json()["detail"]
+
+    def test_a_cancelled_job_cannot_be_retried(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["job-1"] = _make_job()
+        client.post("/queue/job-1/cancel")
+
+        resp = client.post("/queue/job-1/retry")
+
+        assert resp.status_code == 400
+
+
+# ===========================================================================
+# POST /queue/{id}/dismiss
+# ===========================================================================
+
+
+class TestDismissEndpoint:
+    """Errored jobs stay in the queue until somebody says they have been seen."""
+
+    def test_dismissing_an_errored_job_removes_it(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["job-1"] = _make_job(status=JobStatus.ERROR, error="boom")
+
+        resp = client.post("/queue/job-1/dismiss")
+
+        assert resp.status_code == 204
+        assert client.get("/queue").json() == []
+        assert qm.get_job("job-1") is None
+
+    def test_dismissing_an_unknown_job_returns_404(self, client):
+        resp = client.post("/queue/nonexistent-id/dismiss")
+        assert resp.status_code == 404
+
+    @pytest.mark.parametrize("status", ["queued", "downloading", "done", "cancelled"])
+    def test_dismissing_a_job_that_is_not_errored_returns_400(
+        self, status, client_and_qm
+    ):
+        client, qm = client_and_qm
+        qm._jobs["job-1"] = _make_job(status=JobStatus(status))
+
+        resp = client.post("/queue/job-1/dismiss")
+
+        assert resp.status_code == 400
+        assert "errored" in resp.json()["detail"]
+        assert qm.get_job("job-1") is not None
+
+    def test_a_dismissed_job_is_deleted_from_the_database(self, client_and_qm):
+        client, qm = client_and_qm
+        job = _make_job(status=JobStatus.ERROR, error="boom")
+        qm._jobs[job.id] = job
+        qm._persist(job)
+        assert qm._store.get(job.id) is not None
+
+        client.post(f"/queue/{job.id}/dismiss")
+
+        assert qm._store.get(job.id) is None

@@ -15,6 +15,7 @@ from app.file_organizer import (
     FALLBACK_ALBUM,
     FALLBACK_ARTIST,
     get_output_path,
+    resolve_artist_album,
 )
 
 
@@ -346,3 +347,43 @@ class TestHousekeepingDirectoriesAreReserved:
         artist = "...And You Will Know Us by the Trail of Dead"
         result = get_output_path(TRACK, user_artist=artist, download_path=DOWNLOAD)
         assert result.parts[-3] == artist
+
+
+# ===========================================================================
+# resolve_artist_album
+# ===========================================================================
+
+
+class TestResolveArtistAlbum:
+    """The tagger and the path builder must not resolve names separately: a
+    FLAC whose ALBUMARTIST disagrees with its folder is filed twice by
+    Navidrome."""
+
+    def test_it_returns_what_get_output_path_files_under(self):
+        artist, album = resolve_artist_album(
+            user_artist="Bonobo", ytdlp_album="Black Sands"
+        )
+        path = get_output_path(
+            "Kiara.flac",
+            user_artist="Bonobo",
+            ytdlp_album="Black Sands",
+            download_path="/music",
+        )
+
+        assert (artist, album) == ("Bonobo", "Black Sands")
+        assert path.parent == Path("/music") / artist / album
+
+    def test_user_values_still_win_over_yt_dlp(self):
+        assert resolve_artist_album(
+            user_artist="Mine", user_album="Ours", ytdlp_artist="Theirs",
+            ytdlp_album="Yours",
+        ) == ("Mine", "Ours")
+
+    def test_missing_values_fall_back(self):
+        assert resolve_artist_album() == (FALLBACK_ARTIST, FALLBACK_ALBUM)
+
+    def test_names_are_sanitised_the_same_way_the_folders_are(self):
+        artist, album = resolve_artist_album(user_artist="AC/DC", user_album="..")
+
+        assert "/" not in artist
+        assert album == FALLBACK_ALBUM

@@ -10,9 +10,16 @@ This is a project for educational purpose, to learn the usage of the library yt-
 
 1. Paste a YouTube or SoundCloud URL into the web UI, optionally specifying artist and album names.
 2. The backend extracts metadata (title, thumbnail, duration) via yt-dlp and returns it immediately.
-3. The job enters an async queue. yt-dlp downloads the audio, ffmpeg converts it to FLAC, and metadata is embedded.
+3. The job enters an async queue and runs a three-stage pipeline: yt-dlp fetches the best audio stream and the
+   thumbnail (no postprocessing), an ffmpeg subprocess of ours converts that stream to FLAC, and Mutagen writes the
+   tags, the cover art, and the `SOURCEID`/`SOURCEURL` fields that record where the track came from.
 4. Files are saved to `DOWNLOAD_PATH/Artist/Album/track.flac`, falling back to "Unknown Artist"/"Unknown Album" when metadata isn't available.
 Real-time progress is streamed to the browser via Server-Sent Events — no polling.
+
+Queue rows carry two actions. **Cancel** stops a job that is queued, downloading or converting: running ffmpeg is our
+own process, so it is killed rather than waited out, and every partial and temporary file is removed. Cancelled jobs
+leave the queue and are not retried — resubmit the URL instead. **Dismiss** removes a failed job, which is otherwise
+kept until you have seen it.
 
 ## Architecture
 
@@ -143,5 +150,6 @@ must exist and be writable by `PUID:PGID` yourself.
 - **Single tracks only** — playlist and channel URLs are rejected with an error; only the single track behind a URL is ever downloaded.
 - **YouTube and SoundCloud only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com` and their subdomains, and rejects everything else with a validation error. No Spotify, Bandcamp, or other sources.
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
+- **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced.
 - **No authentication** — designed for private/internal networks.
 - **FLAC only** — lossy sources are losslessly wrapped in FLAC for consistent output.

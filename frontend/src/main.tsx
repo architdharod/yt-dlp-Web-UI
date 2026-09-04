@@ -6,7 +6,16 @@ import { QueueDisplay } from "@/components/QueueDisplay";
 import { useSSE } from "@/hooks/useSSE";
 
 function App() {
-  const { jobs, connected, error, addJob, retryJob } = useSSE();
+  const {
+    jobs,
+    connected,
+    error,
+    cancelling,
+    addJob,
+    retryJob,
+    cancelJob,
+    dismissJob,
+  } = useSSE();
 
   return (
     <div className="mx-auto flex h-dvh max-w-2xl flex-col gap-6 overflow-hidden p-4 sm:p-6">
@@ -25,7 +34,13 @@ function App() {
         <div className="shrink-0">
           <DownloadForm onJobCreated={addJob} />
         </div>
-        <QueueDisplay jobs={jobs} onRetry={retryJob} />
+        <QueueDisplay
+          jobs={jobs}
+          cancelling={cancelling}
+          onRetry={retryJob}
+          onCancel={cancelJob}
+          onDismiss={dismissJob}
+        />
       </main>
     </div>
   );

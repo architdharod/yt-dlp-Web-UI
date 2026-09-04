@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getQueue, connectQueueStream, retryJob } from "@/lib/api";
+import {
+  getQueue,
+  connectQueueStream,
+  retryJob,
+  cancelJob,
+  dismissJob,
+} from "@/lib/api";
 import type { Job, SSEEvent } from "@/lib/types";
 
 /**
@@ -49,12 +55,19 @@ function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
  * a job we do not know about (submitted from another tab, or a response we
  * never saw) and whenever the stream reconnects after a drop.
  *
- * Returns the current jobs list, a retry handler, and connection status.
+ * Returns the current jobs list, the row action handlers, and connection
+ * status.
  */
 export function useSSE() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Ids whose cancel request is in flight. The row's Cancel button is disabled
+   * while its id is in here, so a double click cannot send two requests (the
+   * second would answer 400 once the first one landed).
+   */
+  const [cancelling, setCancelling] = useState<Set<string>>(new Set());
 
   const closeRef = useRef<(() => void) | null>(null);
   const cancelledRef = useRef(false);
@@ -110,6 +123,21 @@ export function useSSE() {
             if (job.status !== "error") {
               job.error = null;
             }
+            // A running job only reaches "cancelled" once its thread has
+            // actually stopped, which is the moment it leaves GET /queue —
+            // so the row goes here rather than when the button was clicked.
+            //
+            // Note the asymmetry with "done": GET /queue omits both, but a
+            // done row is deliberately kept in local state as completion
+            // feedback and only disappears at the next resync or reload,
+            // whereas a cancelled row goes immediately because the user just
+            // asked for it to be gone. Phase 3 replaces this hand-rolled state
+            // with a query-cache-backed in-flight view, which supersedes the
+            // divergence.
+            if (job.status === "cancelled") {
+              knownIdsRef.current.delete(job.id);
+              return prev.filter((j) => j.id !== event.job_id);
+            }
             break;
 
           case "error":
@@ -154,6 +182,67 @@ export function useSSE() {
       );
     }
   }, []);
+
+  /** Surface a failed row action as the job's own error text. */
+  const showActionError = useCallback(
+    (jobId: string, err: unknown, fallback: string) => {
+      setJobs((prev) =>
+        prev.map((j) =>
+          j.id === jobId
+            ? { ...j, error: err instanceof Error ? err.message : fallback }
+            : j,
+        ),
+      );
+    },
+    [],
+  );
+
+  /** Cancel a queued or running job. */
+  const handleCancel = useCallback(
+    async (jobId: string) => {
+      setCancelling((prev) => {
+        const next = new Set(prev);
+        next.add(jobId);
+        return next;
+      });
+      try {
+        const updatedJob = await cancelJob(jobId);
+        // A queued job comes back already cancelled and can go now. A running
+        // one is only signalled, so its row stays until the SSE status_change
+        // says the thread has stopped — and the response is deliberately not
+        // written into state: it is a snapshot from before the request, so it
+        // would revert whatever the stream has delivered since (a job that has
+        // reached "converting" would show "downloading" until it finished).
+        if (updatedJob.status === "cancelled") {
+          knownIdsRef.current.delete(jobId);
+          setJobs((prev) => prev.filter((j) => j.id !== jobId));
+        }
+      } catch (err) {
+        showActionError(jobId, err, "Cancel failed");
+      } finally {
+        setCancelling((prev) => {
+          const next = new Set(prev);
+          next.delete(jobId);
+          return next;
+        });
+      }
+    },
+    [showActionError],
+  );
+
+  /** Dismiss an errored job — removed locally only once the backend agreed. */
+  const handleDismiss = useCallback(
+    async (jobId: string) => {
+      try {
+        await dismissJob(jobId);
+        knownIdsRef.current.delete(jobId);
+        setJobs((prev) => prev.filter((j) => j.id !== jobId));
+      } catch (err) {
+        showActionError(jobId, err, "Dismiss failed");
+      }
+    },
+    [showActionError],
+  );
 
   useEffect(() => {
     cancelledRef.current = false;
@@ -207,5 +296,14 @@ export function useSSE() {
     };
   }, [handleEvent, replaceJobs, resync]);
 
-  return { jobs, connected, error, addJob, retryJob: handleRetry };
+  return {
+    jobs,
+    connected,
+    error,
+    cancelling,
+    addJob,
+    retryJob: handleRetry,
+    cancelJob: handleCancel,
+    dismissJob: handleDismiss,
+  };
 }

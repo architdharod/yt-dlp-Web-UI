@@ -7,6 +7,7 @@ QueueManager relies on at boot (``load_active``), the retention sweep
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -105,6 +106,7 @@ class TestSchema:
             "error",
             "attempts",
             "restart_attempts",
+            "cancel_requested",
             "created_at",
             "updated_at",
             "finished_at",
@@ -153,6 +155,29 @@ class TestSchema:
         with pytest.raises(JobStoreError, match="newer than this build"):
             JobStore(path)
 
+    def test_a_refused_database_does_not_leak_its_connection(self, tmp_path):
+        """The refusal is a JobStoreError, which no sqlite3 handler catches."""
+        path = tmp_path / "queue.db"
+        conn = sqlite3.connect(path)
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+        conn.close()
+
+        opened: list[sqlite3.Connection] = []
+        real_connect = sqlite3.connect
+
+        def spy(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            opened.append(connection)
+            return connection
+
+        with patch("app.job_store.sqlite3.connect", side_effect=spy):
+            with pytest.raises(JobStoreError, match="newer than this build"):
+                JobStore(path)
+
+        assert len(opened) == 1
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
+
     def test_unknown_kind_is_rejected_by_the_check_constraint(self, store):
         with pytest.raises(sqlite3.IntegrityError):
             store._conn.execute(
@@ -182,6 +207,7 @@ class TestRoundTrip:
             result_path="Bonobo/Black Sands/Kiara.flac",
             error="something",
             attempts=2,
+            cancel_requested=True,
             created_at=created,
             updated_at=created,
             finished_at=created,
@@ -206,6 +232,7 @@ class TestRoundTrip:
             "error",
             "attempts",
             "restart_attempts",
+            "cancel_requested",
             "created_at",
             "updated_at",
             "finished_at",
@@ -286,6 +313,15 @@ class TestWritesAfterClose:
         store.close()
 
         assert store.delete("j") is False
+
+    def test_the_schema_version_after_close_is_the_one_this_build_writes(
+        self, tmp_path
+    ):
+        """A diagnostic must not be the thing that brings a shutdown down."""
+        store = JobStore(tmp_path / "queue.db")
+        store.close()
+
+        assert store.schema_version == SCHEMA_VERSION
 
     def test_reads_after_close_return_empty_rather_than_raising(self, tmp_path):
         store = JobStore(tmp_path / "queue.db")

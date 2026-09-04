@@ -5,7 +5,9 @@ Defines all API routes:
   - POST /download       -- submit a URL for download
   - GET  /queue          -- list in-flight and errored jobs
   - GET  /queue/stream   -- SSE stream of job events
-  - POST /queue/{id}/retry -- retry a failed job
+  - POST /queue/{id}/retry   -- retry a failed job
+  - POST /queue/{id}/cancel  -- stop a queued or running job
+  - POST /queue/{id}/dismiss -- forget an errored job
 """
 
 import asyncio
@@ -28,6 +30,7 @@ from app.queue_manager import (
     DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
     DEFAULT_MAX_CONCURRENT_DOWNLOADS,
     RETENTION_DAYS,
+    JobNotFound,
     QueueError,
     QueueManager,
 )
@@ -360,9 +363,53 @@ async def queue_stream():
 
 @app.post("/queue/{job_id}/retry", response_model=Job)
 async def retry_job(job_id: str) -> Job:
-    """Retry a failed job — resets it to 'queued' and re-enters the queue."""
+    """Retry a failed job — resets it to 'queued' and re-enters the queue.
+
+    Only errored jobs can be retried; a cancelled job is resubmitted as a new
+    download rather than revived, so that its duplicate check runs again.
+    """
     try:
         job = queue_manager.retry_job(job_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except QueueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return job
+
+
+@app.post("/queue/{job_id}/cancel", response_model=Job)
+async def cancel_job(job_id: str) -> Job:
+    """Stop a queued or running job.
+
+    Returns the job immediately.  A queued job comes back already
+    ``cancelled``; a running one comes back in the state it is still in and
+    reaches ``cancelled`` over the SSE stream a moment later, once its thread
+    has stopped ffmpeg and removed its temp files.
+
+    A job that has already finished, failed or been cancelled is a **400**: the
+    client is acting on a view that is out of date, and pretending the call
+    worked would tell the user a finished track was not filed.
+    """
+    try:
+        job = queue_manager.cancel_job(job_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except QueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return job
+
+
+@app.post("/queue/{job_id}/dismiss", status_code=204)
+async def dismiss_job(job_id: str) -> None:
+    """Forget an errored job: its row and its queue entry are deleted.
+
+    Errored jobs are the only ones the retention sweep never drops, so this is
+    how they leave.  404 for an unknown job, 400 for one that is not in
+    ``error``.
+    """
+    try:
+        queue_manager.dismiss_job(job_id)
+    except JobNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except QueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

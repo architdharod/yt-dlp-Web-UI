@@ -50,11 +50,12 @@ class JobStatus(str, Enum):
     a tagging job runs ``queued -> tagging -> done``.  ``error`` and
     ``cancelled`` are terminal and reachable from every non-terminal state.
 
-    ``TAGGING`` and ``CANCELLED`` exist from the first schema version even
-    though the tagging worker (phase 8) and cancel (phase 2) are not wired up
-    yet: the persisted ``status`` column has to accept them from day one so a
-    database written by a later build is still readable, and so restore logic
-    does not have to grow a special case later.
+    ``CANCELLED`` is live: ``POST /queue/{id}/cancel`` (phase 2) ends a queued
+    or running job there.  ``TAGGING`` is still only vocabulary -- the tagging
+    worker arrives in phase 8 -- but it has been a legal value of the persisted
+    ``status`` column since the first schema version, so a database written by
+    a later build is readable by this one and the restore logic does not have
+    to grow a special case then.
     """
 
     QUEUED = "queued"
@@ -127,6 +128,14 @@ class Job(BaseModel):
         default=0,
         ge=0,
         description="How often a restart interrupted this job; reset by a manual retry",
+    )
+    cancel_requested: bool = Field(
+        default=False,
+        description=(
+            "Whether the user asked for this job to stop.  Persisted so a "
+            "restart during a cancel finishes the job as cancelled instead of "
+            "re-queuing it; never part of an SSE payload."
+        ),
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Job creation timestamp")
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Timestamp of the last state change")
