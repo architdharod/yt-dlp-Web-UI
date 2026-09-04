@@ -131,7 +131,17 @@ export function connectQueueStream(
 ): () => void {
   const eventSource = new EventSource(`${API_BASE_URL}/queue/stream`);
 
-  const eventTypes = ["status_change", "progress", "error", "metadata"];
+  // Every event type the backend emits. EventSource only delivers a named
+  // event to a listener registered for that name, so anything missing here is
+  // silently dropped. "metadata" carries the title/duration/thumbnail the
+  // downloader backfilled and is merged like any other job snapshot.
+  const eventTypes = [
+    "status_change",
+    "progress",
+    "error",
+    "metadata",
+    "library_changed",
+  ];
   for (const eventType of eventTypes) {
     eventSource.addEventListener(eventType, (e: MessageEvent) => {
       try {

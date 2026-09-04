@@ -145,13 +145,24 @@ class Job(BaseModel):
 class SSEEvent(BaseModel):
     """Payload for a Server-Sent Event pushed to clients.
 
-    ``data`` always carries a snapshot of the job's user-visible fields
-    (status, progress, title, thumbnail_url, duration, error) so a client
-    can apply any event without knowing the job beforehand.
+    For a job event, ``data`` always carries a snapshot of the job's
+    user-visible fields (status, progress, title, thumbnail_url, duration,
+    error) so a client can apply any event without knowing the job beforehand.
+
+    ``library_changed`` announces that files under ``DOWNLOAD_PATH`` changed and
+    carries ``data["paths"]``, the POSIX paths of what changed relative to that
+    root.  It has no ``job_id`` when nothing queued caused the change -- a move,
+    a delete, or a manual tag write -- which is why the field is optional.
     """
 
-    event: str = Field(..., description="Event type: status_change, progress, error")
-    job_id: str = Field(..., description="ID of the job this event relates to")
+    event: str = Field(
+        ...,
+        description="Event type: status_change, progress, error, library_changed",
+    )
+    job_id: str | None = Field(
+        None,
+        description="ID of the job this event relates to, or null when no job caused it",
+    )
     data: dict[str, Any] = Field(default_factory=dict, description="Event-specific payload data")
 
 

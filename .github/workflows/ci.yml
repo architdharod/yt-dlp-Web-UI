@@ -47,7 +47,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -60,6 +60,11 @@ jobs:
         env:
           VITE_API_BASE_URL: /api
         run: npm run build
+
+      # `npm test` is vitest in watch mode; --run is the single-pass form CI needs.
+      - name: Test
+        working-directory: frontend
+        run: npm test -- --run
 
   publish:
     needs: [backend-tests, frontend-build]

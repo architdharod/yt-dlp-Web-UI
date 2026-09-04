@@ -1,0 +1,408 @@
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { getQueue } from "@/lib/api";
+import { queueQueryOptions } from "@/hooks/useQueueQuery";
+import {
+  addJobToCache,
+  applyQueueEvent,
+  removeJobFromCache,
+  resyncAfterReconnect,
+} from "@/lib/queueCache";
+import { queryKeys } from "@/lib/queryKeys";
+import type { Job, JobStatus, SSEEvent } from "@/lib/types";
+
+// The reconciliation tests drive the real queue query, so the only thing that
+// needs faking is the request itself.
+vi.mock("@/lib/api", () => ({ getQueue: vi.fn() }));
+
+function job(id: string, status: JobStatus = "downloading"): Job {
+  return {
+    id,
+    url: `https://example.com/${id}`,
+    status,
+    title: id,
+    thumbnail_url: null,
+    duration: null,
+    progress: 0,
+    error: null,
+    artist: null,
+    album: null,
+    created_at: "2026-09-04T00:00:00Z",
+  };
+}
+
+function event(
+  name: string,
+  jobId: string | null,
+  data: Record<string, unknown> = {},
+): SSEEvent {
+  return { event: name, job_id: jobId, data };
+}
+
+let queryClient: QueryClient;
+let invalidated: unknown[];
+
+beforeEach(() => {
+  queryClient = new QueryClient();
+  invalidated = [];
+  vi.spyOn(queryClient, "invalidateQueries").mockImplementation(
+    (filters?: unknown) => {
+      invalidated.push((filters as { queryKey?: unknown })?.queryKey);
+      return Promise.resolve();
+    },
+  );
+});
+
+/** The jobs currently in the ["queue"] cache. */
+function queue(): Job[] | undefined {
+  return queryClient.getQueryData<Job[]>(queryKeys.queue);
+}
+
+describe("applyQueueEvent", () => {
+  it("merges a status_change snapshot into the matching job", () => {
+    const untouched = job("b");
+    queryClient.setQueryData(queryKeys.queue, [job("a", "queued"), untouched]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", {
+        status: "downloading",
+        progress: 12.5,
+        title: "Kerala",
+        artist: "Bonobo",
+      }),
+    );
+
+    const [a, b] = queue()!;
+    expect(a).toMatchObject({
+      id: "a",
+      status: "downloading",
+      progress: 12.5,
+      title: "Kerala",
+      artist: "Bonobo",
+    });
+    // Untouched jobs keep their identity, so React sees no change.
+    expect(b).toBe(untouched);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("keeps progress events off the invalidation path", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a")]);
+
+    applyQueueEvent(queryClient, event("progress", "a", { progress: 40 }));
+
+    expect(queue()![0].progress).toBe(40);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("clears a stale error when the job leaves the error state", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "error"), error: "boom" },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", { status: "queued" }),
+    );
+
+    expect(queue()![0]).toMatchObject({ status: "queued", error: null });
+  });
+
+  it("marks a job errored on an error event", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a")]);
+
+    applyQueueEvent(
+      queryClient,
+      event("error", "a", { error: "ffmpeg exploded" }),
+    );
+
+    expect(queue()![0]).toMatchObject({
+      status: "error",
+      error: "ffmpeg exploded",
+    });
+  });
+
+  it("removes a job that reaches done, because GET /queue omits it", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a"), job("b")]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", { status: "done" }),
+    );
+
+    expect(queue()!.map((j) => j.id)).toEqual(["b"]);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("removes a job that reaches cancelled", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a"), job("b")]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "b", { status: "cancelled" }),
+    );
+
+    expect(queue()!.map((j) => j.id)).toEqual(["a"]);
+  });
+
+  it("invalidates the queue for a job it has never seen", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a")]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "unknown", { status: "downloading" }),
+    );
+
+    expect(invalidated).toEqual([queryKeys.queue]);
+    // No job is invented from the snapshot: it has no url or created_at.
+    expect(queue()!.map((j) => j.id)).toEqual(["a"]);
+  });
+
+  it("invalidates the queue when nothing has been fetched yet", () => {
+    applyQueueEvent(queryClient, event("progress", "a", { progress: 3 }));
+
+    expect(invalidated).toEqual([queryKeys.queue]);
+    expect(queue()).toBeUndefined();
+  });
+
+  it("invalidates the library on library_changed and touches nothing else", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a")]);
+
+    applyQueueEvent(
+      queryClient,
+      event("library_changed", "a", { paths: ["Bonobo/Migration/Kerala.flac"] }),
+    );
+
+    expect(invalidated).toEqual([queryKeys.library]);
+    expect(queue()!.map((j) => j.id)).toEqual(["a"]);
+  });
+
+  it("handles a library_changed with no job behind it", () => {
+    applyQueueEvent(queryClient, event("library_changed", null, { paths: [] }));
+
+    expect(invalidated).toEqual([queryKeys.library]);
+  });
+});
+
+describe("resyncAfterReconnect", () => {
+  it("invalidates both queries, since events were lost while it was down", () => {
+    resyncAfterReconnect(queryClient);
+
+    expect(invalidated).toEqual([queryKeys.queue, queryKeys.library]);
+  });
+});
+
+describe("addJobToCache", () => {
+  it("appends to a cache that has been fetched", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a")]);
+
+    addJobToCache(queryClient, job("b"));
+
+    expect(queue()!.map((j) => j.id)).toEqual(["a", "b"]);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("leaves a job that is already there alone", () => {
+    const existing = job("a");
+    queryClient.setQueryData(queryKeys.queue, [existing]);
+
+    addJobToCache(queryClient, { ...job("a"), title: "stale" });
+
+    expect(queue()![0]).toBe(existing);
+  });
+
+  it("seeds an unfetched cache, so a submit after a failed GET /queue shows", () => {
+    // Without the seed the job vanishes: writeQueue no-ops on undefined and no
+    // SSE event carries enough to rebuild the row.
+    addJobToCache(queryClient, job("a"));
+
+    expect(queue()!.map((j) => j.id)).toEqual(["a"]);
+    // The invalidation fills in whatever else the queue holds.
+    expect(invalidated).toEqual([queryKeys.queue]);
+  });
+});
+
+/**
+ * A `GET /queue` in flight while the cache is patched.
+ *
+ * These use a real `QueryClient` (no mocked `invalidateQueries`) and the real
+ * `queueQueryOptions`, with the response held open on a promise so the SSE
+ * patch lands strictly between the request and its answer.
+ */
+describe("reconciling a fetch that overlapped a drop", () => {
+  /** A client whose queue query answers with whatever `release` is called with. */
+  function gatedClient() {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    let release!: (jobs: Job[]) => void;
+    vi.mocked(getQueue).mockReturnValue(
+      new Promise<Job[]>((resolve) => {
+        release = resolve;
+      }),
+    );
+    return { client, release: (jobs: Job[]) => release(jobs) };
+  }
+
+  /**
+   * Start the fetch and wait until the request has actually gone out. The
+   * pending fetch is handed back wrapped, because awaiting a returned promise
+   * would await the fetch itself and the gate is still shut.
+   */
+  async function startFetch(client: QueryClient): Promise<{ done: Promise<Job[]> }> {
+    const done = client.fetchQuery(queueQueryOptions(client));
+    await vi.waitFor(() => expect(getQueue).toHaveBeenCalled());
+    return { done };
+  }
+
+  beforeEach(() => {
+    vi.mocked(getQueue).mockReset();
+  });
+
+  it("keeps a job the stream finished while the response was on the wire out", async () => {
+    const { client, release } = gatedClient();
+    client.setQueryData(queryKeys.queue, [job("a"), job("b")]);
+
+    const { done: fetching } = await startFetch(client);
+    applyQueueEvent(client, event("status_change", "b", { status: "done" }));
+    expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
+      ["a"],
+    );
+
+    // The server answered from before b finished, and also knows about z.
+    release([job("a"), job("b"), job("z")]);
+    await fetching;
+
+    expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
+      ["a", "z"],
+    );
+  });
+
+  it("does the same for a row removed by cancel or dismiss", async () => {
+    const { client, release } = gatedClient();
+    client.setQueryData(queryKeys.queue, [job("a"), job("b")]);
+
+    const { done: fetching } = await startFetch(client);
+    removeJobFromCache(client, "b");
+
+    release([job("a"), job("b")]);
+    await fetching;
+
+    expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
+      ["a"],
+    );
+  });
+
+  it("forgets drops from before the request, so a retried job can come back", async () => {
+    const { client, release } = gatedClient();
+    client.setQueryData(queryKeys.queue, [job("a"), job("b")]);
+
+    // b finishes first; only afterwards does a fetch go out — by which time a
+    // retry has re-queued b, and the server rightly lists it again.
+    applyQueueEvent(client, event("status_change", "b", { status: "done" }));
+    const { done: fetching } = await startFetch(client);
+
+    release([job("a"), job("b", "queued")]);
+    await fetching;
+
+    expect(client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id)).toEqual(
+      ["a", "b"],
+    );
+  });
+});
+
+/**
+ * Invalidations that overlap an in-flight `GET /queue`.
+ *
+ * `invalidateQueries` cancels and restarts a fetch that is already out unless
+ * told otherwise, so these drive a real, subscribed query (an observer, since
+ * only active queries refetch) with the response held on a gate, and count the
+ * requests that actually leave.
+ */
+describe("invalidating while a fetch is in flight", () => {
+  /**
+   * A client with `[job("a")]` already cached and one refetch on the wire.
+   * Every request resolves only when `releaseAll` is called.
+   */
+  async function gatedActiveClient() {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const releases: ((jobs: Job[]) => void)[] = [];
+    vi.mocked(getQueue).mockImplementation(
+      () =>
+        new Promise<Job[]>((resolve) => {
+          releases.push(resolve);
+        }),
+    );
+
+    client.setQueryData(queryKeys.queue, [job("a")]);
+    const observer = new QueryObserver(client, queueQueryOptions(client));
+    const unsubscribe = observer.subscribe(() => {});
+    await vi.waitFor(() => expect(getQueue).toHaveBeenCalledTimes(1));
+
+    return {
+      client,
+      unsubscribe,
+      releaseAll: (jobs: Job[]) => releases.forEach((r) => r(jobs)),
+    };
+  }
+
+  beforeEach(() => {
+    vi.mocked(getQueue).mockReset();
+  });
+
+  it("lets unknown-job progress events join the fetch instead of restarting it", async () => {
+    const { client, unsubscribe, releaseAll } = await gatedActiveClient();
+
+    // One progress event per whole percent, none of which may cancel the
+    // request that is about to tell us what job z is.
+    for (let i = 1; i <= 20; i += 1) {
+      applyQueueEvent(client, event("progress", "z", { progress: i }));
+    }
+    expect(getQueue).toHaveBeenCalledTimes(1);
+
+    releaseAll([job("a"), job("z")]);
+    await vi.waitFor(() =>
+      expect(
+        client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id),
+      ).toEqual(["a", "z"]),
+    );
+    unsubscribe();
+  });
+
+  it("still restarts the fetch for an unknown job's status_change", async () => {
+    const { client, unsubscribe, releaseAll } = await gatedActiveClient();
+
+    applyQueueEvent(client, event("status_change", "z", { status: "queued" }));
+    await vi.waitFor(() => expect(getQueue).toHaveBeenCalledTimes(2));
+
+    releaseAll([job("a"), job("z")]);
+    await vi.waitFor(() =>
+      expect(
+        client.getQueryData<Job[]>(queryKeys.queue)!.map((j) => j.id),
+      ).toEqual(["a", "z"]),
+    );
+    unsubscribe();
+  });
+
+  it("still restarts the fetch for an unknown job's error", async () => {
+    const { client, unsubscribe, releaseAll } = await gatedActiveClient();
+
+    applyQueueEvent(client, event("error", "z", { error: "boom" }));
+    await vi.waitFor(() => expect(getQueue).toHaveBeenCalledTimes(2));
+
+    releaseAll([job("a")]);
+    unsubscribe();
+  });
+
+  it("does not restart the fetch when the stream reconnects", async () => {
+    const { client, unsubscribe, releaseAll } = await gatedActiveClient();
+
+    resyncAfterReconnect(client);
+    expect(getQueue).toHaveBeenCalledTimes(1);
+
+    releaseAll([job("a")]);
+    unsubscribe();
+  });
+});

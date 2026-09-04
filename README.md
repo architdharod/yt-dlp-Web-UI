@@ -14,7 +14,9 @@ This is a project for educational purpose, to learn the usage of the library yt-
    thumbnail (no postprocessing), an ffmpeg subprocess of ours converts that stream to FLAC, and Mutagen writes the
    tags, the cover art, and the `SOURCEID`/`SOURCEURL` fields that record where the track came from.
 4. Files are saved to `DOWNLOAD_PATH/Artist/Album/track.flac`, falling back to "Unknown Artist"/"Unknown Album" when metadata isn't available.
-Real-time progress is streamed to the browser via Server-Sent Events — no polling.
+Real-time progress is streamed to the browser via Server-Sent Events — no polling. The UI is split into tabs:
+**Download** (the form and the in-flight queue, with a badge counting the jobs still working) and **Library**, with a
+**Trash** tab that appears once something is in it.
 
 Queue rows carry two actions. **Cancel** stops a job that is queued, downloading or converting: running ffmpeg is our
 own process, so it is killed rather than waited out, and every partial and temporary file is removed. Cancelled jobs
@@ -35,7 +37,7 @@ The frontend's nginx container proxies all `/api/` requests to the backend conta
 
 | Layer    | Technology                                       |
 | -------- | ------------------------------------------------ |
-| Frontend | React 18, TypeScript, Vite, Tailwind, shadcn/ui  |
+| Frontend | React 19, TypeScript, Vite, TanStack Query, Tailwind, shadcn/ui |
 | Backend  | Python 3.12, FastAPI, yt-dlp, ffmpeg, Mutagen    |
 | Infra    | Docker Compose, nginx                            |
 

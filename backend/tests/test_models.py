@@ -291,8 +291,18 @@ class TestSSEEvent:
     def test_missing_required_fields_raises_validation_error(self):
         with pytest.raises(ValidationError):
             SSEEvent()  # type: ignore[call-arg]
-        with pytest.raises(ValidationError):
-            SSEEvent(event="test")  # type: ignore[call-arg]
+
+    def test_job_id_is_optional_for_events_no_job_caused(self):
+        """``library_changed`` is emitted for moves and deletes too, which have
+        no job behind them."""
+        event = SSEEvent(event="library_changed", data={"paths": []})
+        assert event.job_id is None
+        assert event.model_dump() == {
+            "event": "library_changed",
+            "job_id": None,
+            "data": {"paths": []},
+        }
+        assert '"job_id":null' in event.model_dump_json().replace(" ", "")
 
     def test_serialization(self):
         event = SSEEvent(event="progress", job_id="j1", data={"progress": 50.0})

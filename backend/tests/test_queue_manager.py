@@ -1063,6 +1063,8 @@ class TestEventSnapshot:
 
         assert events
         for event in events:
+            if event.event == "library_changed":
+                continue  # not a job snapshot; it carries the changed paths
             assert event.data["title"] == "Test Track"
             assert event.data["thumbnail_url"] == "https://img.youtube.com/thumb.jpg"
             assert event.data["duration"] == 210.0
@@ -1132,6 +1134,8 @@ class TestWriteThrough:
         def check(event: SSEEvent) -> None:
             if event.event == "progress":
                 return  # progress is deliberately not persisted
+            if event.event == "library_changed":
+                return  # carries no status, and follows the status_change
             row = store.get(event.job_id)
             if row is None or row.status.value != event.data["status"]:
                 mismatches.append(
@@ -2727,3 +2731,143 @@ class TestDispatch:
 
         assert "job-1" in caplog.text
         assert "boom" in caplog.text
+
+
+# ===========================================================================
+# library_changed
+# ===========================================================================
+
+
+class TestLibraryChanged:
+    """A job that wrote a file tells every client the library moved on."""
+
+    JOB_ID = str(uuid.uuid4())
+
+    @staticmethod
+    def _files(download_dir: Path, relative: str):
+        """A fake download that files *relative* under the library root."""
+        result = download_dir / relative
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text("flac")
+            on_filed(
+                FiledTrack(result, frozenset({result.parent, result.parent.parent}))
+            )
+            return result
+
+        return fake
+
+    @patch("app.queue_manager.download_audio")
+    async def test_it_follows_done_and_carries_the_relative_path(
+        self, mock_download, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        mock_download.side_effect = self._files(
+            download_dir, "Bonobo/Migration/Kerala.flac"
+        )
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        qm.add_job(_make_job(id=self.JOB_ID))
+
+        await _wait_for_job_status(qm, self.JOB_ID, JobStatus.DONE)
+
+        names = [e.event for e in events]
+        assert names[-2:] == ["status_change", "library_changed"], names
+        assert events[-2].data["status"] == JobStatus.DONE.value
+        # The row is written before the status_change that precedes this event,
+        # so a client refetching here never sees the job still in flight.
+        assert store.get(self.JOB_ID).status == JobStatus.DONE
+
+        changed = events[-1]
+        assert changed.job_id == self.JOB_ID
+        assert changed.data["paths"] == ["Bonobo/Migration/Kerala.flac"]
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_failed_job_changes_nothing(self, mock_download, store):
+        mock_download.side_effect = DownloadError("boom")
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        job = _make_job(id=str(uuid.uuid4()))
+        qm.add_job(job)
+
+        await _wait_for_job_status(qm, job.id, JobStatus.ERROR)
+
+        assert [e for e in events if e.event == "library_changed"] == []
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_cancelled_job_changes_nothing(self, mock_download, store):
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            for _ in range(500):
+                if cancel.is_set():
+                    raise DownloadError("Download cancelled")
+                time.sleep(0.01)
+            raise AssertionError("the cancel never reached the downloader")
+
+        mock_download.side_effect = fake
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=30, on_event=events.append, store=store
+        )
+        job = _make_job(id=str(uuid.uuid4()))
+        qm.add_job(job)
+        await _wait_for_job_status(qm, job.id, JobStatus.DOWNLOADING)
+
+        qm.cancel_job(job.id)
+        await _wait_for_job_status(qm, job.id, JobStatus.CANCELLED)
+
+        assert [e for e in events if e.event == "library_changed"] == []
+
+    @patch("app.queue_manager.download_audio")
+    async def test_a_path_outside_the_library_root_sends_an_empty_list(
+        self, mock_download, store, isolated_paths, tmp_path
+    ):
+        """result_path stays unset, but the library still changed as far as we
+        know, so the event goes out saying only that."""
+        stray = tmp_path / "elsewhere" / "Title.flac"
+
+        def fake(job, on_progress, cancel=None, on_phase=None, on_filed=None):
+            stray.parent.mkdir(parents=True, exist_ok=True)
+            stray.write_text("flac")
+            on_filed(FiledTrack(stray, frozenset({stray.parent})))
+            return stray
+
+        mock_download.side_effect = fake
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        job = _make_job(id=str(uuid.uuid4()))
+        qm.add_job(job)
+
+        await _wait_for_job_status(qm, job.id, JobStatus.DONE)
+
+        changed = [e for e in events if e.event == "library_changed"]
+        assert len(changed) == 1
+        assert changed[0].data["paths"] == []
+
+    async def test_the_emitter_takes_changes_no_job_caused(self):
+        """Later phases call it for moves, trash, restore, and tag writes."""
+        events: list[SSEEvent] = []
+        qm = QueueManager(max_concurrent=1, timeout=10, on_event=events.append)
+
+        qm.emit_library_changed(["Bonobo/Migration", "Bonobo/Black Sands"])
+
+        assert len(events) == 1
+        assert events[0].event == "library_changed"
+        assert events[0].job_id is None
+        assert events[0].data["paths"] == [
+            "Bonobo/Migration",
+            "Bonobo/Black Sands",
+        ]
+
+    async def test_the_emitter_is_silent_without_a_callback(self):
+        QueueManager(max_concurrent=1, timeout=10).emit_library_changed([])

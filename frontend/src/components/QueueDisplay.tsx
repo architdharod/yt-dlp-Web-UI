@@ -14,50 +14,14 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useQueueQuery } from "@/hooks/useQueueQuery";
+import { useQueueActions } from "@/hooks/useQueueActions";
+import { CANCELLABLE_STATUSES, sortJobs } from "@/lib/queue";
 import {
   ALREADY_IN_LIBRARY_PREFIX,
   type Job,
   type JobStatus,
 } from "@/lib/types";
-
-/** Statuses that keep a job at the top of the queue. */
-const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
-  "queued",
-  "downloading",
-  "converting",
-  "tagging",
-]);
-
-/**
- * Statuses the backend accepts a cancel on. Anything else is terminal and the
- * endpoint answers 400, so offering the button there would only ever produce
- * an error the user cannot act on.
- */
-const CANCELLABLE_STATUSES: ReadonlySet<JobStatus> = ACTIVE_STATUSES;
-
-/** Sort jobs: active (queued/downloading/converting) first, then newest-to-oldest by created_at. */
-function sortJobs(jobs: Job[]): Job[] {
-  return [...jobs].sort((a, b) => {
-    const aActive = ACTIVE_STATUSES.has(a.status);
-    const bActive = ACTIVE_STATUSES.has(b.status);
-
-    // Active jobs always come first
-    if (aActive && !bActive) return -1;
-    if (!aActive && bActive) return 1;
-
-    // Within the same group, sort newest first (descending by created_at)
-    return b.created_at.localeCompare(a.created_at);
-  });
-}
-
-interface QueueDisplayProps {
-  jobs: Job[];
-  /** Ids whose cancel request is still in flight — their button is disabled. */
-  cancelling: ReadonlySet<string>;
-  onRetry: (jobId: string) => void;
-  onCancel: (jobId: string) => void;
-  onDismiss: (jobId: string) => void;
-}
 
 /** Format seconds into MM:SS or HH:MM:SS. */
 function formatDuration(seconds: number | null): string {
@@ -267,21 +231,47 @@ function JobItem({
   );
 }
 
-export function QueueDisplay({
-  jobs,
-  cancelling,
-  onRetry,
-  onCancel,
-  onDismiss,
-}: QueueDisplayProps) {
-  const sorted = useMemo(() => sortJobs(jobs), [jobs]);
+/**
+ * The in-flight queue, read straight from the `["queue"]` query cache that the
+ * SSE stream patches. Nothing is passed in: the rows and their actions are the
+ * same data wherever the component is mounted.
+ */
+export function QueueDisplay() {
+  const { data: jobs, error } = useQueueQuery();
+  const { cancelling, retryJob, cancelJob, dismissJob } = useQueueActions();
 
-  if (sorted.length === 0) return null;
+  const sorted = useMemo(() => sortJobs(jobs ?? []), [jobs]);
+  const errorMessage =
+    error === null
+      ? null
+      : error instanceof Error
+        ? error.message
+        : "Failed to load the queue";
+
+  // The error only replaces the list when there is no list to show. useQuery
+  // keeps the last data through a failed background refetch, so one 502 during
+  // a backend restart must not blank out every in-flight row — the message goes
+  // in the header instead and the rows stay put. With nothing to show, an
+  // empty queue renders nothing at all and a failure renders the message,
+  // whether the cache is unfetched or fetched-and-empty.
+  if (sorted.length === 0) {
+    if (errorMessage === null) return null;
+    return (
+      <Card className="shrink-0">
+        <CardContent>
+          <p className="text-sm text-destructive">{errorMessage}</p>
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
     <Card className="flex min-h-0 flex-1 flex-col">
       <CardHeader className="shrink-0">
-        <CardTitle>Queue</CardTitle>
+        <CardTitle>In flight</CardTitle>
+        {errorMessage !== null && (
+          <p className="text-xs text-destructive">{errorMessage}</p>
+        )}
       </CardHeader>
       <CardContent className="min-h-0 flex-1 overflow-y-auto queue-scroll">
         <div className="flex flex-col gap-3">
@@ -290,9 +280,9 @@ export function QueueDisplay({
               key={job.id}
               job={job}
               cancelPending={cancelling.has(job.id)}
-              onRetry={onRetry}
-              onCancel={onCancel}
-              onDismiss={onDismiss}
+              onRetry={retryJob}
+              onCancel={cancelJob}
+              onDismiss={dismissJob}
             />
           ))}
         </div>

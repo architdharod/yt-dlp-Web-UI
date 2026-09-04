@@ -44,9 +44,14 @@ export interface DownloadRequest {
   album?: string | null;
 }
 
-/** Payload for Server-Sent Events from GET /queue/stream. */
+/**
+ * Payload for Server-Sent Events from GET /queue/stream.
+ *
+ * `job_id` is null for events that are not about one job — `library_changed`
+ * is emitted for moves, deletes, and tag writes that no job produced.
+ */
 export interface SSEEvent {
   event: string;
-  job_id: string;
+  job_id: string | null;
   data: Record<string, unknown>;
 }

@@ -622,6 +622,17 @@ class QueueManager:
                 # ---- done ---- (converting is reported by the downloader)
                 self._update_status(job_id, JobStatus.DONE)
 
+                # The library gained a file.  Emitted after the DONE
+                # transition, whose _persist wrote the row first, so a client
+                # that refetches on this event never reads a queue that still
+                # calls the job in-flight.  A job that lost the race to a
+                # cancel or a timeout never reached DONE and changed nothing.
+                if job.status is JobStatus.DONE:
+                    self.emit_library_changed(
+                        [job.result_path] if job.result_path else [],
+                        job_id=job_id,
+                    )
+
             except asyncio.TimeoutError:
                 logger.warning("Job %s timed out after %ss", job_id, self._timeout)
                 # Cancelling the token aborts yt-dlp at its next progress
@@ -950,6 +961,29 @@ class QueueManager:
         self._persist(job)
         logger.info("Job %s: %s -> %s", job_id, old_status, status.value)
         self._emit_event("status_change", job)
+
+    def emit_library_changed(self, paths: list[str], job_id: str | None = None) -> None:
+        """Tell every client that files under ``DOWNLOAD_PATH`` changed.
+
+        *paths* are POSIX paths relative to ``DOWNLOAD_PATH`` -- the identity a
+        library path travels as everywhere in this app.  An empty list still
+        says "something changed, re-read the library", which is the honest
+        answer when the file that was written could not be expressed relative
+        to the configured root.
+
+        *job_id* is the job responsible, when there is one.  Moves, deletes,
+        restores, and manual tag writes have no job behind them and leave it
+        None; the event is the same shape either way, which is why this is a
+        public method rather than something folded into the download path.
+        """
+        if self._on_event is None:
+            return
+        event = SSEEvent(
+            event="library_changed",
+            job_id=job_id,
+            data={"paths": list(paths)},
+        )
+        self._on_event(event)
 
     def _emit_event(self, event_type: str, job: Job) -> None:
         """Build an SSEEvent carrying a snapshot of the job and invoke the callback."""
