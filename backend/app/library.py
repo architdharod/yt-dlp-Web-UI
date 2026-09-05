@@ -341,6 +341,17 @@ def _read_track_info(path: Path) -> TrackInfo:
     )
 
 
+def read_track_title(path: Path) -> str:
+    """The ``TITLE`` tag of *path*, or its filename stem when it has none.
+
+    The same answer ``GET /library`` shows for that track, from the same
+    reader, so a tagging job's row in the queue is named what the library row
+    it came from is named.  A file mutagen cannot open is its stem, which is
+    what the browser shows for it too.
+    """
+    return _read_track_info(path).title
+
+
 def _short_reason(reason: str, path: Path) -> str:
     """Strip anything that could leak an absolute path out of a mutagen message."""
     cleaned = reason.replace(str(path), path.name).replace(str(path.parent), "")
@@ -804,7 +815,7 @@ def scan_library(root: Path | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _sniff_image_mime(data: bytes) -> str | None:
+def sniff_image_mime(data: bytes) -> str | None:
     """Return the image type *data* really is, or None if it is not an image.
 
     The only thing allowed to decide a cover's ``Content-Type``.  A tag's
@@ -812,6 +823,10 @@ def _sniff_image_mime(data: bytes) -> str | None:
     can arrive carrying a PICTURE block that claims ``text/html`` around a
     payload of script -- and echoing either would turn the cover endpoint into a
     way to serve arbitrary active content from the app's own origin.
+
+    Public because the album pass names a fetched cover file by what the bytes
+    turn out to be, and the same rule has to decide it: a name and a
+    ``Content-Type`` that disagreed would serve a PNG as ``cover.jpg``.
     """
     if data.startswith(_JPEG_MAGIC):
         return "image/jpeg"
@@ -828,7 +843,7 @@ def _sniffed(data: bytes | None) -> tuple[bytes, str] | None:
     """Return ``(data, content_type)`` when *data* is recognisably an image."""
     if not data:
         return None
-    mime = _sniff_image_mime(data)
+    mime = sniff_image_mime(data)
     return (data, mime) if mime is not None else None
 
 

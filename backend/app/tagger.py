@@ -201,6 +201,45 @@ def configure_musicbrainz() -> None:
 
 
 @dataclass(frozen=True)
+class ReleaseRef:
+    """One release a recording appears on, as the album pass needs it.
+
+    Only what picking a release takes: the id (to fetch the tracklist and the
+    cover art with), the release-group id (the cover fallback), and the number
+    of tracks the release has, which is what tells "the album in this folder"
+    from a hits compilation the same recording also sits on.
+
+    ``track_count`` is MusicBrainz's ``medium-track-count`` -- the total across
+    every medium of the release -- and is ``None`` when the search result did
+    not carry one.  Nothing here is ever written into a file: **no MusicBrainz
+    id is ever written** (metadata ticket), these ids live only for the length
+    of one pass.
+
+    The last three are what the album pass's release-first fallback filters on
+    before it spends a request fetching a tracklist, and they all come free in
+    the search result:
+
+    * ``artist_credit_phrase`` is the *release's* credit.  MusicBrainz omits it
+      when it is the same as the recording's, so an empty string means "same
+      artist", not "unknown" -- a tribute album or a various-artists release is
+      the case where it is present and different.
+    * ``status`` is ``"Official"`` for a real release and something else
+      ("Bootleg", "Pseudo-Release") for the editions a folder is not.
+    * ``secondary_types`` is the release group's secondary-type list, where
+      ``"Compilation"`` marks the hits collection that contains every track of
+      an album without being that album.
+    """
+
+    id: str
+    title: str = ""
+    release_group_id: str | None = None
+    track_count: int | None = None
+    artist_credit_phrase: str = ""
+    status: str = ""
+    secondary_types: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Candidate:
     """One recording MusicBrainz offered, reduced to what the bar looks at.
 
@@ -217,6 +256,10 @@ class Candidate:
     artist_credit: str
     artist_names: tuple[str, ...] = ()
     length_ms: int | None = None
+    # Both are for the album pass only, and both are absent from every
+    # comparison the match bar makes: a per-track fix never looks at a release.
+    recording_id: str | None = None
+    releases: tuple[ReleaseRef, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -548,22 +591,80 @@ def _credit_phrase(recording: dict, names: Sequence[str]) -> str:
     return ", ".join(names)
 
 
+def artist_credit(entity: dict) -> tuple[str, tuple[str, ...]]:
+    """The credit phrase and the individual credited names of *entity*.
+
+    One function because two shapes carry the same pair: a recording in a
+    search result, and a track (or its recording) on a release fetched with
+    ``artist-credits``.  The album pass compares a folder artist against both
+    halves, exactly as :func:`clearing_candidates` does.
+    """
+    names = _credit_names(entity)
+    return _credit_phrase(entity, names), names
+
+
+def _to_int(value: object) -> int | None:
+    """*value* as an int, or ``None`` when it is missing or not a number."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _release_refs(recording: dict) -> tuple[ReleaseRef, ...]:
+    """The releases a search result says its recording appears on.
+
+    MusicBrainz orders them by relevance, and that order is kept: it is the
+    only ranking a recording search gives us, and :func:`app.album_tagger.
+    choose_release` uses it as its tie-break.
+
+    ``medium-track-count`` is the total number of tracks across every medium of
+    the release -- exactly the number an album folder can be compared against.
+    Older or stubbed responses may not carry it, hence the ``None``.
+
+    ``artist-credit-phrase``, ``status`` and the release group's
+    ``secondary-type-list`` are kept for the same reason: they are already in
+    this response, and they are what lets the album pass throw a tribute
+    album, a bootleg or a hits compilation out before it spends a request on
+    its tracklist.
+    """
+    refs: list[ReleaseRef] = []
+    for release in recording.get("release-list") or []:
+        if not isinstance(release, dict):
+            continue
+        release_id = release.get("id")
+        if not release_id:
+            continue
+        group = release.get("release-group") or {}
+        secondary = group.get("secondary-type-list") or ()
+        refs.append(
+            ReleaseRef(
+                id=str(release_id),
+                title=str(release.get("title") or ""),
+                release_group_id=(str(group.get("id")) if group.get("id") else None),
+                track_count=_to_int(release.get("medium-track-count")),
+                artist_credit_phrase=str(release.get("artist-credit-phrase") or ""),
+                status=str(release.get("status") or ""),
+                secondary_types=tuple(str(one) for one in secondary if one),
+            )
+        )
+    return tuple(refs)
+
+
 def _to_candidate(recording: dict) -> Candidate | None:
     """Reduce one search result to a :class:`Candidate`, or drop it."""
     title = recording.get("title")
     if not title:
         return None
-    names = _credit_names(recording)
-    length = recording.get("length")
-    try:
-        length_ms = int(length) if length is not None else None
-    except (TypeError, ValueError):
-        length_ms = None
+    phrase, names = artist_credit(recording)
+    recording_id = recording.get("id")
     return Candidate(
         title=str(title),
-        artist_credit=_credit_phrase(recording, names),
+        artist_credit=phrase,
         artist_names=names,
-        length_ms=length_ms,
+        length_ms=_to_int(recording.get("length")),
+        recording_id=str(recording_id) if recording_id else None,
+        releases=_release_refs(recording),
     )
 
 
@@ -627,13 +728,65 @@ def pick_match(
     Candidates are checked in the order MusicBrainz scored them, so the first
     one that clears the bar is also the best-scoring one that does.
     """
-    if duration_seconds is None:
+    candidate = pick_candidate(
+        candidates, cleaned_title, folder_artist, duration_seconds
+    )
+    if candidate is None:
         return None
+    return Match(title=candidate.title, artist=candidate.artist_credit or "")
+
+
+def pick_candidate(
+    candidates: Iterable[Candidate],
+    cleaned_title: str,
+    folder_artist: str | None,
+    duration_seconds: float | None,
+) -> Candidate | None:
+    """The first candidate that clears the match bar, whole rather than reduced.
+
+    :func:`pick_match` is this, narrowed to the two tags a per-track fix
+    writes.  The album pass needs the candidate itself, because its recording
+    id and its release list are what a folder full of tracks is reconciled
+    into one release by.  One function decides the bar so the two callers can
+    never drift apart on what "matched" means.
+    """
+    return next(
+        iter(
+            clearing_candidates(
+                candidates, cleaned_title, folder_artist, duration_seconds
+            )
+        ),
+        None,
+    )
+
+
+def clearing_candidates(
+    candidates: Iterable[Candidate],
+    cleaned_title: str,
+    folder_artist: str | None,
+    duration_seconds: float | None,
+) -> list[Candidate]:
+    """Every candidate that clears the match bar, in MusicBrainz's own order.
+
+    :func:`pick_candidate` is the first of these.  The album pass needs all of
+    them, because MusicBrainz routinely lists the same recording several times
+    -- one entity per release that duplicated it -- and the best-scoring one
+    can easily be a duplicate that appears on a single obscure release.  When
+    a folder is reconciled into one release, the release the folder actually is
+    may hang off the *second* or *fourth* clearing candidate; taking only the
+    first would fail an album the data plainly supports.
+
+    Same bar as :func:`pick_candidate` because it is the same code: this
+    filters where that one takes the first, so the two can never disagree.
+    """
+    if duration_seconds is None:
+        return []
     wanted_title = normalise(cleaned_title)
     wanted_artist = normalise(folder_artist)
     if not wanted_title or not wanted_artist:
-        return None
+        return []
 
+    clearing: list[Candidate] = []
     for candidate in candidates:
         if candidate.length_ms is None:
             continue
@@ -644,8 +797,8 @@ def pick_match(
         credits = [candidate.artist_credit, *candidate.artist_names]
         if not any(normalise(name) == wanted_artist for name in credits):
             continue
-        return Match(title=candidate.title, artist=candidate.artist_credit or "")
-    return None
+        clearing.append(candidate)
+    return clearing
 
 
 # ---------------------------------------------------------------------------
@@ -704,6 +857,93 @@ def apply_fix(flac_path: Path, match: Match) -> bool:
 SearchCallable = Callable[[str, str | None, float | None], Sequence[Candidate]]
 
 
+@dataclass(frozen=True)
+class TrackProbe:
+    """What one file offers a lookup, or the note saying why it offers none.
+
+    Everything :func:`fix_track` does before it talks to MusicBrainz -- the
+    FLAC-only rule, the enabled flag, the file being there and readable, and
+    the duration the match bar needs -- reduced to one value, so the album pass
+    applies exactly the same rules to exactly the same files rather than a
+    second implementation of them.
+
+    ``note`` is set on every path that cannot go on; ``cleaned_title`` and
+    ``duration`` are meaningful only when it is ``None``.
+    """
+
+    cleaned_title: str = ""
+    duration: float | None = None
+    note: str | None = None
+
+    @property
+    def usable(self) -> bool:
+        return self.note is None
+
+
+def probe_track(flac_path: Path, folder_artist: str | None) -> TrackProbe:
+    """Read *flac_path* far enough to know what to ask MusicBrainz, or why not."""
+    path = Path(flac_path)
+
+    if path.suffix.lower() != ".flac":
+        # Domain-model rule: only FLAC takes part in tagging.
+        return TrackProbe(note=NOTE_NOT_FLAC)
+    if not tag_fix_enabled():
+        return TrackProbe(note=NOTE_DISABLED)
+    if not path.exists():
+        return TrackProbe(note=NOTE_FILE_MISSING)
+
+    try:
+        audio = FLAC(path)
+    except Exception as exc:
+        logger.warning("Tag fix: could not read %s as FLAC: %s", path, exc)
+        return TrackProbe(note=NOTE_UNREADABLE)
+
+    raw_title = _first_tag(audio, "TITLE") or path.stem
+    duration = getattr(audio.info, "length", None)
+    if not duration:
+        # A FLAC whose STREAMINFO has no sample count: the duration half of the
+        # bar cannot be checked, so nothing could pass it anyway.
+        return TrackProbe(note=NOTE_NO_MATCH)
+
+    return TrackProbe(cleaned_title=clean_title(raw_title, folder_artist), duration=duration)
+
+
+def run_search(
+    search: SearchCallable,
+    cleaned_title: str,
+    folder_artist: str | None,
+    duration_seconds: float | None,
+) -> tuple[list[Candidate], str | None]:
+    """Call *search*, turning everything it can raise into a note.
+
+    Returns ``(candidates, None)`` or ``([], note)``.  Never raises for
+    anything MusicBrainz does: a network error, a rate limit and a malformed
+    response are all "we could not ask", which the callers report differently
+    -- a download says so in its detail and finishes, a manual tagging job
+    fails -- but neither of them wants a traceback.
+    """
+    try:
+        return list(search(cleaned_title, folder_artist, duration_seconds)), None
+    except (
+        musicbrainzngs.WebServiceError,
+        musicbrainzngs.NetworkError,
+        musicbrainzngs.ResponseError,
+        OSError,
+    ) as exc:
+        # NetworkError and ResponseError are WebServiceError subclasses; both
+        # are named for the reader.  OSError covers a socket timeout that the
+        # library's retry loop ran out of patience on.
+        logger.info("Tag fix: MusicBrainz lookup for %r failed: %s", cleaned_title, exc)
+        return [], NOTE_UNAVAILABLE
+    except Exception as exc:
+        # A malformed response makes the library raise anything from a KeyError
+        # to a ValueError.  A finished download is not worth a traceback.
+        logger.warning(
+            "Tag fix: unexpected MusicBrainz failure for %r: %r", cleaned_title, exc
+        )
+        return [], NOTE_UNAVAILABLE
+
+
 def fix_track(
     flac_path: Path | str,
     folder_artist: str | None,
@@ -720,11 +960,15 @@ def fix_track(
     *search* is injectable so the whole path can be exercised without a
     network; production leaves it at :func:`search_recordings`.
 
-    *should_cancel* is polled at two checkpoints -- before the lookup and again
-    between the lookup and the write.  A MusicBrainz request in flight cannot
-    be interrupted (the library exposes no handle on it), so a cancel that
-    arrives mid-request takes effect when the request returns, or when the
-    caller's own timeout fires.
+    *should_cancel* is polled at three checkpoints -- before the file is read,
+    after it is read and before the lookup, and again between the lookup and
+    the write.  The first is what the album pass does too (it checks before
+    every ``lookup_track``), and it means a cancelled job whose file happens to
+    be unreadable ends ``cancelled`` rather than reporting a read failure
+    nobody asked about.  A MusicBrainz request in flight cannot be interrupted
+    (the library exposes no handle on it), so a cancel that arrives mid-request
+    takes effect when the request returns, or when the caller's own timeout
+    fires.
 
     Never raises for anything MusicBrainz does: a network error, a rate limit,
     a malformed response and an unreadable file all come back as a result whose
@@ -733,48 +977,20 @@ def fix_track(
     """
     path = Path(flac_path)
 
-    if path.suffix.lower() != ".flac":
-        # Domain-model rule: only FLAC takes part in tagging.
-        return TagFixResult(note=NOTE_NOT_FLAC)
-    if not tag_fix_enabled():
-        return TagFixResult(note=NOTE_DISABLED)
-    if not path.exists():
-        return TagFixResult(note=NOTE_FILE_MISSING)
     if should_cancel is not None and should_cancel():
         return TagFixResult(note=NOTE_CANCELLED)
 
-    try:
-        audio = FLAC(path)
-    except Exception as exc:
-        logger.warning("Tag fix: could not read %s as FLAC: %s", path, exc)
-        return TagFixResult(note=NOTE_UNREADABLE)
+    probe = probe_track(path, folder_artist)
+    if not probe.usable:
+        return TagFixResult(note=probe.note)
+    if should_cancel is not None and should_cancel():
+        return TagFixResult(note=NOTE_CANCELLED)
 
-    raw_title = _first_tag(audio, "TITLE") or path.stem
-    duration = getattr(audio.info, "length", None)
-    if not duration:
-        # A FLAC whose STREAMINFO has no sample count: the duration half of the
-        # bar cannot be checked, so nothing could pass it anyway.
-        return TagFixResult(note=NOTE_NO_MATCH)
-
-    cleaned = clean_title(raw_title, folder_artist)
-    try:
-        candidates = search(cleaned, folder_artist, duration)
-    except (
-        musicbrainzngs.WebServiceError,
-        musicbrainzngs.NetworkError,
-        musicbrainzngs.ResponseError,
-        OSError,
-    ) as exc:
-        # NetworkError and ResponseError are WebServiceError subclasses; both
-        # are named for the reader.  OSError covers a socket timeout that the
-        # library's retry loop ran out of patience on.
-        logger.info("Tag fix: MusicBrainz lookup for %s failed: %s", path, exc)
-        return TagFixResult(note=NOTE_UNAVAILABLE)
-    except Exception as exc:
-        # A malformed response makes the library raise anything from a KeyError
-        # to a ValueError.  A finished download is not worth a traceback.
-        logger.warning("Tag fix: unexpected MusicBrainz failure for %s: %r", path, exc)
-        return TagFixResult(note=NOTE_UNAVAILABLE)
+    cleaned = probe.cleaned_title
+    duration = probe.duration
+    candidates, note = run_search(search, cleaned, folder_artist, duration)
+    if note is not None:
+        return TagFixResult(note=note)
 
     match = pick_match(candidates, cleaned, folder_artist, duration)
     if match is None:

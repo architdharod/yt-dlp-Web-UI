@@ -626,6 +626,19 @@ class TestFixTrack:
         assert result.note == NOTE_CANCELLED
         assert called == []
 
+    def test_a_cancel_wins_over_a_file_that_cannot_be_read(self, tmp_path):
+        """The album pass checks before every lookup; so does this one now.
+
+        Reporting "file could not be read" for a job the user cancelled would
+        offer a Retry for a run nobody asked to finish.
+        """
+        path = tmp_path / "track.flac"
+        path.write_bytes(b"not a flac at all")
+
+        result = fix_track(path, "Bonobo", should_cancel=lambda: True)
+
+        assert result.note == NOTE_CANCELLED
+
     def test_cancel_between_the_lookup_and_the_write(self, tmp_path):
         path = _write_track(
             tmp_path / "track.flac", tags={"TITLE": "Kerala (Official Video)"}
@@ -635,7 +648,9 @@ class TestFixTrack:
 
         def should_cancel() -> bool:
             checkpoints.append(len(checkpoints))
-            return len(checkpoints) > 1  # cancelled after the lookup returned
+            # Three checkpoints: before the read, before the lookup, and after
+            # it.  Only the last one says "cancelled".
+            return len(checkpoints) > 2
 
         result = fix_track(
             path,

@@ -467,6 +467,102 @@ def test_restoring_onto_a_folder_a_download_targets_is_409(client_and_queue, roo
     assert not (root / "Bonobo" / "Black Sands").exists()
 
 
+def tagging_job(path: str, **overrides) -> Job:
+    """An in-flight tagging job rewriting *path*."""
+    fields = {
+        "id": "tag-1",
+        "url": "",
+        "status": JobStatus.TAGGING,
+        "kind": JobKind.TAGGING,
+        "path": path,
+        "target_dir": None,
+    }
+    fields.update(overrides)
+    return Job(**fields)
+
+
+def test_deleting_a_folder_being_tagged_is_409(client_and_queue, root):
+    """The pass is minutes long and is about to write those very files."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = tagging_job("Bonobo/Black Sands")
+
+    response = client.post("/library/delete", json={"path": "Bonobo/Black Sands"})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "is being tagged" in detail["message"]
+    assert detail["conflicts"] == ["Bonobo/Black Sands"]
+    assert (root / "Bonobo" / "Black Sands" / "Kiara.flac").is_file()
+
+
+def test_deleting_an_artist_above_a_folder_being_tagged_is_409(client_and_queue, root):
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = tagging_job("Bonobo/Black Sands")
+
+    response = client.post("/library/delete", json={"path": "Bonobo"})
+
+    assert response.status_code == 409
+    assert (root / "Bonobo" / "Black Sands" / "Kiara.flac").is_file()
+
+
+def test_deleting_a_track_inside_a_folder_being_tagged_is_409(client_and_queue, root):
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = tagging_job("Bonobo/Black Sands")
+
+    response = client.post(
+        "/library/delete", json={"path": "Bonobo/Black Sands/Kiara.flac"}
+    )
+
+    assert response.status_code == 409
+
+
+def test_deleting_the_very_track_being_tagged_is_409(client_and_queue, root):
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = tagging_job("Bonobo/Black Sands/Kiara.flac")
+
+    response = client.post(
+        "/library/delete", json={"path": "Bonobo/Black Sands/Kiara.flac"}
+    )
+
+    assert response.status_code == 409
+    assert (root / "Bonobo" / "Black Sands" / "Kiara.flac").is_file()
+
+
+def test_a_track_being_tagged_does_not_block_its_sibling(client_and_queue, root):
+    """Tagging one track is no reason to refuse a delete of another."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = tagging_job("Bonobo/Black Sands/Kiara.flac")
+
+    response = client.post(
+        "/library/delete", json={"path": "Bonobo/Black Sands/Kong.flac"}
+    )
+
+    assert response.status_code == 200
+    assert not (root / "Bonobo" / "Black Sands" / "Kong.flac").exists()
+
+
+def test_a_tagging_job_elsewhere_does_not_block_a_delete(client_and_queue, root):
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = tagging_job("Bonobo/Migration")
+
+    response = client.post("/library/delete", json={"path": "Bonobo/Black Sands"})
+
+    assert response.status_code == 200
+
+
+def test_restoring_onto_a_folder_being_tagged_is_409(client_and_queue, root):
+    client, manager, _events = client_and_queue
+    deleted = client.post("/library/delete", json={"path": "Bonobo/Black Sands"})
+    entry_id = deleted.json()["entry"]["id"]
+
+    manager._jobs["tag-1"] = tagging_job("Bonobo/Black Sands")
+    response = client.post("/library/trash/restore", json={"id": entry_id})
+
+    assert response.status_code == 409
+    assert "is being tagged" in response.json()["detail"]["message"]
+    assert not (root / "Bonobo" / "Black Sands").exists()
+
+
 # ---------------------------------------------------------------------------
 # Listing
 # ---------------------------------------------------------------------------

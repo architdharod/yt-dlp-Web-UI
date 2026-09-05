@@ -16,6 +16,7 @@ vi.mock("@/lib/api", () => ({
 function job(id: string, status: JobStatus = "downloading"): Job {
   return {
     id,
+    kind: "download",
     url: `https://example.com/${id}`,
     status,
     title: id,

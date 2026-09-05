@@ -12,6 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useLibraryQuery } from "@/hooks/useLibraryQuery";
+import { useTagMutation, type TagFeedback } from "@/hooks/useTagMutation";
 import { plural } from "@/lib/format";
 import {
   ARTISTS_VIEW,
@@ -87,11 +88,21 @@ export function LibraryTab() {
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [moveTarget, setMoveTarget] = useState<MoveTarget | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<MoveTarget | null>(null);
+  // "Update metadata" needs no dialog: it is non-destructive, and the job it
+  // queues shows up in the Download tab's in-flight list like any other.
+  const {
+    tagPath,
+    pending: tagPending,
+    feedback: tagFeedback,
+    clearFeedback: clearTagFeedback,
+  } = useTagMutation();
 
   const location = resolveLocation(view, data);
 
   /** Go somewhere, dropping the highlight the last search result left behind. */
   function navigate(next: LibraryView, highlight: string | null = null) {
+    // The tag line names a path on the level being left behind.
+    clearTagFeedback();
     setView(next);
     setHighlightPath(highlight);
     // A selection only ever means something within one folder, so leaving the
@@ -210,6 +221,8 @@ export function LibraryTab() {
         {isFetching && <span>Updating…</span>}
       </div>
 
+      <TagFeedbackLine feedback={tagFeedback} />
+
       {query.trim() !== "" ? (
         <SearchResults
           results={searchLibrary(data, query)}
@@ -226,6 +239,8 @@ export function LibraryTab() {
           onClearSelection={() => setSelected(new Set())}
           onMove={openMove}
           onDelete={openDelete}
+          onTag={tagPath}
+          tagPending={tagPending}
         />
       )}
 
@@ -250,6 +265,35 @@ export function LibraryTab() {
         />
       )}
     </div>
+  );
+}
+
+/**
+ * What came of the last "Update metadata" click, or nothing yet.
+ *
+ * One line for the whole tab rather than a message per row: only one request is
+ * ever interesting at a time, and a row is too narrow for a 409's sentence.
+ * `role="status"` so a screen reader hears the answer to a click that
+ * otherwise changes nothing on this tab.
+ *
+ * The region is always mounted, empty when there is nothing to say: a live
+ * region has to be in the tree *before* its content changes for the change to
+ * be announced, and `useTagMutation.onMutate` clears the feedback on every
+ * click, so a conditionally rendered line would be inserted already carrying
+ * its text and might be read out late or not at all. Nothing shows on screen
+ * while the text is empty, and the `failed` colour only applies once there is
+ * a message to colour.
+ */
+function TagFeedbackLine({ feedback }: { feedback: TagFeedback | null }) {
+  return (
+    <p
+      role="status"
+      className={`text-xs ${
+        feedback?.failed === true ? "text-destructive" : "text-muted-foreground"
+      }`}
+    >
+      {feedback?.message ?? ""}
+    </p>
   );
 }
 
@@ -328,6 +372,8 @@ function LibraryLevel({
   onClearSelection,
   onMove,
   onDelete,
+  onTag,
+  tagPending,
 }: {
   library: LibraryResponse;
   location: LibraryLocation;
@@ -338,6 +384,8 @@ function LibraryLevel({
   onClearSelection: () => void;
   onMove: (target: MoveTarget) => void;
   onDelete: (target: MoveTarget) => void;
+  onTag: (path: string) => void;
+  tagPending: ReadonlySet<string>;
 }) {
   if (location.level === "artists") {
     if (library.artist_count === 0) {
@@ -375,6 +423,15 @@ function LibraryLevel({
       onMoveSelected: () => onMove(trackTarget(ticked(), album)),
       onDelete: (track: LibraryTrack) => onDelete(trackTarget([track], album)),
       onDeleteSelected: () => onDelete(trackTarget(ticked(), album)),
+      // Rows in a real artist get the action; the synthetic bucket's do not.
+      // Its files sit at the library root, which `POST /library/tag` refuses,
+      // so the button could only ever 400 — `TrackList` renders none when
+      // `onTag` is undefined. The artist level gets none either: the metadata
+      // ticket rules out a per-artist and a whole-library trigger.
+      onTag: artist.synthetic
+        ? undefined
+        : (track: LibraryTrack) => onTag(track.path),
+      tagPending,
     };
   };
 
@@ -457,6 +514,14 @@ function LibraryLevel({
         current={album.name}
         onNavigate={onNavigate}
       >
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={tagPending.has(album.path)}
+          onClick={() => onTag(album.path)}
+        >
+          Update metadata
+        </Button>
         <Button
           variant="outline"
           size="sm"

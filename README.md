@@ -61,6 +61,43 @@ It never shows in the Library tab, and a trashed track no longer counts as a dup
 again without the "already in library" refusal. Deleting something an in-flight job is about to write is refused
 until that job finishes. Navidrome and Lidarr both skip `.trash`; see below.
 
+### Update metadata
+
+**Update metadata** is offered on a track row and on an album header. Both queue a **tagging** job, which appears in
+the in-flight queue next to the downloads, can be cancelled while it runs, retried when it fails, and dismissed
+afterwards. There is deliberately no per-artist or whole-library button.
+
+A track run redoes the fix a download does automatically: MusicBrainz is asked about the cleaned title, the artist
+folder and the duration, and on a confident match `TITLE` and `ARTIST` are rewritten. An album run looks every track
+in the folder up and shows its progress as *N of M*. When all of them match and all of them map to one believable
+MusicBrainz release — not a bootleg, not a tribute, not a greatest-hits compilation, all of which carry the same
+recordings the album does — it also writes `TRACKNUMBER` and `DISCNUMBER` from that release's tracklist and fetches
+`cover.jpg` from the Cover Art Archive — the release's front image, else the release group's. Otherwise it applies
+the per-track fixes on their own, writes no numbers and no cover, and the job says `partial: 9 of 12`.
+
+Finding that one release takes two goes. MusicBrainz lists a popular recording once per release that duplicated it,
+so on a heavily duplicated album no single release shows up in *every* track's search results. When every track
+matched but no believable release is common to all of them, the pass ranks the releases the folder points at — by
+the same three tests, dropping anything credited to another artist, anything that is not an official release, and
+anything the release group calls a compilation — and reads up to three of those tracklists, taking the first that
+holds every track in the folder at the same title/length/artist bar. One of those three that cannot be read is
+skipped rather than failing the job. That costs one to three extra MusicBrainz requests, and none at all on a
+folder the first go already resolved.
+
+An existing `cover.jpg` (or `folder.jpg`) is never overwritten, embedded artwork is left alone, no MusicBrainz id is
+ever written, and `ALBUM`/`ALBUMARTIST` stay whatever the folders say. A loose Single gets title and artist only:
+never a track number, never an `ALBUM` tag, never cover art. Non-FLAC files count towards the album's total but are
+never touched — and because they can never match, a single non-FLAC file in a folder keeps that album off the
+numbers-and-cover path for good; it always reports `partial: 11 of 12`. Nothing is remembered about what matched, so
+running the pass again asks again.
+
+Unlike a download — which always finishes, saying "tags not fixed" in its detail when the lookup failed — a tagging
+job whose whole purpose was to fix tags **fails** when MusicBrainz cannot be reached, when the lookup times out, or
+when a file cannot be written, and stays in the queue with a Retry and a Dismiss. "No match" is not a failure: the
+job finishes with `tags not fixed: no match`. Cancelling mid-album leaves the tracks already written as they are and
+the rest untouched. Tagging a folder an in-flight download is about to write into is refused until that job
+finishes, as a move or a delete would be.
+
 ## Architecture
 
 ```
@@ -243,4 +280,5 @@ worth knowing:
 - **FLAC only** — lossy sources are losslessly wrapped in FLAC for consistent output. Only FLAC files are tagged.
 - **Text-search tagging only** — the automatic fix asks MusicBrainz by title, artist and duration; there is no
   audio fingerprinting, so a live version, a cover, or a sped-up upload is left with the tags it came with. Album
-  track numbers and cover art are not part of the automatic pass.
+  track numbers and cover art are never part of the *automatic* pass; they come only from the album's
+  **Update metadata** button.

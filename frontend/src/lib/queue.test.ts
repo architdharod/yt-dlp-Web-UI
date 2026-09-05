@@ -5,6 +5,7 @@ import type { Job, JobStatus } from "@/lib/types";
 function job(id: string, status: JobStatus): Job {
   return {
     id,
+    kind: "download",
     url: `https://example.com/${id}`,
     status,
     title: id,
@@ -42,6 +43,30 @@ describe("countActiveJobs", () => {
       job("d", "cancelled"),
     ];
     expect(countActiveJobs(jobs)).toBe(1);
+  });
+});
+
+describe("tagging jobs in the badge", () => {
+  it("counts a manual metadata update while it waits and while it runs", () => {
+    const tagging = (id: string, status: JobStatus): Job => ({
+      ...job(id, status),
+      kind: "tagging",
+      url: "",
+      path: "Bonobo/Black Sands",
+    });
+    // A tagging job is in flight in exactly the states a download is: the
+    // badge is one count over the whole queue, whatever made each row.
+    expect(
+      countActiveJobs([tagging("a", "queued"), tagging("b", "tagging")]),
+    ).toBe(2);
+    expect(
+      countActiveJobs([
+        tagging("a", "queued"),
+        tagging("b", "error"),
+        tagging("c", "cancelled"),
+        job("d", "downloading"),
+      ]),
+    ).toBe(2);
   });
 });
 

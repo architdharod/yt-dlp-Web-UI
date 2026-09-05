@@ -676,6 +676,44 @@ def check_in_flight(guarded: Iterable[str], in_flight: Iterable[str]) -> None:
             )
 
 
+def check_not_being_tagged(guarded: Iterable[str], tagging: Iterable[str]) -> None:
+    """Refuse the write while a tagging job is working on one of *guarded*.
+
+    *guarded* are the folders (or files) the move, delete or restore is about
+    to change; *tagging* are the paths in-flight tagging jobs are rewriting.
+    A tagging pass reads a folder, asks MusicBrainz about every track in it and
+    then writes those files back, minutes later -- moving or deleting them in
+    between leaves the pass writing to paths that are gone, or writing tags
+    into a folder the user has just emptied.
+
+    Containment counts in *both* directions, unlike a download's target, which
+    is only ever a folder a write lands *in*.  Deleting ``Artist`` while
+    ``Artist/Album`` is being tagged takes the tagged folder away; deleting
+    ``Artist/Album/track.flac`` while ``Artist/Album`` is being tagged takes a
+    file the pass is about to write.  A sibling -- ``Artist/Other`` -- is
+    untouched by either and is not refused.
+
+    One conflict is reported, as :func:`check_in_flight` does: they are all the
+    same job's doing and "wait for this tag fix" is the whole message.
+    """
+    tagging = [one for one in tagging if one]
+    for folder in guarded:
+        if not folder:
+            # The library root: guarding it would refuse every write while any
+            # tagging job at all was running.
+            continue
+        for path in tagging:
+            if (
+                path == folder
+                or path.startswith(folder + "/")
+                or folder.startswith(path + "/")
+            ):
+                raise LibraryConflict(
+                    f"{path} is being tagged; try again when it finishes",
+                    [path],
+                )
+
+
 def check_resolved(unresolved: int, jobs: Iterable[str] = ()) -> None:
     """Refuse the move while a download has not said where it is going.
 

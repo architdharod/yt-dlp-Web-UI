@@ -703,6 +703,167 @@ def test_a_download_being_tagged_still_guards_its_folder():
     assert in_flight.unresolved == 0
 
 
+def test_a_tagging_job_names_the_path_it_is_rewriting():
+    """It guards through ``tagging_paths``, not through ``targets``."""
+    manager = QueueManager(max_concurrent=1, timeout=10)
+    manager._jobs["job-1"] = _in_flight_job(
+        kind=JobKind.TAGGING, target_dir=None, path="Bonobo/Migration"
+    )
+
+    in_flight = manager.in_flight_library_targets()
+
+    assert in_flight.tagging_paths == ["Bonobo/Migration"]
+    # Not the artist folder above it: an unrelated album by the same artist is
+    # still free to move.
+    assert in_flight.targets == []
+
+
+def test_moving_an_album_that_is_being_tagged_is_refused(client_and_queue, root):
+    """The pass reads the folder, waits on MusicBrainz, then writes it back."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = _in_flight_job(
+        id="tag-1",
+        kind=JobKind.TAGGING,
+        status=JobStatus.TAGGING,
+        target_dir=None,
+        path="Bonobo/Migration",
+    )
+    before = rel_paths(root)
+
+    response = client.post(
+        "/library/move", json={"path": "Bonobo/Migration", "artist": "Lone"}
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert "is being tagged" in detail["message"]
+    assert detail["conflicts"] == ["Bonobo/Migration"]
+    assert rel_paths(root) == before
+
+
+def test_renaming_an_artist_above_a_folder_being_tagged_is_refused(
+    client_and_queue, root
+):
+    """Containment counts upwards too: the rename takes the tagged folder away."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = _in_flight_job(
+        id="tag-1",
+        kind=JobKind.TAGGING,
+        status=JobStatus.TAGGING,
+        target_dir=None,
+        path="Bonobo/Migration",
+    )
+    before = rel_paths(root)
+
+    response = client.post(
+        "/library/move", json={"path": "Bonobo", "artist": "Bonobo (UK)"}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["conflicts"] == ["Bonobo/Migration"]
+    assert rel_paths(root) == before
+
+
+def test_moving_a_track_out_of_a_folder_being_tagged_is_refused(client_and_queue, root):
+    """The pass is about to write that very file."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = _in_flight_job(
+        id="tag-1",
+        kind=JobKind.TAGGING,
+        status=JobStatus.TAGGING,
+        target_dir=None,
+        path="Bonobo/Migration",
+    )
+
+    response = client.post(
+        "/library/move",
+        json={"path": "Bonobo/Migration/Kerala.flac", "artist": "Lone"},
+    )
+
+    assert response.status_code == 409
+
+
+def test_moving_the_very_track_being_tagged_is_refused(client_and_queue, root):
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = _in_flight_job(
+        id="tag-1",
+        kind=JobKind.TAGGING,
+        status=JobStatus.TAGGING,
+        target_dir=None,
+        path="Bonobo/Black Sands/Kiara.flac",
+    )
+
+    response = client.post(
+        "/library/move",
+        json={"path": "Bonobo/Black Sands/Kiara.flac", "artist": "Lone"},
+    )
+
+    assert response.status_code == 409
+    assert "is being tagged" in response.json()["detail"]["message"]
+
+
+def test_a_track_being_tagged_does_not_block_its_sibling(client_and_queue, root):
+    """A single-track pass has no claim on the other files in the folder."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = _in_flight_job(
+        id="tag-1",
+        kind=JobKind.TAGGING,
+        status=JobStatus.TAGGING,
+        target_dir=None,
+        path="Bonobo/Black Sands/Kiara.flac",
+    )
+
+    response = client.post(
+        "/library/move",
+        json={"path": "Bonobo/Black Sands/Kong.flac", "artist": "Lone"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_moving_into_a_folder_being_tagged_is_refused(client_and_queue, root):
+    """The destination stays guarded: the pass is rewriting what is in there."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = _in_flight_job(
+        id="tag-1",
+        kind=JobKind.TAGGING,
+        status=JobStatus.TAGGING,
+        target_dir=None,
+        path="Bonobo/Migration",
+    )
+    before = rel_paths(root)
+
+    response = client.post(
+        "/library/move",
+        json={
+            "path": "Bonobo/Black Sands/Kiara.flac",
+            "artist": "Bonobo",
+            "album": "Migration",
+        },
+    )
+
+    assert response.status_code == 409
+    assert rel_paths(root) == before
+
+
+def test_an_album_being_tagged_does_not_block_its_sibling(client_and_queue, root):
+    """A different album by the same artist is nothing to do with the pass."""
+    client, manager, _events = client_and_queue
+    manager._jobs["tag-1"] = _in_flight_job(
+        id="tag-1",
+        kind=JobKind.TAGGING,
+        status=JobStatus.TAGGING,
+        target_dir=None,
+        path="Bonobo/Migration",
+    )
+
+    response = client.post(
+        "/library/move", json={"path": "Bonobo/Black Sands", "artist": "Lone"}
+    )
+
+    assert response.status_code == 200
+
+
 def test_renaming_an_artist_a_job_is_tagging_in_is_refused(client_and_queue, root):
     client, manager, _events = client_and_queue
     manager._jobs["job-1"] = _in_flight_job(status=JobStatus.TAGGING)

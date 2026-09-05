@@ -15,6 +15,11 @@ State machine::
     error ──► queued  (retry)
     error ──► gone    (dismiss)
 
+A *manual tagging job* (``JobKind.TAGGING``, phase 9) is the same machine with
+the download taken out: ``queued ──► tagging ──► done``, plus ``error`` for a
+lookup that could not happen and ``cancelled`` for one the user stopped.  It
+takes no download slot, only the tagging lock.
+
 ``converting`` is reported by the downloader immediately before it starts
 ffmpeg.  ``tagging`` is the automatic MusicBrainz tag fix (phase 8), and it is
 the one stage that runs *outside* a download slot: the FLAC is already in the
@@ -70,7 +75,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from app.downloader import (
     FFMPEG_TERMINATE_GRACE_SECONDS,
@@ -82,14 +87,24 @@ from app.downloader import (
     remove_orphan_temp_dirs,
     unfile_track,
 )
+from app.album_tagger import AlbumTagResult, TagStepFailed, tag_album
 from app.file_organizer import DEFAULT_DOWNLOAD_PATH
 from app.job_store import JobStore
+from app.library_ops import (
+    LibraryConflict,
+    check_in_flight,
+    check_resolved,
+    is_audio,
+)
 from app.models import Job, JobKind, JobStatus, SSEEvent
 from app.tagger import (
     NOTE_CANCELLED,
     NOTE_FAILED,
     NOTE_FILE_MISSING,
     NOTE_TIMED_OUT,
+    NOTE_UNAVAILABLE,
+    NOTE_UNREADABLE,
+    NOTE_WRITE_FAILED,
     TagFixResult,
     fix_track,
 )
@@ -174,6 +189,24 @@ _TERMINAL = (JobStatus.DONE, JobStatus.ERROR, JobStatus.CANCELLED)
 # Statuses the retention sweep may drop.  Mirrors JobStore.TERMINAL_STATUSES.
 _SWEEPABLE = (JobStatus.DONE, JobStatus.CANCELLED)
 
+# Notes a *manual* tagging job reports as a failure rather than as a finished
+# job with something to say.  The metadata ticket's rule: a download always
+# completes even when its automatic fix could not run ("tags not fixed: ..."
+# in the detail), but a job whose entire purpose was to fix tags and did not
+# has failed, and the user gets a Retry and a Dismiss.  "No match" is
+# deliberately absent -- MusicBrainz answering "I do not know this recording"
+# is a result, not a failure.
+_TAGGING_FAILURES = frozenset(
+    {
+        NOTE_UNAVAILABLE,
+        NOTE_TIMED_OUT,
+        NOTE_FAILED,
+        NOTE_WRITE_FAILED,
+        NOTE_UNREADABLE,
+        NOTE_FILE_MISSING,
+    }
+)
+
 
 def _env_int(name: str, default: int) -> int:
     """Read an integer env var; empty or missing values yield *default*.
@@ -195,6 +228,14 @@ class InFlightTargets:
     together because a caller that only looked at ``targets`` would read an
     unresolved job as "aiming nowhere" and happily rename the folder it is
     about to land in.
+
+    ``tagging_paths`` is the third thing a library write has to wait for and is
+    deliberately its own field rather than more ``targets``: a tagging job
+    creates no folder, so it is not a destination -- it is a path already in
+    the library whose files are about to be rewritten, and it is guarded in
+    both directions (see
+    :func:`~app.library_ops.check_not_being_tagged`) where a download's target
+    is only ever guarded as a folder something lands inside.
     """
 
     targets: list[str]
@@ -204,6 +245,42 @@ class InFlightTargets:
     # is being asked to wait for instead of leaving them to guess at a queue
     # that may be several jobs deep.
     unresolved_jobs: list[str] = field(default_factory=list)
+    # The ``job.path`` of every in-flight tagging job -- the album folder or
+    # the single track the pass is rewriting.  Never the artist folder above
+    # it: the artist is not what the pass touches, and guarding it would
+    # refuse a move of an unrelated album by the same artist.
+    tagging_paths: list[str] = field(default_factory=list)
+
+
+def tagging_conflict_message(conflict: "Job") -> str:
+    """The 409 text for "something is already tagging this path".
+
+    One function because two callers say it: the route checks before it builds
+    a job (so the tagging-vs-tagging answer wins over the in-flight download
+    one, which would otherwise be the first to fire) and
+    :meth:`QueueManager.add_tagging_job` checks again as it adds.
+    """
+    return (
+        f"{conflict.path!r} is already being tagged "
+        f"(job {conflict.id}, {conflict.status.value})"
+    )
+
+
+def tagging_guarded_folder(path: str) -> str:
+    """The folder a tagging job on *path* is guarded as, from the path alone.
+
+    The album trigger names a folder and is guarded as itself; the track
+    trigger names a file and is guarded as the folder it sits in, because that
+    is the folder a download could file into underneath the pass.  The same
+    two answers the ``POST /library/tag`` route computes with a ``is_dir``
+    call, derived here from the name instead -- a retry has only the stored
+    row to go on, and :func:`~app.library_ops.is_audio` is the very test the
+    route made the file take before the job existed.
+    """
+    if not path or not is_audio(Path(path)):
+        return path
+    parent, separator, _ = path.rpartition("/")
+    return parent if separator else ""
 
 
 class QueueError(Exception):
@@ -219,6 +296,21 @@ class JobNotFound(QueueError):
 
     A subclass so a route can tell "no such job" (404) from "not in a state
     that allows this" (400) without inspecting the message.
+    """
+
+
+class TaggingConflict(QueueError):
+    """Raised when re-running a tagging job would collide with other work.
+
+    A subclass so the retry route can answer **409** ("something else is using
+    this path, try again in a moment") rather than the 400 a plain
+    :class:`QueueError` means ("this job cannot be retried at all").  The job
+    is left exactly as it was: still ``error``, still carrying its detail,
+    still retryable, and its ``attempts`` not spent on a run that never
+    happened.
+
+    Its message travels as a plain string, because that is what the frontend
+    unwraps out of a failed retry.
     """
 
 
@@ -395,6 +487,60 @@ class QueueManager:
                 return job
         return None
 
+    def add_tagging_job(self, job: Job) -> Job:
+        """Add a manual tagging job and start it on the tagging worker.
+
+        Unlike :meth:`add_job` there is no download slot and no URL: what makes
+        two tagging jobs the same is the library path they are about to write
+        into, which is also why the duplicate check is
+        :meth:`find_tagging_conflict` rather than the URL check downloads use.
+
+        Raises:
+            QueueError: another tagging job is already working on this path,
+                or on one that contains it or sits inside it.
+        """
+        conflict = self.find_tagging_conflict(job.path or "")
+        if conflict is not None:
+            raise QueueError(tagging_conflict_message(conflict))
+
+        self._jobs[job.id] = job
+        self._persist(job)
+        logger.info(
+            "Tagging job %s added to queue for %r", job.id, job.path
+        )
+        self._dispatch_tagging_job(job.id)
+        return job
+
+    def find_tagging_conflict(self, path: str, exclude: str | None = None) -> Job | None:
+        """An in-flight tagging job whose path overlaps *path*, if there is one.
+
+        Overlap, not equality: a track inside an album that is already being
+        tagged would have the two passes writing the same file, and an album
+        containing a track that is being tagged is the same collision seen from
+        the other end.  Compared as path prefixes, which is what the library's
+        own guards do.
+
+        *exclude* is a job id to ignore -- the retry path's own job, which is
+        asking whether anything *else* is on its path.
+        """
+        if not path:
+            return None
+        for job in self._jobs.values():
+            if job.id == exclude:
+                continue
+            if job.kind is not JobKind.TAGGING or job.status not in _IN_FLIGHT:
+                continue
+            other = job.path or ""
+            if not other:
+                continue
+            if (
+                other == path
+                or other.startswith(path + "/")
+                or path.startswith(other + "/")
+            ):
+                return job
+        return None
+
     def in_flight_library_targets(self) -> InFlightTargets:
         """The library folders in-flight jobs are going to write into.
 
@@ -417,20 +563,28 @@ class QueueManager:
         which turns a non-zero count into a 409 that says which download it is
         waiting for.
 
+        ``tagging_paths`` is separate and comes from ``Job.path``: a tagging
+        job has no ``target_dir`` (it creates nothing) but is rewriting files
+        that are already there, and a move or a delete of those has to wait
+        for it just the same.
+
         The library's move and delete routes refuse to touch a folder that
         appears here: a download that lands in a folder renamed out from under
         it leaves a track the user cannot find.
         """
         targets: list[str] = []
         unresolved_jobs: list[str] = []
+        tagging_paths: list[str] = []
         for job in self._jobs.values():
             if job.status not in _IN_FLIGHT:
                 continue
             # Only downloads create folders in the library.  A bulk parent and
             # a standalone tagging job never write a new path, so neither is a
             # destination anybody has to wait for -- and a tagging *job* has no
-            # ``target_dir`` at all, which would otherwise make every tagging
-            # run refuse every move.
+            # ``target_dir`` at all, which would make it "unresolved" and so
+            # refuse every move for a reason that is not true.  A tagging job
+            # is guarded instead through ``tagging_paths``, by the path it is
+            # rewriting.
             #
             # A download in the ``tagging`` *status* is a different thing and
             # is deliberately still guarded here: it keeps its kind and its
@@ -438,6 +592,10 @@ class QueueManager:
             # file inside that folder, so a move or a delete of the folder
             # while the fix is running would have the tagger writing to a path
             # that no longer exists.
+            if job.kind is JobKind.TAGGING:
+                if job.path and job.path not in tagging_paths:
+                    tagging_paths.append(job.path)
+                continue
             if job.kind is not JobKind.DOWNLOAD:
                 continue
             # A guessed target is no better than no target: it is the
@@ -457,6 +615,7 @@ class QueueManager:
             targets=targets,
             unresolved=len(unresolved_jobs),
             unresolved_jobs=unresolved_jobs,
+            tagging_paths=tagging_paths,
         )
 
     def get_jobs(self) -> list[Job]:
@@ -490,9 +649,19 @@ class QueueManager:
         persists the row, and schedules it for processing again.  Retries are
         manual and unlimited.
 
+        A *tagging* job additionally re-takes the guards the ``POST
+        /library/tag`` route took before the job existed.  A retry is a second
+        submission of the same request, minutes or hours later, and the library
+        has moved on: the folder may now be inside another tagging job's path,
+        or a download may be about to file into it.  Re-running the pass
+        without asking would have two writers on the same files.
+
         Raises:
             QueueError: If the job does not exist, is not in ERROR status,
                 or its previous download thread has not exited yet.
+            TaggingConflict: If a tagging job's path is now busy.  Nothing is
+                mutated -- the row stays ``error``, keeps its detail and can be
+                retried again once the collision clears.
         """
         job = self._jobs.get(job_id)
         if job is None:
@@ -506,6 +675,10 @@ class QueueManager:
             raise QueueError(
                 f"Job {job_id!r} is still shutting down its previous attempt; retry in a moment"
             )
+        if job.kind is JobKind.TAGGING:
+            # Before the first mutation, so a refused retry costs the row
+            # nothing -- not its detail, and not an attempt.
+            self._check_tagging_path_free(job)
 
         job.status = JobStatus.QUEUED
         job.error = None
@@ -514,6 +687,8 @@ class QueueManager:
         # read against the old run's reason.
         job.detail = None
         job.progress = 0.0
+        job.progress_done = None
+        job.progress_total = None
         job.finished_at = None
         job.attempts += 1
         # A deliberate retry is a fresh start: give the job its full restart
@@ -536,8 +711,37 @@ class QueueManager:
         self._emit_event("status_change", job)
 
         logger.info("Job %s retried, re-queued for processing", job.id)
-        self._dispatch(job.id)
+        if job.kind is JobKind.TAGGING:
+            self._dispatch_tagging_job(job.id)
+        else:
+            self._dispatch(job.id)
         return job
+
+    def _check_tagging_path_free(self, job: Job) -> None:
+        """Raise :class:`TaggingConflict` when *job* cannot be re-run yet.
+
+        The three checks the tag route makes, in the same order and for the
+        same reasons: another tagging job on an overlapping path first (so the
+        answer names what the user actually collided with), then a download
+        aiming into the guarded folder, then a download that has not said where
+        it is aiming at all.
+
+        The caller holds ``LIBRARY_WRITE_LOCK``, which is what keeps this from
+        passing against a tree a move already running in a thread is halfway
+        through renaming.
+        """
+        path = job.path or ""
+        conflict = self.find_tagging_conflict(path, exclude=job.id)
+        if conflict is not None:
+            raise TaggingConflict(tagging_conflict_message(conflict))
+        in_flight = self.in_flight_library_targets()
+        try:
+            check_in_flight([tagging_guarded_folder(path)], in_flight.targets)
+            check_resolved(in_flight.unresolved, in_flight.unresolved_jobs)
+        except LibraryConflict as exc:
+            # A plain string, not the route's ``{"message", "conflicts"}``:
+            # a retry has one line of UI to say this in.
+            raise TaggingConflict(exc.message) from exc
 
     def cancel_job(self, job_id: str) -> Job:
         """Stop a queued or running job and end it in ``cancelled``.
@@ -553,14 +757,21 @@ class QueueManager:
         :meth:`_run_download_stage`, not here, so the queue never shows
         ``cancelled`` while an ffmpeg is still writing.
 
-        A ``tagging`` job is signalled the same way but ends differently: its
-        FLAC is already in the library, so cancelling the *fix* cannot undo the
-        download.  It finishes ``done`` with "tags not fixed: cancelled" in its
-        detail rather than ``cancelled``, which would tell the user a track
-        they can play was never downloaded.  A job still waiting for the
-        tagging lock skips its lookup entirely; one whose MusicBrainz request
-        is already open stops at the next checkpoint, because that request
-        cannot be interrupted.
+        A *download* in ``tagging`` is signalled the same way but ends
+        differently: its FLAC is already in the library, so cancelling the
+        *fix* cannot undo the download.  It finishes ``done`` with "tags not
+        fixed: cancelled" in its detail rather than ``cancelled``, which would
+        tell the user a track they can play was never downloaded.  A job still
+        waiting for the tagging lock skips its lookup entirely; one whose
+        MusicBrainz request is already open stops at the next checkpoint,
+        because that request cannot be interrupted.
+
+        A *manual tagging job* in ``tagging`` is the one case that does end in
+        ``cancelled``: nothing was downloaded, so the word describes exactly
+        what happened.  It is signalled through the same persisted flag, which
+        its pass reads before each lookup and before each write -- so the
+        tracks it had already rewritten stay rewritten and the rest are left
+        alone.
 
         Terminal jobs are refused rather than silently accepted: a Cancel on a
         job that just finished is a stale UI, and answering "done" to it would
@@ -675,7 +886,13 @@ class QueueManager:
 
         # The user's original queue order is preserved across the restart.
         for job in restored:
-            if job.status == JobStatus.QUEUED:
+            if job.kind is JobKind.TAGGING:
+                # A manual tagging job has no download half at all: whichever
+                # of the two in-flight states it was in, what it needs is the
+                # tagging worker and a fresh pass.
+                if job.status in (JobStatus.QUEUED, JobStatus.TAGGING):
+                    self._dispatch_tagging_job(job.id)
+            elif job.status == JobStatus.QUEUED:
                 self._dispatch(job.id)
             elif job.status == JobStatus.TAGGING:
                 self._dispatch_tagging(job.id)
@@ -697,8 +914,12 @@ class QueueManager:
         restart is not the job's fault either, so it costs no attempt.
 
         A job interrupted in ``tagging`` is not re-queued at all; see
-        :meth:`_recover_tagging`.
+        :meth:`_recover_tagging` for a download's tag stage and
+        :meth:`_recover_tagging_job` for a manual tagging job.
         """
+        if job.kind is JobKind.TAGGING:
+            self._recover_tagging_job(job)
+            return
         remove_job_temp_dir(job.id)
         if job.status is JobStatus.TAGGING:
             self._recover_tagging(job)
@@ -796,6 +1017,64 @@ class QueueManager:
             "Job %s was interrupted mid-tagging; re-running only the tag fix",
             job.id,
         )
+
+    def _recover_tagging_job(self, job: Job) -> None:
+        """Decide what a *manual* tagging job interrupted by a restart does now.
+
+        Nothing about a match is ever stored (metadata ticket), so there is no
+        half-finished pass to resume: the job simply runs again from the top,
+        and the whole cost of the restart is a repeated MusicBrainz query.  It
+        is therefore left in ``tagging`` for :meth:`restore_from_store` to hand
+        back to the tagging worker.
+
+        ``restart_attempts`` is deliberately not spent, exactly as it is not
+        for a download's tag stage: the budget exists to stop a job that
+        crashes the process from resuming forever, and a pass that reads tags
+        and writes two of them is not that job.
+
+        Two endings instead of a re-run:
+
+        * the user had asked to cancel -- ``cancelled``.  Unlike a download's
+          tag stage this really is a cancellation: no file was downloaded, so
+          there is nothing the word would misrepresent;
+        * the path is gone -- ``error`` with "file missing".  A manual job that
+          did not do what it was asked has failed (ticket), and the user gets
+          the Dismiss that goes with it.
+        """
+        job.progress_done = None
+        job.progress_total = None
+        if job.cancel_requested:
+            job.status = JobStatus.CANCELLED
+            job.error = None
+            self._persist(job)
+            logger.info(
+                "Tagging job %s was being cancelled when the process stopped, "
+                "finishing it as cancelled",
+                job.id,
+            )
+            return
+
+        root = Path(os.environ.get("DOWNLOAD_PATH") or DEFAULT_DOWNLOAD_PATH)
+        if not job.path or not (root / job.path).exists():
+            job.status = JobStatus.ERROR
+            job.error = NOTE_FILE_MISSING
+            self._persist(job)
+            logger.info(
+                "Tagging job %s was working on %s, which is no longer there",
+                job.id,
+                job.path,
+            )
+            return
+
+        job.status = JobStatus.TAGGING
+        logger.info(
+            "Tagging job %s was interrupted by a restart; running its pass again",
+            job.id,
+        )
+
+    def _dispatch_tagging_job(self, job_id: str) -> None:
+        """Start a manual tagging job's pass as a tracked task."""
+        self._track(job_id, self._run_tagging_job(job_id), "tagging job")
 
     def _dispatch_tagging(self, job_id: str) -> None:
         """Start the tagging stage alone, for a job restored in ``tagging``.
@@ -1305,6 +1584,24 @@ class QueueManager:
         them to one at a time is the tagging lock plus the stuck-fix guard in
         :meth:`_tag_fix`, not a pool size.
         """
+        return self._submit_tag_step(
+            lambda: fix_track(path, folder_artist, should_cancel=should_cancel)
+        )
+
+    def _submit_tag_step(self, step: Callable[[], object]) -> concurrent.futures.Future:
+        """Run one blocking tagging step on a daemon thread of its own.
+
+        The general form of :meth:`_submit_tag_fix`: the album pass is a
+        sequence of blocking steps -- a lookup per track, the release fetch,
+        each write, the cover -- and every one of them has to be on a thread
+        this loop can walk away from, for the reason spelled out at
+        :data:`DEFAULT_TAG_FIX_TIMEOUT_SECONDS`.
+
+        A thread per step rather than one thread for the whole pass, because
+        the timeout is per step: one wedged lookup must not make the eleven
+        tracks after it unreachable, and a step this queue has abandoned has to
+        be able to keep its own thread until its socket dies.
+        """
         pending: concurrent.futures.Future = concurrent.futures.Future()
 
         def runner() -> None:
@@ -1313,7 +1610,7 @@ class QueueManager:
             if not pending.set_running_or_notify_cancel():
                 return
             try:
-                result = fix_track(path, folder_artist, should_cancel=should_cancel)
+                result = step()
             except BaseException as exc:  # noqa: BLE001 -- reported to the caller
                 pending.set_exception(exc)
             else:
@@ -1352,6 +1649,234 @@ class QueueManager:
             logger.info("Job %s: %s", job_id, detail)
         job.detail = detail
         self._update_status(job_id, JobStatus.DONE)
+
+    # ------------------------------------------------------------------
+    # Manual tagging jobs (phase 9)
+    # ------------------------------------------------------------------
+
+    async def _run_tagging_job(self, job_id: str) -> None:
+        """Run one manual tagging job from ``queued`` to its final status.
+
+        A tagging job is a download job with the download taken out: no slot,
+        no yt-dlp, no temp directory -- just the single tagging lock, which is
+        this app's whole MusicBrainz rate limit, and a pass over one path.
+
+        How it ends is the one place a manual job differs from the automatic
+        fix a download carries.  A download always finishes ``done``, because
+        its file is in the library whatever the lookup did.  A tagging job has
+        no file to fall back on, so the metadata ticket's rule applies: a
+        lookup that could not happen (MusicBrainz unreachable, a timeout, an
+        unexpected failure, a file that could not be written) is an ``error``
+        with a Retry and a Dismiss, while "no match" and a partial album are
+        ``done`` with the reason in ``detail``.
+
+        ``library_changed`` fires at the end of every run that got as far as
+        the pass -- including one that failed or was cancelled partway, because
+        the tracks written before it stopped really did change, and including
+        one that changed nothing, because the rescan fires after any manual run
+        (ticket).
+        """
+        job = self._jobs.get(job_id)
+        if job is None or job.status not in (JobStatus.QUEUED, JobStatus.TAGGING):
+            return
+
+        if job.cancel_requested:
+            # Cancelled while it waited its turn: nothing has been touched.
+            self._finish_cancelled(job_id)
+            return
+
+        # ``tagging`` is set *inside* the lock, not here: the lock is this
+        # app's whole MusicBrainz rate limit, so a second manual job can wait
+        # behind the first for minutes, and a row that said "tagging" all that
+        # while would be claiming work that has not started.  It stays
+        # ``queued``, which is what it is.
+        async with self._tagging_lock:
+            if self._closed:
+                # The app is on its way down.  The row is left in whichever
+                # in-flight state it holds -- ``queued`` for a job that never
+                # got its turn, ``tagging`` for one restored from an earlier
+                # boot -- and ``restore_from_store`` re-dispatches both, so the
+                # next start picks it up either way.  Finishing it here would
+                # throw the user's request away instead.
+                logger.info(
+                    "Tagging job %s: the worker is shut down, leaving it for "
+                    "the next start",
+                    job_id,
+                )
+                return
+            if job.cancel_requested:
+                self._finish_cancelled(job_id)
+                return
+            if job.status not in (JobStatus.QUEUED, JobStatus.TAGGING):
+                # Finished while it waited: ``_finish_cancelled`` writes
+                # ``cancelled`` without setting ``cancel_requested``, so the
+                # check above cannot see a job that was cancelled from the
+                # queue while it sat here.  Without this the job would wake up,
+                # run the whole pass and end ``done``.
+                return
+            self._update_status(job_id, JobStatus.TAGGING)
+            await self._run_tagging_pass(job)
+
+    async def _run_tagging_pass(self, job: Job) -> None:
+        """Do the work of one tagging job and write its verdict.
+
+        Split out from :meth:`_run_tagging_job` so the lock, the shutdown check
+        and the cancel checkpoints stay readable above, and so every exit from
+        the pass itself goes through one ``finally`` that emits
+        ``library_changed``.
+        """
+        root = Path(os.environ.get("DOWNLOAD_PATH") or DEFAULT_DOWNLOAD_PATH)
+        target = root / (job.path or "")
+        # The artist folder is the library's own answer to "whose track is
+        # this", and the match bar checks the MusicBrainz credit against it.
+        folder_artist = (job.path or "").split("/")[0] or None
+
+        changed: list[str] = []
+        try:
+            if not job.path or not target.exists():
+                # Moved or deleted between the request and its turn on the
+                # worker.  Nothing to fix, and a manual job that did not do
+                # what it was asked has failed.
+                self._fail(job.id, NOTE_FILE_MISSING)
+                return
+
+            if target.is_dir():
+                result = await self._tag_album_job(job, target, folder_artist)
+            else:
+                result = await self._tag_track_job(job, target, folder_artist)
+
+            changed = self._relative_paths(result.changed, root)
+            if result.cancelled:
+                self._finish_cancelled(job.id)
+            else:
+                self._finish_tagged(job.id, result.detail)
+        except TagStepFailed as exc:
+            # Whatever was written before the step that failed stays written;
+            # there is no way to unwrite a tag that is not another write, and
+            # the tags that did land are correct.
+            self._fail(job.id, exc.note)
+        except Exception:
+            logger.exception("Tagging job %s raised", job.id)
+            self._fail(job.id, NOTE_FAILED)
+        finally:
+            # An empty-ish list still says "re-read the library": the rescan
+            # hook maps the job's own path to the folder to touch, which is the
+            # honest answer when the pass stopped before it could say more.
+            self.emit_library_changed(changed or [job.path or ""], job_id=job.id)
+
+    async def _tag_track_job(
+        self, job: Job, path: Path, folder_artist: str | None
+    ) -> AlbumTagResult:
+        """Redo the per-track fix for one file, as its own job.
+
+        Exactly the fix a download runs automatically (phase 8), down to the
+        same function and the same match bar -- what differs is only how the
+        outcome is reported, which is :meth:`_run_tagging_pass`'s business.
+
+        No progress counters.  One track is one step, and "0 of 1" then "1 of
+        1" is a progress bar that says nothing the status does not: both
+        counters stay ``None`` and the row shows the status alone.
+        """
+        outcome: TagFixResult = await self._run_tag_step(
+            lambda: fix_track(
+                path, folder_artist, should_cancel=lambda: job.cancel_requested
+            )
+        )
+
+        if outcome.note in _TAGGING_FAILURES:
+            raise TagStepFailed(outcome.note)
+        if outcome.note == NOTE_CANCELLED:
+            return AlbumTagResult(total=1, cancelled=True)
+        return AlbumTagResult(
+            total=1,
+            matched=1 if outcome.matched else 0,
+            changed=[path] if outcome.changed else [],
+            detail=outcome.note,
+        )
+
+    async def _tag_album_job(
+        self, job: Job, folder: Path, folder_artist: str | None
+    ) -> AlbumTagResult:
+        """Run the whole-folder pass, reporting N of M as it goes."""
+        return await tag_album(
+            folder,
+            folder_artist,
+            run=self._run_tag_step,
+            on_progress=lambda done, total: self._set_tag_progress(job, done, total),
+            should_cancel=lambda: job.cancel_requested,
+        )
+
+    async def _run_tag_step(self, step: Callable[[], object]):
+        """Run one blocking tagging step, bounded by the tag-fix timeout.
+
+        The hook :func:`~app.album_tagger.tag_album` is handed: it owns the
+        thread, the timeout and the stuck-worker guard, so the pass itself
+        knows nothing about either and can be tested without them.
+
+        Every failure leaves here as a :class:`~app.album_tagger.TagStepFailed`
+        carrying the note the job's ``error`` will show, because an exception
+        escaping the pass would strand the job in ``tagging`` -- a status the
+        next restart re-runs without spending a restart attempt, so a
+        deterministic failure would raise again on every boot, forever.
+        """
+        if self._stuck_tag_fix is not None:
+            # An earlier lookup is still holding a tagging thread and has not
+            # come back; this step could only wait for the same socket.
+            logger.warning(
+                "Skipping a tagging step: an earlier lookup is still running"
+            )
+            raise TagStepFailed(NOTE_TIMED_OUT)
+
+        pending = self._submit_tag_step(step)
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(pending), timeout=self._tag_fix_timeout
+            )
+        except asyncio.TimeoutError as exc:
+            # The thread is still inside urllib and will stay there until the
+            # socket gives up; see DEFAULT_TAG_FIX_TIMEOUT_SECONDS.
+            pending.cancel()
+            if not pending.done():
+                self._stuck_tag_fix = pending
+                pending.add_done_callback(self._release_stuck_tag_fix)
+            logger.warning(
+                "A tagging step did not finish within %ss", self._tag_fix_timeout
+            )
+            raise TagStepFailed(NOTE_TIMED_OUT) from exc
+        except TagStepFailed:
+            raise
+        except Exception as exc:
+            logger.exception("A tagging step raised")
+            raise TagStepFailed(NOTE_FAILED) from exc
+
+    def _set_tag_progress(self, job: Job, done: int, total: int) -> None:
+        """Publish a tagging job's N of M, when it has moved.
+
+        Memory-only and therefore never persisted: a restarted job re-runs its
+        whole pass, so a stored count would describe work that is about to
+        happen again.  The event is the ordinary ``progress`` one, carrying the
+        same job snapshot every other event does.
+        """
+        if job.progress_done == done and job.progress_total == total:
+            return
+        job.progress_done = done
+        job.progress_total = total
+        if job.status in _TERMINAL:
+            return
+        self._emit_event("progress", job)
+
+    def _relative_paths(self, paths: Iterable[Path], root: Path) -> list[str]:
+        """*paths* as POSIX paths relative to the library root, skipping any
+        that cannot be expressed that way."""
+        relative: list[str] = []
+        for path in paths:
+            try:
+                relative.append(Path(path).relative_to(root).as_posix())
+            except ValueError:
+                logger.warning(
+                    "A tagging pass wrote %s, which is outside %s", path, root
+                )
+        return relative
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1574,6 +2099,11 @@ class QueueManager:
             "duration": job.duration,
             "artist": job.artist,
             "album": job.album,
+            # Always present, null for anything that does not count in units:
+            # a client rendering "7 of 12" should not have to tell "no progress
+            # yet" from "this kind of job has no N of M".
+            "progress_done": job.progress_done,
+            "progress_total": job.progress_total,
         }
         if job.error:
             data["error"] = job.error

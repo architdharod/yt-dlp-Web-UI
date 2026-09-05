@@ -279,3 +279,41 @@ def fake_ffmpeg():
     fake = FakeFfmpeg()
     with patch("app.downloader.subprocess.Popen", new=fake):
         yield fake
+
+
+# ---------------------------------------------------------------------------
+# The network, closed
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def no_musicbrainz_or_cover_art():
+    """Never let a test reach MusicBrainz or the Cover Art Archive.
+
+    Both are reached from inside the queue: a job the API queues starts before
+    the request returns, so a route test that only looked at the response body
+    would otherwise fire a real lookup at a public service.  The stand-ins sit
+    at the true boundary -- the ``musicbrainzngs`` module and ``httpx.Client``
+    -- rather than at our own wrappers, because the wrappers' defaults are
+    bound at import and a test cannot replace them after the fact.
+
+    Tests that mean to exercise a lookup hand their own stub in (every function
+    in ``app.tagger`` and ``app.album_tagger`` takes one), or patch these same
+    attributes over this fixture.
+    """
+    import musicbrainzngs
+
+    import app.album_tagger as album_tagger_module
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(
+            "a test tried to reach MusicBrainz or the Cover Art Archive; "
+            "pass a stub search/fetch instead"
+        )
+
+    with (
+        patch.object(musicbrainzngs, "search_recordings", side_effect=refuse),
+        patch.object(musicbrainzngs, "get_release_by_id", side_effect=refuse),
+        patch.object(album_tagger_module.httpx, "Client", side_effect=refuse),
+    ):
+        yield

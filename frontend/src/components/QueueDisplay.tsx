@@ -95,6 +95,24 @@ function ProgressBar({ progress }: { progress: number }) {
   );
 }
 
+/**
+ * The "3 of 12" a job that counts whole items shows instead of a percent bar.
+ *
+ * An album tagging run knows how many tracks it has written but nothing about
+ * how far through the current one it is, so a bar would be a guess. `queued`
+ * shows "0 of 12" honestly rather than hiding the size of the run.
+ */
+function CountProgress({ done, total }: { done: number; total: number }) {
+  return (
+    <span className="text-xs tabular-nums text-muted-foreground">
+      {`${done} of ${total}`}
+    </span>
+  );
+}
+
+/** What a tagging row calls itself, in place of a download's duration. */
+const TAGGING_LABEL = "Updating metadata";
+
 function JobItem({
   job,
   cancelPending,
@@ -108,9 +126,13 @@ function JobItem({
   onCancel: (id: string) => void;
   onDismiss: (id: string) => void;
 }) {
+  const tagging = job.kind === "tagging";
   // Progress is only meaningful while downloading; the converting phase
   // (ffmpeg encode) reports nothing, so it shows a spinning badge instead.
-  const showProgress = job.status === "downloading";
+  // A tagging job has no bytes at all — it counts tracks, and only an album
+  // run has more than one to count.
+  const showProgress = !tagging && job.status === "downloading";
+  const total = job.progress_total ?? null;
   const canCancel = CANCELLABLE_STATUSES.has(job.status);
   // The backend ends a download whose target file already exists as an error,
   // but nothing went wrong and retrying would fail the same way — so it reads
@@ -128,6 +150,10 @@ function JobItem({
             className="size-full object-cover"
             loading="lazy"
           />
+        ) : tagging ? (
+          // A tagging run has no thumbnail to fetch: the file is already in the
+          // library, so the row is identified by its icon and its label.
+          <Tags className="size-6 text-muted-foreground" />
         ) : (
           <Music className="size-6 text-muted-foreground" />
         )}
@@ -142,7 +168,7 @@ function JobItem({
               {job.title ?? "Loading metadata..."}
             </p>
             <p className="text-xs text-muted-foreground">
-              {formatDuration(job.duration)}
+              {tagging ? TAGGING_LABEL : formatDuration(job.duration)}
               {job.artist && ` \u00B7 ${job.artist}`}
               {job.album && ` \u00B7 ${job.album}`}
             </p>
@@ -160,8 +186,8 @@ function JobItem({
               <Button
                 variant="ghost"
                 size="icon-xs"
-                aria-label="Cancel download"
-                title="Cancel download"
+                aria-label={tagging ? "Cancel metadata update" : "Cancel download"}
+                title={tagging ? "Cancel metadata update" : "Cancel download"}
                 disabled={cancelPending}
                 onClick={() => onCancel(job.id)}
               >
@@ -171,8 +197,21 @@ function JobItem({
           </div>
         </div>
 
-        {/* Progress bar */}
+        {/* Progress bar, or the N of M an album tagging run counts instead. */}
         {showProgress && <ProgressBar progress={job.progress} />}
+        {!showProgress && total !== null && (
+          <CountProgress done={job.progress_done ?? 0} total={total} />
+        )}
+
+        {/*
+          The note a job that finished anyway carries — "tags not fixed: ..."
+          on a download, "partial: 9 of 12" on an album tagging run. Muted, not
+          destructive: nothing failed. Most `done` rows leave the view before
+          it can be read, but an errored row that carries one keeps it visible.
+        */}
+        {job.detail != null && job.detail !== "" && (
+          <p className="truncate text-xs text-muted-foreground">{job.detail}</p>
+        )}
 
         {/*
           The message shows whenever the job carries one, not just in the error

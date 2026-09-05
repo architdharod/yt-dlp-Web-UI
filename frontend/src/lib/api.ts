@@ -7,6 +7,7 @@ import type {
   LibraryMoveRequest,
   LibraryMoveResponse,
   LibraryResponse,
+  LibraryTagRequest,
   Notice,
   SSEEvent,
   TrashEmptyResponse,
@@ -357,6 +358,21 @@ export async function deleteLibraryPath(
   request: LibraryDeleteRequest,
 ): Promise<LibraryDeleteResponse> {
   return postLibraryJson<LibraryDeleteResponse>("/library/delete", request);
+}
+
+/**
+ * Queue a metadata update for one track or album folder.
+ *
+ * Non-destructive and asynchronous: the backend answers with the `tagging` Job
+ * it created and the work happens on the single tagging worker, so the caller's
+ * only job is to put the row in the queue. A 409 throws a
+ * `LibraryMoveConflict` — the same shape every other library refusal uses —
+ * when the path is already being tagged or a download is aiming at it.
+ */
+export async function tagLibraryPath(
+  request: LibraryTagRequest,
+): Promise<Job> {
+  return postLibraryJson<Job>("/library/tag", request);
 }
 
 /** Everything currently in `.trash`, newest first. */

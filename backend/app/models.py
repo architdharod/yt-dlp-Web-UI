@@ -59,10 +59,15 @@ class JobStatus(str, Enum):
     ``CANCELLED`` is live: ``POST /queue/{id}/cancel`` (phase 2) ends a queued
     or running job there.  ``TAGGING`` is live too (phase 8): a download enters
     it once its FLAC is in the library, having *released its download slot*,
-    and waits there for the single tagging worker.  A job in ``tagging``
+    and waits there for the single tagging worker.  A *download* in ``tagging``
     therefore always has a finished file behind it, which is why a cancel from
     there ends in ``done`` (with a "tags not fixed" detail) rather than in
     ``cancelled`` -- the track exists and the user should be told so.
+
+    A manual tagging job (``JobKind.TAGGING``, phase 9) shares the status and
+    not that ending: it downloaded nothing, so a cancel really did stop the
+    only thing it was doing and it ends in ``cancelled``, and a lookup that
+    could not happen ends it in ``error`` rather than in ``done`` with a note.
     """
 
     QUEUED = "queued"
@@ -77,10 +82,12 @@ class JobStatus(str, Enum):
 class JobKind(str, Enum):
     """What a queue entry actually does.
 
-    ``DOWNLOAD`` is the only kind produced today.  ``BULK`` (a parent that
-    aggregates child downloads) and ``TAGGING`` (a metadata fix run on the
-    single tagging worker) arrive in later phases; the column exists now so no
-    migration is needed then.
+    ``DOWNLOAD`` is a URL fetched into the library; ``TAGGING`` (phase 9) is a
+    metadata fix the user asked for on a track or an album that is already
+    there, run on the single tagging worker with no download slot and no URL.
+    ``BULK`` -- a parent that aggregates child downloads -- arrives in a later
+    phase; the column has held all three from the first migration so none of
+    them needs one of its own.
     """
 
     DOWNLOAD = "download"
@@ -104,9 +111,10 @@ class DownloadRequest(BaseModel):
 class Job(BaseModel):
     """Represents a queue entry with its current state and metadata.
 
-    Every field except ``progress`` is persisted by
-    :class:`~app.job_store.JobStore`; progress is memory-only because an
-    interrupted job re-runs from zero after a restart.
+    Every field except ``progress``, ``progress_done`` and ``progress_total``
+    is persisted by :class:`~app.job_store.JobStore`; the three progress fields
+    are memory-only because an interrupted job re-runs from zero after a
+    restart.
     """
 
     id: str = Field(..., description="Unique job identifier")
@@ -116,6 +124,24 @@ class Job(BaseModel):
     thumbnail_url: str | None = Field(None, description="Thumbnail URL from source CDN")
     duration: float | None = Field(None, description="Track duration in seconds")
     progress: float = Field(default=0.0, ge=0.0, le=100.0, description="Download progress percentage")
+    progress_done: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Units of this job's work already finished -- the N of a tagging "
+            "job's 'N of M'.  Memory-only, like ``progress``: a restarted job "
+            "re-runs its whole pass, so a stored count would be a lie."
+        ),
+    )
+    progress_total: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Units of work this job has in total -- the M of 'N of M', which "
+            "for an album pass is every track in the folder, non-FLAC ones "
+            "included.  Memory-only; see ``progress_done``."
+        ),
+    )
     error: str | None = Field(None, description="Error message if job failed")
     detail: str | None = Field(
         None,
@@ -422,6 +448,33 @@ class LibraryMoveResponse(BaseModel):
     destination: str | None = Field(
         default=None,
         description="Where the moved album or artist now lives, relative POSIX",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tagging
+# ---------------------------------------------------------------------------
+
+
+class LibraryTagRequest(BaseModel):
+    """Schema for POST /library/tag.
+
+    ``path`` names an album folder (depth 2) or a single track -- one inside an
+    album, or a loose Single directly under an artist.  An artist folder is
+    refused: the metadata ticket defines a per-track and a per-album trigger
+    and deliberately no per-artist one, so a whole-artist run would be a
+    button nobody asked for and a queue nobody can follow.
+
+    The path travels in the body rather than in a URL segment, like every other
+    library path in this API (domain model), so a folder called ``AC/DC`` needs
+    no encoding scheme of its own.
+    """
+
+    path: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_PATH_LENGTH,
+        description="The album folder or track to re-tag, relative to DOWNLOAD_PATH",
     )
 
 

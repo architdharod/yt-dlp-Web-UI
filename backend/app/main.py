@@ -7,6 +7,7 @@ Defines all API routes:
   - GET  /library/cover  -- cover art for one album
   - POST /library/move   -- move tracks or an album, or rename an artist
   - POST /library/delete -- move a track, an album, or an artist to the trash
+  - POST /library/tag    -- queue a MusicBrainz tag fix for a track or an album
   - GET  /library/trash  -- what is in the trash
   - POST /library/trash/restore -- put one trash entry back
   - POST /library/trash/empty   -- delete the trash permanently
@@ -40,18 +41,29 @@ from app.library import (
     get_album_cover,
     get_download_path,
     invalidate as library_invalidate,
+    read_track_title,
     scan_library,
+    validate_library_path,
 )
-from app.library_ops import PartialRenameError
+from app.library_ops import (
+    PartialRenameError,
+    check_in_flight,
+    check_not_being_tagged,
+    check_resolved,
+    is_audio,
+    is_reserved,
+)
 from app.mover import LIBRARY_WRITE_LOCK, LibraryConflict, move_library_entry
 from app.models import (
     DownloadRequest,
     HealthResponse,
     Job,
+    JobKind,
     LibraryDeleteRequest,
     LibraryDeleteResponse,
     LibraryMoveRequest,
     LibraryMoveResponse,
+    LibraryTagRequest,
     LibraryResponse,
     MovedPath,
     Notice,
@@ -83,6 +95,8 @@ from app.queue_manager import (
     JobNotFound,
     QueueError,
     QueueManager,
+    TaggingConflict,
+    tagging_conflict_message,
 )
 from app.tagger import musicbrainz_contact, tag_fix_enabled
 
@@ -579,13 +593,26 @@ async def retry_job(job_id: str) -> Job:
 
     Only errored jobs can be retried; a cancelled job is resubmitted as a new
     download rather than revived, so that its duplicate check runs again.
+
+    Taken under ``LIBRARY_WRITE_LOCK``, whatever the job's kind.  A retry is a
+    second submission of the same request against a library that has moved on,
+    and both kinds write into it: a tagging job re-checks the tag route's
+    guards inside the lock (409 when the path is busy), and a download re-enters
+    the queue that a move's in-flight check has already been taken against.
+    ``retry_job`` is synchronous and awaits nothing, so holding the lock across
+    it costs microseconds and cannot deadlock.
     """
-    try:
-        job = queue_manager.retry_job(job_id)
-    except JobNotFound as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except QueueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    async with LIBRARY_WRITE_LOCK:
+        try:
+            job = queue_manager.retry_job(job_id)
+        except JobNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TaggingConflict as exc:
+            # A plain string: the frontend's retry error line only unwraps
+            # one, and a dict would surface as a bare "Retry failed".
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except QueueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     return job
 
 
@@ -750,6 +777,7 @@ async def move_library_path(request: LibraryMoveRequest) -> LibraryMoveResponse:
                 in_flight=in_flight.targets,
                 unresolved=in_flight.unresolved,
                 unresolved_jobs=in_flight.unresolved_jobs,
+                tagging=in_flight.tagging_paths,
             )
         except LibraryPathError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -849,6 +877,7 @@ async def delete_library_path(request: LibraryDeleteRequest) -> LibraryDeleteRes
                 in_flight=in_flight.targets,
                 unresolved=in_flight.unresolved,
                 unresolved_jobs=in_flight.unresolved_jobs,
+                tagging=in_flight.tagging_paths,
             )
         except PartialRenameError as exc:
             # Not all-or-nothing after all: some files really did move, so the
@@ -871,6 +900,152 @@ async def delete_library_path(request: LibraryDeleteRequest) -> LibraryDeleteRes
         entry=TrashEntry.model_validate(vars(outcome.entry)),
         removed=outcome.removed,
     )
+
+
+@app.post("/library/tag", response_model=Job)
+async def tag_library_path(request: LibraryTagRequest) -> Job:
+    """Queue a MusicBrainz tag fix for one track or one album folder.
+
+    The two triggers the metadata ticket defines, and no others: a track row
+    and an album header.  An artist folder, a disc subfolder, the library root
+    and anything under ``.trash`` are refused with 400 -- there is deliberately
+    no per-artist or whole-library run, because neither has a queue row a user
+    could follow or cancel.
+
+    A *file* is accepted at any depth below its artist, because a disc
+    subfolder is not a level of the library the domain model has: its tracks
+    are the Album's, so ``Artist/Album/Disc 2/x.flac`` is tagged as a track of
+    ``Album``, which is what the album pass over that folder already does to
+    it.  Only a file directly at the root is refused, having no artist.
+
+    The work itself happens on the queue's single tagging worker, so this
+    returns the moment the job is queued, exactly as ``POST /download`` does.
+    The job then appears in ``GET /queue`` and on the SSE stream, carrying
+    ``progress_done``/``progress_total`` for an album's N of M, and can be
+    cancelled while it runs, retried when it fails and dismissed afterwards.
+
+    409 for the two collisions worth waiting out: another tagging job already
+    working on this path (or on one that contains it), and a download about to
+    file into the folder -- writing tags in a folder a download is landing in
+    would have the pass counting a track that is not there yet.
+    """
+    # Resolved, as every other library write resolves it: ``is_reserved``
+    # compares against ``root/.trash``, and an unresolved root under a
+    # symlinked DOWNLOAD_PATH makes every real path look like it is not under
+    # the library at all.
+    root = get_download_path().resolve()
+    try:
+        target = validate_library_path(request.path, root)
+    except LibraryPathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if is_reserved(target, root):
+        raise HTTPException(
+            status_code=400, detail="the trash is not part of the library"
+        )
+    # Everything that reads the tree, and every guard taken against it, under
+    # the library write lock: a move already running in ``asyncio.to_thread``
+    # holds this lock, and a read taken outside it could see a folder the move
+    # (or a delete) is halfway through renaming away -- answering 200 and
+    # queuing a pass over a path that is gone by the time it runs.  Only
+    # ``validate_library_path`` above stays outside, because it resolves a
+    # string and touches nothing the lock protects.
+    async with LIBRARY_WRITE_LOCK:
+        if not await asyncio.to_thread(target.exists):
+            raise HTTPException(status_code=404, detail="no such track or album")
+
+        segments = request.path.split("/")
+        is_folder = await asyncio.to_thread(target.is_dir)
+        if is_folder:
+            if len(segments) != 2:
+                # Depth 1 is an artist, depth 3+ is a disc subfolder inside an
+                # album; the album folder is the only one with a button.
+                raise HTTPException(
+                    status_code=400,
+                    detail="only an album folder or a single track can be tagged",
+                )
+            artist, album = segments[0], segments[1]
+            title = album
+            guarded = request.path
+        else:
+            if len(segments) < 2:
+                # A file at the library root belongs to no artist, and the
+                # artist is the one thing a track lookup cannot do without.
+                raise HTTPException(
+                    status_code=400,
+                    detail="only an album folder or a single track can be tagged",
+                )
+            if not is_audio(target):
+                raise HTTPException(status_code=400, detail="that file is not audio")
+            artist = segments[0]
+            # A loose Single has no album folder, and never gets an ALBUM tag.
+            # Anything deeper is a disc subfolder, which the domain model
+            # flattens into its Album: the album at ``segments[1]`` is the
+            # album for ``Artist/Album/Disc 2/x.flac`` exactly as it is for
+            # ``Artist/Album/x.flac``, and the album pass already tags such a
+            # file as part of the album folder above it.
+            album = segments[1] if len(segments) >= 3 else None
+            title = await asyncio.to_thread(read_track_title, target)
+            # The folder the file sits in -- the disc folder for a nested file,
+            # not the album folder -- because that is the folder a download
+            # could file into underneath the pass.  This must stay the same
+            # answer as ``tagging_guarded_folder``, which a retry derives from
+            # the stored path with ``rpartition``: route and retry guard the
+            # same folder or a retry could slip past a collision the first
+            # attempt was held for.
+            guarded = "/".join(segments[:-1])
+
+        job = Job(
+            id=str(uuid.uuid4()),
+            # A tagging job has no source URL -- it is about a file that is
+            # already in the library.  Empty rather than null because every
+            # reader of a Job (and the duplicate check downloads use) expects
+            # a string.
+            url="",
+            kind=JobKind.TAGGING,
+            path=request.path,
+            title=title,
+            artist=artist,
+            album=album,
+        )
+
+        # Read on the event-loop thread, where the queue's dicts are only ever
+        # mutated; the same reasoning as the move and delete routes.
+        in_flight = queue_manager.in_flight_library_targets()
+        # Before the download guard, so the answer names the right collision:
+        # tagging the same folder twice is what the user actually did.
+        conflict = queue_manager.find_tagging_conflict(request.path)
+        if conflict is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": tagging_conflict_message(conflict),
+                    "conflicts": [request.path],
+                },
+            )
+        try:
+            check_in_flight([guarded], in_flight.targets)
+            # A download that has not said where it is going could be about
+            # to land in this very folder, and no guard can name it.
+            # ``unresolved`` is narrow on purpose -- only a job whose metadata
+            # probe failed *and* that the user typed no artist for, so its
+            # ``Unknown Artist`` target is a guess rather than a destination --
+            # so this is not "any download with an open probe".
+            check_resolved(in_flight.unresolved, in_flight.unresolved_jobs)
+        except LibraryConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": exc.message, "conflicts": exc.conflicts},
+            ) from exc
+
+        try:
+            queue_manager.add_tagging_job(job)
+        except QueueError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"message": str(exc), "conflicts": [request.path]},
+            ) from exc
+    return job
 
 
 @app.get("/library/trash", response_model=TrashListResponse)
@@ -911,6 +1086,7 @@ async def restore_library_trash(request: TrashRestoreRequest) -> TrashRestoreRes
                 in_flight=in_flight.targets,
                 unresolved=in_flight.unresolved,
                 unresolved_jobs=in_flight.unresolved_jobs,
+                tagging=in_flight.tagging_paths,
             )
         except PartialRenameError as exc:
             # Not all-or-nothing after all: some files really did move, so the

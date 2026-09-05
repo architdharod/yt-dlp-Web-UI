@@ -26,6 +26,10 @@ export interface TrackListActions {
   onMoveSelected?: () => void;
   /** Trash one track, from its own row action. */
   onDelete?: (track: LibraryTrack) => void;
+  /** Queue a metadata update for one track, from its own row action. */
+  onTag?: (track: LibraryTrack) => void;
+  /** Paths whose metadata update request is still out. */
+  tagPending?: ReadonlySet<string>;
   /** Trash everything currently ticked. */
   onDeleteSelected?: () => void;
 }
@@ -46,7 +50,7 @@ function TrackRow({
   onHighlightMount: (node: HTMLDivElement | null) => void;
   actions: TrackListActions;
 }) {
-  const { selected, onSelect, onMove, onDelete } = actions;
+  const { selected, onSelect, onMove, onDelete, onTag, tagPending } = actions;
 
   return (
     <div
@@ -84,6 +88,22 @@ function TrackRow({
       <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
         {formatDuration(track.duration)}
       </span>
+      {onTag !== undefined && (
+        // No confirmation: a metadata update rewrites two tags in a file that
+        // is already in the library, and the row it queues is undoable with
+        // Cancel. The accessible name names the track, so a list of them does
+        // not read as a column of identical buttons.
+        <Button
+          variant="ghost"
+          size="xs"
+          aria-label={`Update metadata for ${track.title}`}
+          disabled={tagPending?.has(track.path) ?? false}
+          className="opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100"
+          onClick={() => onTag(track)}
+        >
+          Update metadata
+        </Button>
+      )}
       {onMove !== undefined && (
         // Always in the DOM, only visible on hover or keyboard focus: an action
         // that appears on hover alone is unreachable from a keyboard.

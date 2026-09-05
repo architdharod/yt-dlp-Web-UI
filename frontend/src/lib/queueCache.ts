@@ -125,9 +125,30 @@ export function reconcileQueueSnapshot(
 }
 
 /**
+ * Read a snapshot field that is a number or an explicit null.
+ *
+ * `undefined` (the field absent) leaves the job's current value alone, but an
+ * explicit `null` is a value: a tagging job that could not count its tracks
+ * sends `progress_total: null`, and treating that as "absent" would leave a
+ * stale "3 of 12" on the row.
+ */
+function numberOrNull(
+  value: unknown,
+  current: number | null | undefined,
+): number | null | undefined {
+  if (typeof value === "number") return value;
+  if (value === null) return null;
+  return current;
+}
+
+/**
  * Merge the job snapshot fields carried by every SSE event into a job.
- * The backend sends status/progress/title/thumbnail_url/duration/artist/album
- * (and error when set) on every event type, so any event can refresh them.
+ *
+ * The backend's `_emit_event` sends status, progress, title, thumbnail_url,
+ * duration, artist and album on every event type, plus the N-of-M counters,
+ * and error/detail when they are set. `kind` and `path` are *not* in that
+ * snapshot — they never change over a job's life anyway, so the cached row
+ * keeps whatever `GET /queue` (or the creating response) gave it.
  */
 export function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
   const merged = { ...job };
@@ -152,6 +173,15 @@ export function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
   }
   if (typeof data.album === "string") {
     merged.album = data.album;
+  }
+  if (data.progress_done !== undefined) {
+    merged.progress_done = numberOrNull(data.progress_done, job.progress_done);
+  }
+  if (data.progress_total !== undefined) {
+    merged.progress_total = numberOrNull(
+      data.progress_total,
+      job.progress_total,
+    );
   }
   if (typeof data.error === "string") {
     merged.error = data.error;
@@ -353,6 +383,11 @@ export function applyQueueEvent(
     } else if (event.event === "status_change" && job.status !== "error") {
       // Clear the error when the job transitions away from the error state.
       job.error = null;
+      // Back to `queued` is a retry: the note from the previous run ("tags not
+      // fixed: no match") describes an attempt that is over, and no event
+      // clears it otherwise, so a client that did not press Retry would keep
+      // showing it for the whole new run.
+      if (job.status === "queued") job.detail = null;
     }
 
     if (TERMINAL_HIDDEN_STATUSES.has(job.status)) {

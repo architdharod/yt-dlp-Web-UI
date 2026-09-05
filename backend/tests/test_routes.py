@@ -16,15 +16,19 @@ import os
 import sqlite3
 import threading
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.downloader import DownloadError, TrackMetadata
 from app.job_store import SCHEMA_VERSION, JobStore
-from app.models import Job, JobStatus, SSEEvent
+from app.models import Job, JobKind, JobStatus, SSEEvent
 from app.queue_manager import QueueManager
+
+from mutagen.flac import FLAC
+
+from tests.conftest import minimal_flac_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -1464,6 +1468,143 @@ class TestCancelEndpoint:
         assert resp.status_code == 400
 
 
+
+class TestRetryGuardsTheLibrary:
+    """A retry is a second submission, and the library has moved on since."""
+
+    def _errored_tagging_job(self, path: str, job_id: str = "tag-1") -> Job:
+        return _make_job(
+            id=job_id,
+            url="",
+            kind=JobKind.TAGGING,
+            status=JobStatus.ERROR,
+            path=path,
+            error="tags not fixed: MusicBrainz unavailable",
+            detail="tags not fixed: MusicBrainz unavailable",
+        )
+
+    def test_an_overlapping_tagging_job_makes_it_a_409(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["tag-1"] = self._errored_tagging_job("Bonobo/Migration")
+        qm._jobs["tag-2"] = _make_job(
+            id="tag-2",
+            url="",
+            kind=JobKind.TAGGING,
+            status=JobStatus.TAGGING,
+            path="Bonobo/Migration/01 Kerala.flac",
+        )
+
+        resp = client.post("/queue/tag-1/retry")
+
+        assert resp.status_code == 409
+        # A plain string, which is the only shape the retry error line unwraps.
+        detail = resp.json()["detail"]
+        assert isinstance(detail, str) and "already being tagged" in detail
+
+    def test_a_refused_retry_leaves_the_row_exactly_as_it_was(self, client_and_qm):
+        client, qm = client_and_qm
+        job = self._errored_tagging_job("Bonobo/Migration")
+        qm._jobs["tag-1"] = job
+        qm._jobs["tag-2"] = _make_job(
+            id="tag-2",
+            url="",
+            kind=JobKind.TAGGING,
+            status=JobStatus.TAGGING,
+            path="Bonobo/Migration",
+        )
+
+        assert client.post("/queue/tag-1/retry").status_code == 409
+
+        assert job.status is JobStatus.ERROR
+        assert job.detail == "tags not fixed: MusicBrainz unavailable"
+        assert job.attempts == 0
+
+    def test_a_download_aiming_into_the_folder_makes_it_a_409(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["tag-1"] = self._errored_tagging_job("Bonobo/Migration/01 Kerala.flac")
+        qm._jobs["dl"] = _make_job(
+            id="dl", status=JobStatus.DOWNLOADING, target_dir="Bonobo/Migration"
+        )
+
+        resp = client.post("/queue/tag-1/retry")
+
+        assert resp.status_code == 409
+        assert "a download is in progress" in resp.json()["detail"]
+
+    def test_a_download_with_no_destination_yet_makes_it_a_409(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["tag-1"] = self._errored_tagging_job("Bonobo/Migration")
+        qm._jobs["dl"] = _make_job(id="dl", status=JobStatus.QUEUED, target_dir=None)
+
+        resp = client.post("/queue/tag-1/retry")
+
+        assert resp.status_code == 409
+        assert "has not resolved its destination" in resp.json()["detail"]
+
+    def test_an_unrelated_tagging_job_does_not_block_it(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["tag-1"] = self._errored_tagging_job("Bonobo/Migration")
+        qm._jobs["tag-2"] = _make_job(
+            id="tag-2",
+            url="",
+            kind=JobKind.TAGGING,
+            status=JobStatus.TAGGING,
+            path="Bonobo/Black Sands",
+        )
+
+        with patch("app.queue_manager.QueueManager._dispatch_tagging_job"):
+            resp = client.post("/queue/tag-1/retry")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "queued"
+
+    @patch("app.queue_manager.download_audio")
+    @patch("app.main.extract_metadata")
+    def test_a_download_retry_still_works(
+        self, mock_extract, mock_download, client_and_qm
+    ):
+        """The guards are the tagging kind's; a download retry is untouched."""
+        client, qm = client_and_qm
+        qm._jobs["job-1"] = _make_job(status=JobStatus.ERROR, error="boom")
+        qm._jobs["tag-2"] = _make_job(
+            id="tag-2",
+            url="",
+            kind=JobKind.TAGGING,
+            status=JobStatus.TAGGING,
+            path="Bonobo/Migration",
+        )
+
+        with patch("app.queue_manager.QueueManager._dispatch"):
+            resp = client.post("/queue/job-1/retry")
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "queued"
+
+    async def test_a_retry_waits_for_a_move_that_is_already_running(self):
+        """The lock, not the guard: a move holding it must finish first."""
+        import app.main as main_module
+        from app.mover import LIBRARY_WRITE_LOCK
+
+        qm = QueueManager(max_concurrent=1, timeout=10)
+        original = main_module.queue_manager
+        main_module.queue_manager = qm
+        qm._jobs["tag-1"] = self._errored_tagging_job("Bonobo/Migration")
+
+        try:
+            with patch("app.queue_manager.QueueManager._dispatch_tagging_job"):
+                async with LIBRARY_WRITE_LOCK:
+                    waiting = asyncio.create_task(main_module.retry_job("tag-1"))
+                    await asyncio.sleep(0.05)
+                    assert not waiting.done()
+                    assert qm.get_job("tag-1").status is JobStatus.ERROR
+                job = await asyncio.wait_for(waiting, timeout=2)
+
+            assert job.status is JobStatus.QUEUED
+        finally:
+            main_module.queue_manager = original
+            qm.close()
+
+
 # ===========================================================================
 # POST /queue/{id}/dismiss
 # ===========================================================================
@@ -1618,3 +1759,310 @@ class TestTaggingOverTheApi:
             main_module._loop = original_loop
             async with main_module._sse_clients_lock:
                 main_module._sse_clients.remove(q)
+
+
+# ===========================================================================
+# POST /library/tag (phase 9)
+# ===========================================================================
+
+
+def _library_track(download_dir, relative: str, *, title: str = "Kerala") -> str:
+    """Write a real FLAC at *relative* under the library root and return it."""
+    path = download_dir / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(minimal_flac_bytes(44100 * 183))
+    audio = FLAC(path)
+    audio["TITLE"] = title
+    audio.save()
+    return relative
+
+
+@pytest.fixture()
+def no_real_lookup():
+    """Never let a route test reach MusicBrainz.
+
+    ``POST /library/tag`` starts the job before it answers, so a test that only
+    checked the response body would otherwise run a real lookup against the
+    real service.
+    """
+    with patch("app.queue_manager.fix_track") as mock_fix:
+        from app.tagger import TagFixResult
+
+        mock_fix.return_value = TagFixResult(matched=True, changed=False)
+        yield mock_fix
+
+
+class TestTagEndpoint:
+    """The Library tab's two 'Update metadata' actions, as an API."""
+
+    def test_a_track_is_accepted_and_queued(
+        self, client_and_qm, isolated_paths, no_real_lookup
+    ):
+        client, qm = client_and_qm
+        download_dir, _ = isolated_paths
+        path = _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+
+        resp = client.post("/library/tag", json={"path": path})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kind"] == "tagging"
+        assert body["status"] in ("queued", "tagging", "done")
+        assert body["path"] == path
+        assert body["title"] == "Kerala"
+        assert body["artist"] == "Bonobo" and body["album"] == "Migration"
+        assert body["url"] == ""
+
+    def test_a_track_with_no_title_tag_is_named_after_its_file(
+        self, client, isolated_paths, no_real_lookup
+    ):
+        download_dir, _ = isolated_paths
+        path = download_dir / "Bonobo" / "Migration" / "Untitled.flac"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(minimal_flac_bytes(44100 * 183))
+
+        resp = client.post(
+            "/library/tag", json={"path": "Bonobo/Migration/Untitled.flac"}
+        )
+
+        assert resp.json()["title"] == "Untitled"
+
+    def test_an_album_folder_is_accepted(self, client, isolated_paths, no_real_lookup):
+        download_dir, _ = isolated_paths
+        _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+
+        resp = client.post("/library/tag", json={"path": "Bonobo/Migration"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["title"] == "Migration" and body["album"] == "Migration"
+
+    def test_a_loose_single_is_accepted_with_no_album(
+        self, client, isolated_paths, no_real_lookup
+    ):
+        download_dir, _ = isolated_paths
+        _library_track(download_dir, "Bonobo/Kerala.flac")
+
+        resp = client.post("/library/tag", json={"path": "Bonobo/Kerala.flac"})
+
+        assert resp.status_code == 200
+        assert resp.json()["album"] is None
+
+    def test_a_track_in_a_disc_subfolder_is_accepted_as_the_albums(
+        self, client, isolated_paths, no_real_lookup
+    ):
+        """A disc subfolder is not a level of the library the domain model
+        has: its tracks are the Album's, and the album pass over ``Migration``
+        already tags this file.  The row's own button must reach it too."""
+        download_dir, _ = isolated_paths
+        path = _library_track(
+            download_dir, "Bonobo/Migration/Disc 2/01 Kerala.flac", title="Kerala"
+        )
+
+        resp = client.post("/library/tag", json={"path": path})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["kind"] == "tagging" and body["path"] == path
+        assert body["artist"] == "Bonobo" and body["album"] == "Migration"
+        assert body["title"] == "Kerala"
+
+    def test_an_artist_folder_is_refused(self, client, isolated_paths):
+        download_dir, _ = isolated_paths
+        _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+
+        resp = client.post("/library/tag", json={"path": "Bonobo"})
+
+        assert resp.status_code == 400
+        assert "album folder or a single track" in resp.json()["detail"]
+
+    def test_a_disc_subfolder_is_refused(self, client, isolated_paths):
+        download_dir, _ = isolated_paths
+        _library_track(download_dir, "Bonobo/Migration/Disc 1/01 Kerala.flac")
+
+        resp = client.post("/library/tag", json={"path": "Bonobo/Migration/Disc 1"})
+
+        assert resp.status_code == 400
+
+    def test_the_root_is_refused(self, client):
+        assert client.post("/library/tag", json={"path": ""}).status_code == 422
+
+    def test_the_trash_is_refused(self, client, isolated_paths):
+        download_dir, _ = isolated_paths
+        _library_track(download_dir, ".trash/20260101/Bonobo/Migration/x.flac")
+
+        resp = client.post("/library/tag", json={"path": ".trash/20260101"})
+
+        assert resp.status_code == 400
+        assert "trash" in resp.json()["detail"]
+
+    @pytest.mark.parametrize(
+        "path", ["../etc", "Bonobo/../../etc", "Bonobo\\Migration", "Bonobo//x.flac"]
+    )
+    def test_a_malformed_path_is_refused(self, client, path):
+        assert client.post("/library/tag", json={"path": path}).status_code == 400
+
+    def test_a_path_that_is_not_there_is_a_404(self, client):
+        resp = client.post("/library/tag", json={"path": "Bonobo/Migration"})
+
+        assert resp.status_code == 404
+
+    def test_a_file_that_is_not_audio_is_refused(self, client, isolated_paths):
+        download_dir, _ = isolated_paths
+        notes = download_dir / "Bonobo" / "Migration" / "notes.txt"
+        notes.parent.mkdir(parents=True)
+        notes.write_text("hello")
+
+        resp = client.post(
+            "/library/tag", json={"path": "Bonobo/Migration/notes.txt"}
+        )
+
+        assert resp.status_code == 400
+        assert "not audio" in resp.json()["detail"]
+
+    def test_a_second_job_for_the_same_path_is_a_409(
+        self, client_and_qm, isolated_paths
+    ):
+        client, qm = client_and_qm
+        download_dir, _ = isolated_paths
+        path = _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+        release = threading.Event()
+
+        with patch("app.queue_manager.fix_track") as mock_fix:
+            from app.tagger import TagFixResult
+
+            mock_fix.side_effect = lambda *a, **k: (
+                release.wait(timeout=5),
+                TagFixResult(matched=True),
+            )[1]
+            assert client.post("/library/tag", json={"path": path}).status_code == 200
+
+            resp = client.post("/library/tag", json={"path": path})
+            assert resp.status_code == 409
+            assert "already being tagged" in resp.json()["detail"]["message"]
+            assert resp.json()["detail"]["conflicts"] == [path]
+
+            # And the album that contains it, from the other end.
+            assert (
+                client.post(
+                    "/library/tag", json={"path": "Bonobo/Migration"}
+                ).status_code
+                == 409
+            )
+            release.set()
+
+    def test_a_download_aiming_at_the_folder_is_a_409(
+        self, client_and_qm, isolated_paths
+    ):
+        client, qm = client_and_qm
+        download_dir, _ = isolated_paths
+        path = _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+        qm._jobs["dl"] = _make_job(
+            id="dl", status=JobStatus.DOWNLOADING, target_dir="Bonobo/Migration"
+        )
+
+        resp = client.post("/library/tag", json={"path": path})
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "a download is in progress" in detail["message"]
+        assert detail["conflicts"] == ["Bonobo/Migration"]
+
+    def test_a_download_elsewhere_does_not_block_it(
+        self, client_and_qm, isolated_paths, no_real_lookup
+    ):
+        client, qm = client_and_qm
+        download_dir, _ = isolated_paths
+        path = _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+        qm._jobs["dl"] = _make_job(
+            id="dl", status=JobStatus.DOWNLOADING, target_dir="Floating Points/Crush"
+        )
+
+        assert client.post("/library/tag", json={"path": path}).status_code == 200
+
+    def test_a_download_with_no_destination_yet_is_a_409(
+        self, client_and_qm, isolated_paths
+    ):
+        """It could be about to land in this very folder; nobody can say."""
+        client, qm = client_and_qm
+        download_dir, _ = isolated_paths
+        path = _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+        qm._jobs["dl"] = _make_job(
+            id="dl", status=JobStatus.DOWNLOADING, target_dir=None, title="A Download"
+        )
+
+        resp = client.post("/library/tag", json={"path": path})
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert "has not resolved its destination" in detail["message"]
+        assert detail["conflicts"] == ["A Download"]
+
+    def test_a_symlinked_library_root_still_works(
+        self, client_and_qm, tmp_path, monkeypatch, no_real_lookup
+    ):
+        """`is_reserved` compares against the resolved root, so this must too.
+
+        A DOWNLOAD_PATH that is a symlink (the ordinary shape of a container
+        bind mount) made every real path look like it was outside the library.
+        """
+        real = tmp_path / "real-library"
+        real.mkdir()
+        link = tmp_path / "library-link"
+        link.symlink_to(real, target_is_directory=True)
+        monkeypatch.setenv("DOWNLOAD_PATH", str(link))
+        path = _library_track(real, "Bonobo/Migration/01 Kerala.flac")
+
+        client, _ = client_and_qm
+        resp = client.post("/library/tag", json={"path": path})
+
+        assert resp.status_code == 200, resp.json()
+
+    def test_the_queue_view_carries_the_n_of_m_fields(
+        self, client_and_qm, isolated_paths
+    ):
+        client, qm = client_and_qm
+        qm._jobs["tag-1"] = Job(
+            id="tag-1",
+            url="",
+            kind=JobKind.TAGGING,
+            status=JobStatus.TAGGING,
+            path="Bonobo/Migration",
+            title="Migration",
+            progress_done=7,
+            progress_total=12,
+        )
+
+        [row] = client.get("/queue").json()
+
+        assert row["progress_done"] == 7 and row["progress_total"] == 12
+        assert row["kind"] == "tagging"
+
+    def test_a_finished_run_wakes_the_rescan_hook(
+        self, client_and_qm, isolated_paths
+    ):
+        """`library_changed` is the single announcement the hook listens on,
+        so a manual tag run reaches Navidrome and Lidarr for free."""
+        import app.main as main_module
+
+        client, qm = client_and_qm
+        download_dir, _ = isolated_paths
+        path = _library_track(download_dir, "Bonobo/Migration/01 Kerala.flac")
+
+        hook = MagicMock()
+        original = main_module.rescan_hook
+        main_module.rescan_hook = hook
+        try:
+            with patch("app.queue_manager.fix_track") as mock_fix:
+                from app.tagger import TagFixResult
+
+                mock_fix.return_value = TagFixResult(matched=True, changed=True)
+                client.post("/library/tag", json={"path": path})
+
+                deadline = time.monotonic() + 5
+                while not hook.notify.called and time.monotonic() < deadline:
+                    time.sleep(0.02)
+        finally:
+            main_module.rescan_hook = original
+
+        hook.notify.assert_called_with([path])

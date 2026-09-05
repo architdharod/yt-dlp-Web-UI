@@ -17,9 +17,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mutagen.flac import FLAC
+
+from app import album_tagger
 from app.downloader import DownloadError, FiledTrack, unfile_track
 from app.job_store import JobStore
-from app.models import Job, JobStatus, SSEEvent
+from app.models import Job, JobKind, JobStatus, SSEEvent
 from app.tagger import (
     NOTE_CANCELLED,
     NOTE_FAILED,
@@ -3957,3 +3960,668 @@ class TestActiveRunsBookkeeping:
 
         assert "job-1" in qm._active_runs
         qm.close()
+
+
+# ===========================================================================
+# Manual tagging jobs (phase 9)
+# ===========================================================================
+
+
+def _tagging_job(path: str, **overrides) -> Job:
+    """A queued tagging job for *path*, the way POST /library/tag builds one."""
+    defaults = {
+        "id": "tag-1",
+        "url": "",
+        "kind": JobKind.TAGGING,
+        "status": JobStatus.QUEUED,
+        "path": path,
+        "title": "Kerala",
+        "artist": "Bonobo",
+        "album": "Migration",
+    }
+    defaults.update(overrides)
+    return Job(**defaults)
+
+
+def _album_on_disk(download_dir: Path, *names: str) -> Path:
+    """An album folder holding one empty-but-valid FLAC per name."""
+    folder = download_dir / "Bonobo" / "Migration"
+    folder.mkdir(parents=True, exist_ok=True)
+    for name in names or ("Kerala.flac",):
+        (folder / name).write_bytes(minimal_flac_bytes(44100 * 183))
+    return folder
+
+
+def _release_rows():
+    """The two rows `release_tracks` returns for the release `_lookup` names."""
+    from app.album_tagger import ReleaseTrack
+
+    return [
+        ReleaseTrack(
+            recording_id=f"rec-{position}",
+            title=f"Track {position}",
+            length_ms=183000,
+            artist_credit="Bonobo",
+            artist_names=("Bonobo",),
+            track_number=position,
+            disc_number=1,
+        )
+        for position in (1, 2)
+    ]
+
+
+def _lookup(path: Path, title: str, recording_id: str, release_id: str = "rel-1"):
+    """A matched TrackLookup, as app.album_tagger.lookup_track would return."""
+    from app.album_tagger import TrackLookup
+    from app.tagger import Candidate, ReleaseRef
+
+    return TrackLookup(
+        path=path,
+        candidates=(
+            Candidate(
+                title=title,
+                artist_credit="Bonobo",
+                artist_names=("Bonobo",),
+                length_ms=183000,
+                recording_id=recording_id,
+                releases=(
+                    ReleaseRef(id=release_id, track_count=2, status="Official"),
+                ),
+            ),
+        ),
+    )
+
+
+class TestTrackTaggingJobs:
+    """The row action: one file, the same fix a download runs automatically."""
+
+    @patch("app.queue_manager.fix_track")
+    async def test_it_runs_queued_tagging_done(self, mock_fix, store, isolated_paths):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        statuses = [e.data["status"] for e in events if e.event == "status_change"]
+        assert statuses == ["tagging", "done"]
+        assert qm.get_job("tag-1").detail is None
+        # It got the absolute path and the folder artist, like the automatic fix.
+        args, kwargs = mock_fix.call_args
+        assert args[0] == download_dir / "Bonobo" / "Migration" / "Kerala.flac"
+        assert args[1] == "Bonobo"
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_a_track_in_a_disc_subfolder_runs_the_same_fix(
+        self, mock_fix, store, isolated_paths
+    ):
+        """The route accepts a file at any depth below its artist, so the
+        worker has to run one: the folder artist is still the top segment."""
+        download_dir, _ = isolated_paths
+        folder = download_dir / "Bonobo" / "Migration" / "Disc 2"
+        folder.mkdir(parents=True)
+        (folder / "Kerala.flac").write_bytes(minimal_flac_bytes(44100 * 183))
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Disc 2/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        args, _ = mock_fix.call_args
+        assert args[0] == folder / "Kerala.flac"
+        assert args[1] == "Bonobo"
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_it_reports_no_progress_counts(
+        self, mock_fix, store, isolated_paths
+    ):
+        """One track is one step: "0 of 1" then "1 of 1" says nothing."""
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        assert [e for e in events if e.event == "progress"] == []
+        job = qm.get_job("tag-1")
+        assert job.progress_done is None
+        assert job.progress_total is None
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_no_match_finishes_done_with_the_note(
+        self, mock_fix, store, isolated_paths
+    ):
+        """A recording MusicBrainz does not know is a result, not a failure."""
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(note=NOTE_NO_MATCH)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        assert qm.get_job("tag-1").detail == NOTE_NO_MATCH
+        assert qm.get_job("tag-1").error is None
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_musicbrainz_being_down_ends_in_error(
+        self, mock_fix, store, isolated_paths
+    ):
+        """The ticket's rule: a manual tagging job that could not run fails."""
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(note=NOTE_UNAVAILABLE)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.ERROR)
+
+        assert qm.get_job("tag-1").error == NOTE_UNAVAILABLE
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_an_errored_job_can_be_retried_and_then_succeeds(
+        self, mock_fix, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(note=NOTE_UNAVAILABLE)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.ERROR)
+
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+        qm.retry_job("tag-1")
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        job = qm.get_job("tag-1")
+        assert job.error is None and job.detail is None and job.attempts == 1
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_an_errored_job_can_be_dismissed(
+        self, mock_fix, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(note=NOTE_UNAVAILABLE)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.ERROR)
+
+        qm.dismiss_job("tag-1")
+
+        assert qm.get_job("tag-1") is None
+        qm.close()
+
+    async def test_a_path_that_is_gone_ends_in_error(self, store, isolated_paths):
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Gone.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.ERROR)
+
+        assert qm.get_job("tag-1").error == NOTE_FILE_MISSING
+        qm.close()
+
+    async def test_a_second_job_for_the_same_path_is_refused(
+        self, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        released = threading.Event()
+
+        with patch("app.queue_manager.fix_track") as mock_fix:
+            mock_fix.side_effect = lambda *a, **k: (
+                released.wait(timeout=5),
+                TagFixResult(matched=True),
+            )[1]
+            qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+            qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+            await _wait_for_job_status(qm, "tag-1", JobStatus.TAGGING)
+
+            with pytest.raises(QueueError):
+                qm.add_tagging_job(
+                    _tagging_job("Bonobo/Migration/Kerala.flac", id="tag-2")
+                )
+            # And the album that contains it, from the other end.
+            with pytest.raises(QueueError):
+                qm.add_tagging_job(_tagging_job("Bonobo/Migration", id="tag-3"))
+
+            released.set()
+            await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+            qm.close()
+
+    async def test_an_unrelated_path_is_allowed_alongside(self, store, isolated_paths):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm._jobs["tag-1"] = _tagging_job(
+            "Bonobo/Migration/Kerala.flac", status=JobStatus.TAGGING
+        )
+
+        assert qm.find_tagging_conflict("Bonobo/Black Sands") is None
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_library_changed_fires_after_a_run(
+        self, mock_fix, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        changed = [e for e in events if e.event == "library_changed"]
+        assert [e.data["paths"] for e in changed] == [
+            ["Bonobo/Migration/Kerala.flac"]
+        ]
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_a_run_that_changed_nothing_still_wakes_the_rescan(
+        self, mock_fix, store, isolated_paths
+    ):
+        """The ticket: below the match bar nothing changes, and the rescan
+        still fires -- a manual run has no download event behind it."""
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(note=NOTE_NO_MATCH)
+        events: list[SSEEvent] = []
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=events.append, store=store
+        )
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        assert [e.data["paths"] for e in events if e.event == "library_changed"] == [
+            ["Bonobo/Migration/Kerala.flac"]
+        ]
+        qm.close()
+
+    async def test_a_queued_job_cancelled_before_it_starts_never_runs(
+        self, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+
+        with patch("app.queue_manager.fix_track") as mock_fix:
+            qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+            job = _tagging_job("Bonobo/Migration/Kerala.flac")
+            job.cancel_requested = True
+            qm._jobs[job.id] = job
+            qm._dispatch_tagging_job(job.id)
+            await _wait_for_job_status(qm, "tag-1", JobStatus.CANCELLED)
+
+            mock_fix.assert_not_called()
+            qm.close()
+
+
+class TestAlbumTaggingJobs:
+    """The album header action: every track, one release, N of M progress."""
+
+    async def test_it_reports_n_of_m_and_writes_the_numbers(
+        self, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        folder = _album_on_disk(download_dir, "01 Migration.flac", "02 Kerala.flac")
+        events: list[SSEEvent] = []
+
+        def fake_lookup(path, folder_artist, **kwargs):
+            index = 1 if path.name.startswith("01") else 2
+            return _lookup(path, f"Track {index}", f"rec-{index}")
+
+        with (
+            patch("app.album_tagger.lookup_track", side_effect=fake_lookup),
+            patch(
+                "app.album_tagger.release_tracks",
+                return_value=_release_rows(),
+            ),
+            patch(
+                "app.album_tagger.store_cover",
+                return_value=(folder / "cover.jpg", None),
+            ),
+        ):
+            qm = QueueManager(
+                max_concurrent=1, timeout=10, on_event=events.append, store=store
+            )
+            qm.add_tagging_job(_tagging_job("Bonobo/Migration"))
+            await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+            qm.close()
+
+        assert qm.get_job("tag-1").detail is None
+        counts = [
+            (e.data["progress_done"], e.data["progress_total"])
+            for e in events
+            if e.event == "progress"
+        ]
+        assert counts == [(0, 2), (1, 2), (2, 2)]
+        first = FLAC(folder / "01 Migration.flac")
+        assert first["TITLE"] == ["Track 1"] and first["TRACKNUMBER"] == ["1"]
+
+    async def test_a_partial_album_says_so_and_writes_no_numbers(
+        self, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        folder = _album_on_disk(download_dir, "01 Migration.flac", "02 Kerala.flac")
+
+        def fake_lookup(path, folder_artist, **kwargs):
+            from app.album_tagger import TrackLookup
+
+            if path.name.startswith("01"):
+                return _lookup(path, "Track 1", "rec-1")
+            return TrackLookup(path=path, note=NOTE_NO_MATCH)
+
+        with patch("app.album_tagger.lookup_track", side_effect=fake_lookup):
+            qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+            qm.add_tagging_job(_tagging_job("Bonobo/Migration"))
+            await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+            qm.close()
+
+        assert qm.get_job("tag-1").detail == "partial: 1 of 2"
+        assert "TRACKNUMBER" not in FLAC(folder / "01 Migration.flac")
+        assert not (folder / "cover.jpg").exists()
+
+    async def test_cancelling_mid_album_leaves_the_written_tracks_alone(
+        self, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        folder = _album_on_disk(download_dir, "01 Migration.flac", "02 Kerala.flac")
+        second = folder / "02 Kerala.flac"
+        untouched = second.read_bytes()
+        first_lookup_done = threading.Event()
+        keep_going = threading.Event()
+
+        def fake_lookup(path, folder_artist, **kwargs):
+            index = 1 if path.name.startswith("01") else 2
+            if index == 2:
+                first_lookup_done.set()
+                keep_going.wait(timeout=5)
+            return _lookup(path, f"Track {index}", f"rec-{index}")
+
+        with patch("app.album_tagger.lookup_track", side_effect=fake_lookup):
+            qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+            qm.add_tagging_job(_tagging_job("Bonobo/Migration"))
+            await _wait_for_job_status(qm, "tag-1", JobStatus.TAGGING)
+            await asyncio.to_thread(first_lookup_done.wait, 5)
+
+            qm.cancel_job("tag-1")
+            keep_going.set()
+            await _wait_for_job_status(qm, "tag-1", JobStatus.CANCELLED)
+            qm.close()
+
+        # The pass stopped before its write phase, so nothing was rewritten --
+        # and nothing that had been written would have been undone either.
+        assert second.read_bytes() == untouched
+
+    async def test_a_write_phase_cancel_keeps_the_tracks_already_written(
+        self, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        folder = _album_on_disk(download_dir, "01 Migration.flac", "02 Kerala.flac")
+        second = folder / "02 Kerala.flac"
+        untouched = second.read_bytes()
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+
+        def fake_lookup(path, folder_artist, **kwargs):
+            index = 1 if path.name.startswith("01") else 2
+            return _lookup(path, f"Track {index}", f"rec-{index}")
+
+        real_write = album_tagger.write_track
+
+        def write_then_cancel(path, match, numbers=None):
+            written = real_write(path, match, numbers)
+            # The cancel lands between the first write and the second.
+            qm.get_job("tag-1").cancel_requested = True
+            return written
+
+        with (
+            patch("app.album_tagger.lookup_track", side_effect=fake_lookup),
+            patch("app.album_tagger.write_track", side_effect=write_then_cancel),
+            patch(
+                "app.album_tagger.release_tracks",
+                return_value=_release_rows(),
+            ),
+        ):
+            qm.add_tagging_job(_tagging_job("Bonobo/Migration"))
+            await _wait_for_job_status(qm, "tag-1", JobStatus.CANCELLED)
+            qm.close()
+
+        assert FLAC(folder / "01 Migration.flac")["TITLE"] == ["Track 1"]
+        assert second.read_bytes() == untouched
+        assert not (folder / "cover.jpg").exists()
+
+    async def test_musicbrainz_being_down_fails_the_album_job(
+        self, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir, "01 Migration.flac")
+
+        def fake_lookup(path, folder_artist, **kwargs):
+            from app.album_tagger import TrackLookup
+
+            return TrackLookup(path=path, note=NOTE_UNAVAILABLE)
+
+        with patch("app.album_tagger.lookup_track", side_effect=fake_lookup):
+            qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+            qm.add_tagging_job(_tagging_job("Bonobo/Migration"))
+            await _wait_for_job_status(qm, "tag-1", JobStatus.ERROR)
+            qm.close()
+
+        assert qm.get_job("tag-1").error == NOTE_UNAVAILABLE
+
+    async def test_a_step_that_never_returns_times_the_job_out(
+        self, store, isolated_paths
+    ):
+        """The lookup cannot be interrupted, so the queue bounds the wait and
+        the job fails rather than hanging in `tagging` forever."""
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir, "01 Migration.flac")
+        release = threading.Event()
+
+        def stalled_lookup(path, folder_artist, **kwargs):
+            release.wait(timeout=5)
+            return _lookup(path, "Track 1", "rec-1")
+
+        with patch("app.album_tagger.lookup_track", side_effect=stalled_lookup):
+            qm = QueueManager(
+                max_concurrent=1, timeout=10, store=store, tag_fix_timeout=0
+            )
+            qm.add_tagging_job(_tagging_job("Bonobo/Migration"))
+            await _wait_for_job_status(qm, "tag-1", JobStatus.ERROR)
+            release.set()
+            qm.close()
+
+        assert qm.get_job("tag-1").error == NOTE_TIMED_OUT
+
+
+class TestWaitingForTheTaggingLock:
+    """The lock is this app's whole MusicBrainz rate limit, so a second job
+    can sit behind the first for minutes.  What its row says while it waits,
+    and what a cancel does to it, is the subject here."""
+
+    @patch("app.queue_manager.fix_track")
+    async def test_a_job_waiting_its_turn_still_says_queued(
+        self, mock_fix, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        release = threading.Event()
+        mock_fix.side_effect = lambda *a, **k: (
+            release.wait(timeout=5),
+            TagFixResult(matched=True),
+        )[1]
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.TAGGING)
+        # A second job for a different path, so the tagging-vs-tagging guard
+        # does not refuse it: the only thing in its way is the lock.
+        (download_dir / "Bonobo" / "Migration" / "Kong.flac").write_bytes(
+            minimal_flac_bytes(44100 * 183)
+        )
+        qm.add_tagging_job(
+            _tagging_job("Bonobo/Migration/Kong.flac", id="tag-2")
+        )
+
+        await asyncio.sleep(0.1)
+        assert qm.get_job("tag-2").status == JobStatus.QUEUED
+
+        release.set()
+        await _wait_for_job_status(qm, "tag-2", JobStatus.DONE)
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_cancelling_a_waiting_job_ends_it_without_running_the_pass(
+        self, mock_fix, store, isolated_paths
+    ):
+        """`_finish_cancelled` writes ``cancelled`` without setting the flag,
+        so the pass has to re-read the status once it holds the lock."""
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        release = threading.Event()
+        calls: list[Path] = []
+
+        def blocking(path, *args, **kwargs):
+            calls.append(path)
+            release.wait(timeout=5)
+            return TagFixResult(matched=True)
+
+        mock_fix.side_effect = blocking
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.add_tagging_job(_tagging_job("Bonobo/Migration/Kerala.flac"))
+        await _wait_for_job_status(qm, "tag-1", JobStatus.TAGGING)
+        (download_dir / "Bonobo" / "Migration" / "Kong.flac").write_bytes(
+            minimal_flac_bytes(44100 * 183)
+        )
+        qm.add_tagging_job(
+            _tagging_job("Bonobo/Migration/Kong.flac", id="tag-2")
+        )
+        await asyncio.sleep(0.05)
+
+        # Cancelled while queued: immediate, because nothing has been touched.
+        qm.cancel_job("tag-2")
+        assert qm.get_job("tag-2").status == JobStatus.CANCELLED
+
+        release.set()
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+        await asyncio.sleep(0.1)
+
+        assert qm.get_job("tag-2").status == JobStatus.CANCELLED
+        assert [path.name for path in calls] == ["Kerala.flac"]
+        qm.close()
+
+
+class TestTaggingJobsAcrossARestart:
+    """Nothing is stored about matches, so a restart re-runs the whole pass."""
+
+    def _row(self, store, download_dir, **overrides):
+        job = _tagging_job("Bonobo/Migration/Kerala.flac", **overrides)
+        store.upsert(job)
+        return job
+
+    @patch("app.queue_manager.fix_track")
+    async def test_an_interrupted_job_runs_again(
+        self, mock_fix, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+        self._row(store, download_dir, status=JobStatus.TAGGING)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.restore_from_store()
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        assert mock_fix.called
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_it_does_not_spend_a_restart_attempt(
+        self, mock_fix, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+        self._row(store, download_dir, status=JobStatus.TAGGING)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.restore_from_store()
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        assert qm.get_job("tag-1").restart_attempts == 0
+        assert qm.get_job("tag-1").attempts == 0
+        qm.close()
+
+    async def test_a_job_whose_path_is_gone_ends_in_error(self, store, isolated_paths):
+        download_dir, _ = isolated_paths
+        self._row(store, download_dir, status=JobStatus.TAGGING)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.restore_from_store()
+
+        assert qm.get_job("tag-1").status is JobStatus.ERROR
+        assert qm.get_job("tag-1").error == NOTE_FILE_MISSING
+        qm.close()
+
+    async def test_a_job_being_cancelled_ends_cancelled(self, store, isolated_paths):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        self._row(
+            store, download_dir, status=JobStatus.TAGGING, cancel_requested=True
+        )
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.restore_from_store()
+
+        assert qm.get_job("tag-1").status is JobStatus.CANCELLED
+        qm.close()
+
+    @patch("app.queue_manager.fix_track")
+    async def test_a_still_queued_job_is_dispatched_onto_the_tagging_worker(
+        self, mock_fix, store, isolated_paths
+    ):
+        download_dir, _ = isolated_paths
+        _album_on_disk(download_dir)
+        mock_fix.return_value = TagFixResult(matched=True, changed=True)
+        self._row(store, download_dir, status=JobStatus.QUEUED)
+
+        qm = QueueManager(max_concurrent=1, timeout=10, store=store)
+        qm.restore_from_store()
+        await _wait_for_job_status(qm, "tag-1", JobStatus.DONE)
+
+        # No download slot was ever taken: the semaphore is untouched.
+        assert qm._semaphore._value == 1
+        qm.close()
+
+    def test_progress_is_never_persisted(self, store, isolated_paths):
+        job = _tagging_job("Bonobo/Migration")
+        job.progress_done = 3
+        job.progress_total = 12
+        store.upsert(job)
+
+        [restored] = store.load_active()
+
+        assert restored.progress_done is None and restored.progress_total is None

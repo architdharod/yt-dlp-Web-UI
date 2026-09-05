@@ -14,6 +14,7 @@ vi.mock("@/lib/api", () => ({ getQueue: vi.fn(() => new Promise<Job[]>(() => {})
 function job(id: string, status: JobStatus): Job {
   return {
     id,
+    kind: "download",
     url: `https://example.com/${id}`,
     status,
     title: id,

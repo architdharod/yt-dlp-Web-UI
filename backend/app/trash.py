@@ -47,6 +47,7 @@ from app.library_ops import (
     PartialRenameError,
     check_ancestors_are_dirs,
     check_in_flight,
+    check_not_being_tagged,
     check_inside,
     check_resolved,
     cleanup_upwards,
@@ -415,6 +416,7 @@ def delete_library_entry(
     in_flight: Iterable[str] = (),
     unresolved: int = 0,
     unresolved_jobs: Iterable[str] = (),
+    tagging: Iterable[str] = (),
 ) -> DeleteOutcome:
     """Move one track, one selection of tracks, an album or an artist to the trash.
 
@@ -431,10 +433,12 @@ def delete_library_entry(
         LibraryNotFound: a path that is not on disk (404).
         LibraryConflict: a download in flight into one of the folders being
             deleted -- *unresolved* being non-zero counts as in flight into an
-            unknown folder (409).
+            unknown folder -- or a tagging job rewriting one of them, named in
+            *tagging* (409).
     """
     base = root.resolve()
     in_flight = list(in_flight)
+    tagging = list(tagging)
 
     if path is None and paths is None:
         raise LibraryPathError("give either 'path' or 'paths'")
@@ -450,14 +454,18 @@ def delete_library_entry(
                 raise LibraryPathError("that folder is not part of the library")
             if not source.is_file():
                 raise LibraryNotFound("no such track")
-        return _delete_tracks(sources, base, in_flight, unresolved, unresolved_jobs)
+        return _delete_tracks(
+            sources, base, in_flight, unresolved, unresolved_jobs, tagging
+        )
 
     assert path is not None
     source = _lexical(path, base)
     if is_reserved(source, base):
         raise LibraryPathError("that folder is not part of the library")
     if source.is_file():
-        return _delete_tracks([source], base, in_flight, unresolved, unresolved_jobs)
+        return _delete_tracks(
+            [source], base, in_flight, unresolved, unresolved_jobs, tagging
+        )
     if not source.is_dir():
         raise LibraryNotFound("no such album or artist")
 
@@ -473,6 +481,7 @@ def delete_library_entry(
         in_flight,
         unresolved,
         unresolved_jobs,
+        tagging,
     )
 
 
@@ -516,6 +525,7 @@ def _delete_tracks(
     in_flight: Iterable[str],
     unresolved: int,
     unresolved_jobs: Iterable[str],
+    tagging: Iterable[str] = (),
 ) -> DeleteOutcome:
     """Trash audio files that share one parent folder, then tidy the folder."""
     parents = {source.parent for source in sources}
@@ -530,6 +540,13 @@ def _delete_tracks(
     # into it would find it gone.
     parent_rel = "" if parent == root else rel_path(parent, root)
     check_in_flight([parent_rel], in_flight)
+    # The files themselves, not their folder.  A tagging job on one track of an
+    # album has no claim on its siblings, and guarding the parent would refuse
+    # a delete of ``b.flac`` while ``a.flac`` was being tagged.  Containment
+    # still does the work that matters: a job tagging the *album* covers every
+    # file in it and refuses this, because the guarded path sits inside the
+    # tagged one.
+    check_not_being_tagged((rel_path(source, root) for source in sources), tagging)
     check_resolved(unresolved, unresolved_jobs)
 
     relatives = [rel_path(source, root) for source in sources]
@@ -559,10 +576,12 @@ def _delete_folder(
     in_flight: Iterable[str],
     unresolved: int,
     unresolved_jobs: Iterable[str],
+    tagging: Iterable[str] = (),
 ) -> DeleteOutcome:
     """Trash a whole album or artist folder as one rename."""
     source_rel = rel_path(source, root)
     check_in_flight([source_rel], in_flight)
+    check_not_being_tagged([source_rel], tagging)
     check_resolved(unresolved, unresolved_jobs)
 
     entry_dir, entry_id = _stage(root, [(source, source_rel)])
@@ -708,6 +727,7 @@ def restore_trash_entry(
     in_flight: Iterable[str] = (),
     unresolved: int = 0,
     unresolved_jobs: Iterable[str] = (),
+    tagging: Iterable[str] = (),
 ) -> RestoreOutcome:
     """Put one trash entry back, either where it came from or somewhere new.
 
@@ -733,11 +753,13 @@ def restore_trash_entry(
     Raises:
         LibraryPathError: a bad id or an unusable artist/album name (400).
         LibraryNotFound: no such entry (404).
-        LibraryConflict: an occupied target, or a download in flight into one
-            of the destination folders (409).
+        LibraryConflict: an occupied target, a download in flight into one
+            of the destination folders, or a tagging job rewriting one of them
+            (409).
     """
     base = root.resolve()
     in_flight = list(in_flight)
+    tagging = list(tagging)
 
     entry_dir = trash_root(base) / _validate_entry_id(entry_id)
     # A symlink is not an entry: the listing skips one (it scans without
@@ -768,6 +790,7 @@ def restore_trash_entry(
         if folder not in guarded:
             guarded.append(folder)
     check_in_flight(guarded, in_flight)
+    check_not_being_tagged(guarded, tagging)
 
     conflicts: list[str] = []
     renames: list[tuple[Path, Path]] = []

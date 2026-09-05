@@ -51,6 +51,7 @@ from app.library_ops import (
     LIBRARY_WRITE_LOCK,
     LibraryConflict,
     check_in_flight,
+    check_not_being_tagged,
     check_inside,
     check_resolved,
     check_type_conflicts,
@@ -115,6 +116,7 @@ def _move_tracks(
     in_flight: Iterable[str],
     unresolved: int = 0,
     unresolved_jobs: Iterable[str] = (),
+    tagging: Iterable[str] = (),
 ) -> MoveOutcome:
     """Move audio files that share a parent to ``artist``/``album``."""
     parents = {source.parent for source in sources}
@@ -133,6 +135,16 @@ def _move_tracks(
     # the artist folder above it is not what this move touches.
     parent_rel = "" if parent == root else rel_path(parent, root)
     check_in_flight([parent_rel, rel_path(destination, root)], in_flight)
+    # The files being moved, not the folder they came out of: a tagging job on
+    # one track of an album has no claim on its siblings.  The destination
+    # stays guarded, because a pass running there would have this move landing
+    # files in a folder it is halfway through rewriting.  Containment still
+    # refuses a move out of an album that is *itself* being tagged: every
+    # source sits inside the tagged path.
+    check_not_being_tagged(
+        [*(rel_path(source, root) for source in sources), rel_path(destination, root)],
+        tagging,
+    )
 
     pairs: list[tuple[Path, Path]] = []
     conflicts: list[str] = []
@@ -191,6 +203,7 @@ def _move_album(
     in_flight: Iterable[str],
     unresolved: int = 0,
     unresolved_jobs: Iterable[str] = (),
+    tagging: Iterable[str] = (),
 ) -> MoveOutcome:
     """Move an album folder to another artist, merging where one exists."""
     # An album folder cannot become a Single, so a blank album means "same
@@ -201,6 +214,7 @@ def _move_album(
 
     source_rel = rel_path(source, root)
     check_in_flight([source_rel, rel_path(destination, root)], in_flight)
+    check_not_being_tagged([source_rel, rel_path(destination, root)], tagging)
 
     outcome = MoveOutcome()
     if destination == source:
@@ -265,6 +279,7 @@ def _rename_artist(
     in_flight: Iterable[str],
     unresolved: int = 0,
     unresolved_jobs: Iterable[str] = (),
+    tagging: Iterable[str] = (),
 ) -> MoveOutcome:
     """Rename an artist folder and follow it in every FLAC below."""
     # ``adopt_existing=False``: renaming "bonobo" to "Bonobo" is a real request
@@ -282,6 +297,7 @@ def _rename_artist(
         return outcome
 
     check_in_flight([source_rel, rel_path(destination, root)], in_flight)
+    check_not_being_tagged([source_rel, rel_path(destination, root)], tagging)
     check_resolved(unresolved, unresolved_jobs)
     check_type_conflicts(destination, root, root)
 
@@ -327,6 +343,7 @@ def move_library_entry(
     in_flight: Iterable[str] = (),
     unresolved: int = 0,
     unresolved_jobs: Iterable[str] = (),
+    tagging: Iterable[str] = (),
 ) -> MoveOutcome:
     """Perform one move and return what it did.
 
@@ -339,12 +356,14 @@ def move_library_entry(
     Raises:
         LibraryPathError: a malformed path or name, or a mixed selection (400).
         LibraryNotFound: a source that is not on disk (404).
-        LibraryConflict: a target that is occupied, or a download in flight
+        LibraryConflict: a target that is occupied, a download in flight
             into one of the folders involved -- *unresolved* being non-zero
-            counts as in flight into an unknown folder (409).
+            counts as in flight into an unknown folder -- or a tagging job
+            rewriting one of them, named in *tagging* (409).
     """
     base = root.resolve()
     in_flight = list(in_flight)
+    tagging = list(tagging)
 
     if path is None and paths is None:
         raise LibraryPathError("give either 'path' or 'paths'")
@@ -365,7 +384,8 @@ def move_library_entry(
             if not source.is_file():
                 raise LibraryNotFound("no such track")
         return _move_tracks(
-            sources, artist, album, base, in_flight, unresolved, unresolved_jobs
+            sources, artist, album, base, in_flight, unresolved, unresolved_jobs,
+            tagging,
         )
 
     assert path is not None
@@ -377,7 +397,8 @@ def move_library_entry(
         raise LibraryPathError("that folder is not part of the library")
     if source.is_file():
         return _move_tracks(
-            [source], artist, album, base, in_flight, unresolved, unresolved_jobs
+            [source], artist, album, base, in_flight, unresolved, unresolved_jobs,
+            tagging,
         )
     if not source.is_dir():
         raise LibraryNotFound("no such album or artist")
@@ -385,11 +406,12 @@ def move_library_entry(
     depth = len(source.relative_to(base).parts)
     if depth == 1:
         return _rename_artist(
-            source, artist, base, in_flight, unresolved, unresolved_jobs
+            source, artist, base, in_flight, unresolved, unresolved_jobs, tagging
         )
     if depth == 2:
         return _move_album(
-            source, artist, album, base, in_flight, unresolved, unresolved_jobs
+            source, artist, album, base, in_flight, unresolved, unresolved_jobs,
+            tagging,
         )
     raise LibraryPathError(
         "only a track, an album folder, or an artist folder can be moved"

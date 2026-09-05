@@ -18,6 +18,7 @@ vi.mock("@/lib/api", () => ({ getQueue: vi.fn() }));
 function job(id: string, status: JobStatus = "downloading"): Job {
   return {
     id,
+    kind: "download",
     url: `https://example.com/${id}`,
     status,
     title: id,
@@ -107,6 +108,88 @@ describe("applyQueueEvent", () => {
     expect(queue()).toEqual([]);
   });
 
+  it("carries a tagging job's N of M through a snapshot", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "queued"), kind: "tagging" as const, path: "Bonobo/Black Sands" },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", {
+        status: "tagging",
+        progress_done: 0,
+        progress_total: 12,
+      }),
+    );
+
+    expect(queue()![0]).toMatchObject({
+      kind: "tagging",
+      status: "tagging",
+      path: "Bonobo/Black Sands",
+      progress_done: 0,
+      progress_total: 12,
+    });
+
+    applyQueueEvent(
+      queryClient,
+      event("progress", "a", { progress_done: 7, progress_total: 12 }),
+    );
+
+    expect(queue()![0].progress_done).toBe(7);
+  });
+
+  it("leaves kind and path alone, since no event carries them", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "queued"), kind: "tagging" as const, path: "Bonobo/Black Sands" },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", {
+        status: "tagging",
+        kind: "download",
+        path: "somewhere/else",
+      }),
+    );
+
+    expect(queue()![0]).toMatchObject({
+      kind: "tagging",
+      path: "Bonobo/Black Sands",
+    });
+  });
+
+  it("leaves the counters alone when an event does not mention them", () => {
+    // A download's events carry no counters at all; a tagging job's `error`
+    // event may leave them out. Either way the row must not lose its count.
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "tagging"), kind: "tagging" as const, progress_done: 3, progress_total: 12 },
+    ]);
+
+    applyQueueEvent(queryClient, event("progress", "a", { progress: 50 }));
+
+    expect(queue()![0]).toMatchObject({ progress_done: 3, progress_total: 12 });
+  });
+
+  it("clears the counters when the backend sends an explicit null", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "tagging"), kind: "tagging" as const, progress_done: 3, progress_total: 12 },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", {
+        status: "tagging",
+        progress_done: null,
+        progress_total: null,
+      }),
+    );
+
+    expect(queue()![0]).toMatchObject({
+      progress_done: null,
+      progress_total: null,
+    });
+  });
+
   it("keeps progress events off the invalidation path", () => {
     queryClient.setQueryData(queryKeys.queue, [job("a")]);
 
@@ -127,6 +210,40 @@ describe("applyQueueEvent", () => {
     );
 
     expect(queue()![0]).toMatchObject({ status: "queued", error: null });
+  });
+
+  it("clears a stale detail when a job is re-queued by a retry", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      {
+        ...job("a", "error"),
+        kind: "tagging" as const,
+        detail: "tags not fixed: no match",
+      },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", { status: "queued" }),
+    );
+
+    expect(queue()![0]).toMatchObject({ status: "queued", detail: null });
+  });
+
+  it("keeps the detail on a status change that is not a re-queue", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      {
+        ...job("a", "queued"),
+        kind: "tagging" as const,
+        detail: "tags not fixed: no match",
+      },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", { status: "tagging" }),
+    );
+
+    expect(queue()![0].detail).toBe("tags not fixed: no match");
   });
 
   it("marks a job errored on an error event", () => {

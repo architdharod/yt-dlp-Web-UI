@@ -22,9 +22,20 @@ export type JobStatus =
  */
 export const ALREADY_IN_LIBRARY_PREFIX = "already in library: ";
 
-/** A download job as returned by the backend API. */
+/**
+ * What a job is doing, as the backend's `kind` column names it.
+ *
+ * `download` is one track; `bulk` is the parent of a collection download;
+ * `tagging` is a manual "Update metadata" run over a track or an album folder.
+ * The kind decides how a queue row reads: a tagging job has no URL to show and
+ * counts tracks rather than bytes.
+ */
+export type JobKind = "download" | "bulk" | "tagging";
+
+/** A job as returned by the backend API: a download, a bulk parent, or a tagging run. */
 export interface Job {
   id: string;
+  kind: JobKind;
   url: string;
   status: JobStatus;
   title: string | null;
@@ -41,6 +52,20 @@ export interface Job {
   detail?: string | null;
   artist: string | null;
   album: string | null;
+  /**
+   * The library path the job is about — the track or album folder a tagging
+   * job is rewriting. Null for a download, which has a URL instead and only
+   * learns its path once the file has landed.
+   */
+  path?: string | null;
+  /**
+   * N of M for a job that counts whole items rather than bytes: the tracks a
+   * tagging job has written of the tracks in the album folder. Both null for a
+   * download and for a single-track tagging run, which have nothing to count,
+   * so the row shows the percent bar or nothing at all instead.
+   */
+  progress_done?: number | null;
+  progress_total?: number | null;
   created_at: string;
 }
 
@@ -188,6 +213,17 @@ export interface LibraryMoveResponse {
   moved: MovedPath[];
   removed: string[];
   destination: string | null;
+}
+
+/**
+ * Request body for `POST /library/tag`.
+ *
+ * One path: a track (title and artist only) or an album folder (the album
+ * pass, which may also write track numbers and fetch a cover). There is no
+ * artist-level or whole-library form — the metadata ticket rules both out.
+ */
+export interface LibraryTagRequest {
+  path: string;
 }
 
 /**

@@ -7,6 +7,7 @@ import {
   getTrash,
   moveLibraryPath,
   restoreTrashEntry,
+  tagLibraryPath,
 } from "@/lib/api";
 
 describe("coverUrl", () => {
@@ -214,5 +215,67 @@ describe("the trash endpoints", () => {
 
     expect(fetchMock.mock.calls[0][0]).toBe("/library/trash/empty");
     expect(result).toEqual({ removed: 2, track_count: 13 });
+  });
+});
+
+describe("tagLibraryPath", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const job = {
+    id: "j1",
+    kind: "tagging",
+    url: "",
+    status: "queued",
+    title: "Black Sands",
+    thumbnail_url: null,
+    duration: null,
+    progress: 0,
+    error: null,
+    artist: "Bonobo",
+    album: "Black Sands",
+    path: "Bonobo/Black Sands",
+    progress_done: 0,
+    progress_total: 12,
+    created_at: "2026-09-05T09:00:00Z",
+  };
+
+  it("posts the path and returns the tagging job it created", async () => {
+    const fetchMock = respondWith(200, job);
+
+    const created = await tagLibraryPath({ path: "Bonobo/Black Sands" });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/library/tag");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("POST");
+    expect(sentBody(fetchMock)).toEqual({ path: "Bonobo/Black Sands" });
+    expect(created.kind).toBe("tagging");
+    expect(created.progress_total).toBe(12);
+  });
+
+  it("raises the backend's message when the path is already being tagged", async () => {
+    respondWith(409, {
+      detail: {
+        message: "Bonobo/Black Sands is already being tagged",
+        conflicts: ["Bonobo/Black Sands"],
+      },
+    });
+
+    const failure = await tagLibraryPath({
+      path: "Bonobo/Black Sands",
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(LibraryMoveConflict);
+    expect((failure as Error).message).toBe(
+      "Bonobo/Black Sands is already being tagged",
+    );
+  });
+
+  it("reports a 404 with the backend's message", async () => {
+    respondWith(404, { detail: "no such track" });
+
+    await expect(tagLibraryPath({ path: "Nope.flac" })).rejects.toThrow(
+      "no such track",
+    );
   });
 });

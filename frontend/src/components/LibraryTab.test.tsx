@@ -9,7 +9,12 @@ import {
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LibraryTab } from "@/components/LibraryTab";
-import { deleteLibraryPath, getLibrary, moveLibraryPath } from "@/lib/api";
+import {
+  deleteLibraryPath,
+  getLibrary,
+  moveLibraryPath,
+  tagLibraryPath,
+} from "@/lib/api";
 import {
   album,
   artist,
@@ -18,7 +23,7 @@ import {
   track,
 } from "@/lib/library.fixture";
 import { queryKeys } from "@/lib/queryKeys";
-import type { LibraryResponse } from "@/lib/types";
+import type { Job, LibraryResponse } from "@/lib/types";
 
 // Only the request is faked; `coverUrl` stays real so the <img> src the tiles
 // build is the one the app would ask the backend for.
@@ -27,11 +32,34 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   getLibrary: vi.fn(),
   moveLibraryPath: vi.fn(),
   deleteLibraryPath: vi.fn(),
+  tagLibraryPath: vi.fn(),
 }));
 
 const getLibraryMock = vi.mocked(getLibrary);
 const moveMock = vi.mocked(moveLibraryPath);
 const deleteMock = vi.mocked(deleteLibraryPath);
+const tagMock = vi.mocked(tagLibraryPath);
+
+/** The job `POST /library/tag` answers with, for whatever *path* was sent. */
+function taggingJob(path: string): Job {
+  return {
+    id: `tag-${path}`,
+    kind: "tagging",
+    url: "",
+    status: "queued",
+    title: path.slice(path.lastIndexOf("/") + 1),
+    thumbnail_url: null,
+    duration: null,
+    progress: 0,
+    error: null,
+    artist: "Bonobo",
+    album: null,
+    path,
+    progress_done: 0,
+    progress_total: null,
+    created_at: "2026-09-05T09:00:00Z",
+  };
+}
 
 /** Mount the tab against a fresh client, leaving the mock to the caller. */
 function renderLibraryTab() {
@@ -60,6 +88,18 @@ function click(name: RegExp | string) {
   fireEvent.click(screen.getByRole("button", { name }));
 }
 
+/**
+ * The SearchResults count line.
+ *
+ * The tab also mounts the tag-feedback live region unconditionally, so two
+ * `status` nodes are in the tree while a query is typed; the feedback line
+ * comes first, the results count second.
+ */
+function searchStatus(): HTMLElement {
+  const [, results] = screen.getAllByRole("status");
+  return results;
+}
+
 /** Wait for the first fetch to paint, then open Bonobo's page. */
 async function openBonobo() {
   await screen.findByRole("button", { name: /Bonobo/ });
@@ -70,6 +110,8 @@ beforeEach(() => {
   getLibraryMock.mockReset();
   moveMock.mockReset();
   moveMock.mockResolvedValue({ moved: [], removed: [], destination: null });
+  tagMock.mockReset();
+  tagMock.mockImplementation(({ path }) => Promise.resolve(taggingJob(path)));
   deleteMock.mockReset();
   deleteMock.mockResolvedValue({
     entry: {
@@ -309,7 +351,7 @@ describe("LibraryTab", () => {
       target: { value: "kerala" },
     });
 
-    expect(screen.getByRole("status").textContent).toBe("1 result");
+    expect(searchStatus().textContent).toBe("1 result");
 
     const result = screen.getByRole("button", { name: /Kerala/ });
     expect(result.textContent).toContain("Bonobo · Migration");
@@ -354,7 +396,7 @@ describe("LibraryTab", () => {
       target: { value: "zzz" },
     });
 
-    expect(screen.getByRole("status").textContent).toBe("No matches");
+    expect(searchStatus().textContent).toBe("No matches");
   });
 
   it("picks up a new track after library_changed, without moving the user", async () => {
@@ -884,5 +926,143 @@ describe("LibraryTab deleting", () => {
     expect(screen.queryByRole("button", { name: "Delete artist" })).toBeNull();
     // Its loose files can still be trashed one by one.
     expect(screen.getAllByRole("button", { name: /^Delete$/ })).toHaveLength(1);
+  });
+});
+
+describe("LibraryTab updating metadata", () => {
+  /** The row action of the track whose title is *title*. */
+  function tagRow(title: string) {
+    fireEvent.click(
+      screen.getByRole("button", { name: `Update metadata for ${title}` }),
+    );
+  }
+
+  it("keeps the live region mounted and empty until there is something to say", async () => {
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+
+    // A live region has to be in the tree before its content changes for the
+    // change to be announced, so the line is there — empty — from the start.
+    const [region] = screen.getAllByRole("status");
+    expect(region.textContent).toBe("");
+
+    click("Update metadata");
+
+    await waitFor(() =>
+      expect(region.textContent).toMatch(/Metadata update queued/),
+    );
+    // Same node, filled in — not a second one inserted alongside it.
+    expect(screen.getAllByRole("status")).toHaveLength(1);
+  });
+
+  it("queues an album pass from the album header", async () => {
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+
+    click("Update metadata");
+
+    await waitFor(() => expect(tagMock).toHaveBeenCalledTimes(1));
+    expect(tagMock.mock.calls[0][0]).toEqual({ path: "Bonobo/Black Sands" });
+    expect(
+      await screen.findByText(/Metadata update queued/),
+    ).toBeTruthy();
+  });
+
+  it("queues one track from its own row", async () => {
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+
+    tagRow("Prelude");
+
+    await waitFor(() => expect(tagMock).toHaveBeenCalledTimes(1));
+    expect(tagMock.mock.calls[0][0]).toEqual({
+      path: "Bonobo/Black Sands/Prelude.flac",
+    });
+  });
+
+  it("offers the row action on a loose Single", async () => {
+    renderTab();
+    await openBonobo();
+
+    tagRow("Cirrus");
+
+    await waitFor(() => expect(tagMock).toHaveBeenCalledTimes(1));
+    expect(tagMock.mock.calls[0][0]).toEqual({ path: "Bonobo/Cirrus.flac" });
+  });
+
+  it("offers no artist-level action, on a real artist or the root bucket", async () => {
+    renderTab();
+    await openBonobo();
+
+    // The artist level has Rename and Delete artist and nothing else: the
+    // metadata ticket rules out a per-artist and a whole-library trigger.
+    expect(screen.queryByRole("button", { name: "Update metadata" })).toBeNull();
+
+    click("Library");
+    await screen.findByRole("button", { name: /Unknown Artist/ });
+    click(/Unknown Artist/);
+
+    expect(screen.queryByRole("button", { name: "Update metadata" })).toBeNull();
+  });
+
+  it("offers no row action in the synthetic bucket, whose files sit at the root", async () => {
+    renderTab();
+    await screen.findByRole("button", { name: /Unknown Artist/ });
+    click(/Unknown Artist/);
+
+    // `POST /library/tag` refuses a path directly under the library root, so
+    // the button would only ever 400 — the rows must not offer it.
+    expect(screen.getByText("Tycho - Awake")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /^Update metadata for / }),
+    ).toBeNull();
+
+    // A real artist's loose Single still gets one.
+    click("Library");
+    await openBonobo();
+    expect(
+      screen.getByRole("button", { name: "Update metadata for Cirrus" }),
+    ).toBeTruthy();
+  });
+
+  it("shows the backend's refusal instead of a queued row", async () => {
+    tagMock.mockRejectedValue(
+      new Error("Bonobo/Black Sands is already being tagged"),
+    );
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+
+    click("Update metadata");
+
+    expect(
+      await screen.findByText("Bonobo/Black Sands is already being tagged"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Metadata update queued/)).toBeNull();
+  });
+
+  it("disables the button while the request is out", async () => {
+    let settle: (job: Job) => void = () => {};
+    tagMock.mockReturnValue(
+      new Promise<Job>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+
+    click("Update metadata");
+
+    const button = screen.getByRole("button", { name: "Update metadata" });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(true));
+
+    settle(taggingJob("Bonobo/Black Sands"));
+    await waitFor(() =>
+      expect((button as HTMLButtonElement).disabled).toBe(false),
+    );
   });
 });
