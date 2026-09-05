@@ -414,3 +414,125 @@ class LibraryMoveResponse(BaseModel):
         default=None,
         description="Where the moved album or artist now lives, relative POSIX",
     )
+
+
+# ---------------------------------------------------------------------------
+# Trash
+# ---------------------------------------------------------------------------
+
+# A trash entry id is a folder name under ``.trash``: a UTC timestamp, plus a
+# ``-2`` when two deletes landed in the same microsecond.  Bounded so a bad
+# client cannot hand the route a megabyte to validate.
+MAX_ENTRY_ID = 100
+
+
+class LibraryDeleteRequest(BaseModel):
+    """Schema for POST /library/delete.
+
+    ``path`` names a track, an album folder or an artist folder; ``paths``
+    names tracks that share one parent folder -- a multi-selection inside one
+    album or one artist's Singles.  Exactly one of the two is given, and the
+    route answers 400 when that is not so.
+    """
+
+    path: str | None = Field(
+        None,
+        max_length=MAX_PATH_LENGTH,
+        description="The track, album, or artist to delete, relative to DOWNLOAD_PATH",
+    )
+    paths: list[Annotated[str, StringConstraints(max_length=MAX_PATH_LENGTH)]] | None = (
+        Field(
+            None,
+            max_length=MAX_MOVE_PATHS,
+            description="Track paths to delete, all from one folder; alternative to 'path'",
+        )
+    )
+
+    @field_validator("paths")
+    @classmethod
+    def _check_paths(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and not value:
+            raise ValueError("paths must name at least one track")
+        return value
+
+
+class TrashEntry(BaseModel):
+    """One ``.trash/<id>/`` folder as the Trash tab shows it.
+
+    ``path`` is the one line the tab has room for -- the artist, the album, the
+    track, or the folder a multi-track delete came out of -- while ``paths``
+    is everything Restore will put back.
+    """
+
+    id: str = Field(..., description="The .trash/<id> folder name")
+    path: str = Field(
+        ...,
+        description="The deleted item's original relative path, or the shared parent folder",
+    )
+    kind: Literal["artist", "album", "track", "tracks"]
+    paths: list[str] = Field(
+        default_factory=list,
+        description="Every original relative path inside this entry",
+    )
+    deleted_at: str = Field(..., description="ISO-8601 UTC, e.g. 2026-09-04T18:22:31Z")
+    track_count: int = Field(0, description="Audio files inside the entry")
+
+
+class LibraryDeleteResponse(BaseModel):
+    """Schema for POST /library/delete.
+
+    ``removed`` are the library folders the delete emptied and cleaned up, so
+    the browser can tell "the album is gone" from "the album lost a track".
+    """
+
+    entry: TrashEntry
+    removed: list[str] = Field(default_factory=list)
+
+
+class TrashListResponse(BaseModel):
+    """Schema for GET /library/trash: entries newest first, plus the tab badge."""
+
+    entries: list[TrashEntry] = Field(default_factory=list)
+    track_count: int = 0
+
+
+class TrashRestoreRequest(BaseModel):
+    """Schema for POST /library/trash/restore.
+
+    ``artist`` and ``album`` are optional and mean the same as they do on
+    ``/library/move``: without them the entry goes back where it came from,
+    with them it is restored under that artist instead -- which is how the UI
+    answers a 409 without making the user restore and then move.
+    """
+
+    id: str = Field(..., min_length=1, max_length=MAX_ENTRY_ID)
+    artist: str | None = Field(
+        None,
+        max_length=MAX_FOLDER_NAME,
+        description="Restore under this artist instead of the original one",
+    )
+    album: str | None = Field(
+        None,
+        max_length=MAX_FOLDER_NAME,
+        description="Album folder name; blank means a loose Single (tracks only)",
+    )
+
+
+class RestoredPath(BaseModel):
+    """One item a restore put back: where it was in the trash, where it is now."""
+
+    source: str = Field(..., description="Path relative to .trash")
+    target: str = Field(..., description="Path relative to DOWNLOAD_PATH")
+
+
+class TrashRestoreResponse(BaseModel):
+    """Schema for POST /library/trash/restore."""
+
+    restored: list[RestoredPath] = Field(default_factory=list)
+
+
+class TrashEmptyResponse(BaseModel):
+    """Schema for POST /library/trash/empty: what was permanently deleted."""
+
+    removed: int = Field(0, description="Entries removed")
+    track_count: int = Field(0, description="Audio files removed")

@@ -9,6 +9,8 @@ import {
 } from "@/components/library/MoveDialog";
 import { LibraryMoveConflict, moveLibraryPath } from "@/lib/api";
 import { libraryFixture } from "@/lib/library.fixture";
+import { restoreTarget } from "@/lib/trash";
+import type { TrashEntry } from "@/lib/types";
 
 vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/api")>()),
@@ -267,5 +269,95 @@ describe("buildMoveRequest", () => {
       path: "Bonobo",
       artist: "New Name",
     });
+  });
+});
+
+describe("MoveDialog in restore mode", () => {
+  const entry: TrashEntry = {
+    id: "t1",
+    path: "Bonobo/Black Sands",
+    kind: "album",
+    paths: ["Bonobo/Black Sands/Prelude.flac"],
+    deleted_at: "2026-09-04T11:00:00Z",
+    track_count: 12,
+  };
+
+  function renderRestore(
+    target = restoreTarget(entry),
+    error: Error | null = new LibraryMoveConflict("Already in the library", [
+      "Bonobo/Black Sands",
+    ]),
+  ) {
+    const onSubmit = vi.fn();
+    const onClose = vi.fn();
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    );
+    render(
+      <MoveDialog
+        mode="restore"
+        target={target}
+        library={fixture}
+        onClose={onClose}
+        restore={{ submit: onSubmit, isPending: false, error }}
+      />,
+      { wrapper },
+    );
+    return { onSubmit, onClose };
+  }
+
+  it("names the entry and the conflict that opened it", () => {
+    renderRestore();
+
+    expect(screen.getByText("Restore elsewhere")).toBeTruthy();
+    expect(
+      screen.getByText('Restore "Bonobo/Black Sands" (12 tracks) somewhere else.'),
+    ).toBeTruthy();
+    expect(screen.getByText("Bonobo/Black Sands")).toBeTruthy();
+  });
+
+  it("hands the caller the trimmed names instead of running a move", () => {
+    const { onSubmit } = renderRestore();
+
+    fill(/^Artist$/, "  Ninja Tune  ");
+    fill(/^Album$/, "  Black Sands Remixed  ");
+    submit(/^Restore$/);
+
+    expect(onSubmit).toHaveBeenCalledWith({
+      artist: "Ninja Tune",
+      album: "Black Sands Remixed",
+    });
+    expect(moveMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a blank artist without troubling the caller", () => {
+    const { onSubmit } = renderRestore();
+
+    fill(/^Artist$/, "   ");
+    submit(/^Restore$/);
+
+    expect(
+      screen.getAllByRole("alert").map((alert) => alert.textContent),
+    ).toContain("Enter an artist name.");
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("shows a plain restore failure as a message rather than a conflict list", () => {
+    renderRestore(restoreTarget(entry), new Error("the trash is unreadable"));
+
+    expect(screen.getByRole("alert").textContent).toBe(
+      "the trash is unreadable",
+    );
+  });
+
+  it("gives an artist entry no album field", () => {
+    renderRestore(
+      restoreTarget({ ...entry, kind: "artist", path: "Bonobo" }),
+    );
+
+    expect(screen.queryByLabelText(/^Album$/)).toBeNull();
   });
 });

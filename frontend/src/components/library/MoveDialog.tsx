@@ -12,6 +12,7 @@ import {
 import { useMoveMutation } from "@/hooks/useMoveMutation";
 import { LibraryMoveConflict } from "@/lib/api";
 import { plural } from "@/lib/format";
+import { entryLabel, type RestoreTarget } from "@/lib/trash";
 import type {
   LibraryAlbum,
   LibraryArtist,
@@ -37,6 +38,22 @@ export type MoveTarget =
   | { kind: "album"; artist: LibraryArtist; album: LibraryAlbum }
   | { kind: "artist"; artist: LibraryArtist };
 
+/**
+ * Everything the dialog can be pointed at: the three move targets, plus a
+ * trash entry being restored somewhere other than where it came from. The
+ * fields, the validation, and the conflict list are the same choice either
+ * way, which is why restore reuses this dialog rather than growing its own.
+ */
+export type DialogTarget = MoveTarget | RestoreTarget;
+
+/** The trash entry's own path, which is the only name a restore has to show. */
+function restoreDescription(target: RestoreTarget): string {
+  return `Restore "${entryLabel(target.entry)}" (${plural(
+    target.entry.track_count,
+    "track",
+  )}) somewhere else.`;
+}
+
 /** Every artist folder name, for the artist combobox. */
 function artistNames(library: LibraryResponse): string[] {
   return library.artists
@@ -57,7 +74,8 @@ function albumNames(library: LibraryResponse, artistName: string): string[] {
 }
 
 /** The sentence above the fields: exactly what is about to move. */
-function describe(target: MoveTarget): string {
+function describe(target: DialogTarget): string {
+  if (target.kind === "restore") return restoreDescription(target);
   if (target.kind === "artist") return `Rename "${target.artist.name}".`;
   if (target.kind === "album") {
     return `Album "${target.album.name}" (${plural(
@@ -102,19 +120,67 @@ export function buildMoveRequest(
  * tag. For an album folder there is nothing loose to become: the backend falls
  * back to the folder's current name, so blank means "keep this name".
  */
-function albumHint(target: MoveTarget): string {
+function albumHint(target: DialogTarget): string {
+  if (target.kind === "restore") {
+    return target.entry.kind === "album"
+      ? `Optional — leave blank to keep the name "${target.album ?? ""}".`
+      : "Optional — leave blank to file the track loose under the artist.";
+  }
   if (target.kind === "album") {
     return `Optional — leave blank to keep the name "${target.album.name}".`;
   }
   return "Optional — leave blank to file the track loose under the artist.";
 }
 
+/** The artist name the artist field starts out as. */
+function initialArtist(target: DialogTarget): string {
+  return target.kind === "restore" ? target.artist : target.artist.name;
+}
+
 /** What the album field starts out as: the name the thing already carries. */
-function initialAlbum(target: MoveTarget): string {
+function initialAlbum(target: DialogTarget): string {
+  if (target.kind === "restore") return target.album ?? "";
   if (target.kind === "album") return target.album.name;
   if (target.kind === "tracks") return target.album?.name ?? "";
   return "";
 }
+
+/** What the dialog needs from the caller to run a restore in place of a move. */
+export interface RestoreControls {
+  /** Send the restore again, aimed at the names the user settled on. */
+  submit: (names: { artist: string; album: string }) => void;
+  isPending: boolean;
+  /** The failed restore's error — the 409 that opened this dialog, at first. */
+  error: Error | null;
+  /** A field was edited: drop an error that described the old names. */
+  onEdit?: () => void;
+}
+
+/**
+ * Move mode, which owns its own mutation, or restore mode, where the caller
+ * owns the mutation because the Trash tab has to react to it landing.
+ *
+ * The union is discriminated on `mode` rather than on `target.kind` so
+ * TypeScript narrows the props themselves, and `mode` is optional on the move
+ * side so every existing call site stays as it is.
+ */
+export type MoveDialogProps =
+  | {
+      mode?: "move";
+      target: MoveTarget;
+      library: LibraryResponse;
+      /** Cancel, Escape, or a press outside: nothing happened, nothing changes. */
+      onClose: () => void;
+      /** The move landed. The result says where its files ended up. */
+      onMoved: (result: LibraryMoveResponse) => void;
+    }
+  | {
+      mode: "restore";
+      target: RestoreTarget;
+      library: LibraryResponse;
+      onClose: () => void;
+      restore: RestoreControls;
+    };
 
 /**
  * The move dialog: an artist field, an album field, and the 409 conflicts.
@@ -126,28 +192,33 @@ function initialAlbum(target: MoveTarget): string {
  * moved, so there is no album to choose. Everything else shows both, and a
  * blank album is a deliberate answer: the tracks become loose Singles and the
  * backend clears their `ALBUM` tag.
+ *
+ * In restore mode it is the same dialog over a trash entry: the 409 the
+ * restore came back with is the conflict list, and submitting re-sends the
+ * restore with the names the user picked instead of running a move.
  */
-export function MoveDialog({
-  target,
-  library,
-  onClose,
-  onMoved,
-}: {
-  target: MoveTarget;
-  library: LibraryResponse;
-  /** Cancel, Escape, or a press outside: nothing happened, nothing changes. */
-  onClose: () => void;
-  /** The move landed. The result says where its files ended up. */
-  onMoved: (result: LibraryMoveResponse) => void;
-}) {
-  const [artist, setArtist] = useState(target.artist.name);
+export function MoveDialog(props: MoveDialogProps) {
+  const { target, library, onClose } = props;
+  const restore = props.mode === "restore" ? props.restore : null;
+
+  const [artist, setArtist] = useState(() => initialArtist(target));
   const [album, setAlbum] = useState(() => initialAlbum(target));
   const [invalid, setInvalid] = useState<string | null>(null);
   const move = useMoveMutation();
 
   const isRename = target.kind === "artist";
-  const conflict =
-    move.error instanceof LibraryMoveConflict ? move.error : null;
+  // A restored artist folder has no album to choose, for the same reason a
+  // rename has none: the entry is the folder itself.
+  const showAlbum =
+    !isRename && !(target.kind === "restore" && target.album === null);
+  const error = restore === null ? move.error : restore.error;
+  const isPending = restore === null ? move.isPending : restore.isPending;
+  const conflict = error instanceof LibraryMoveConflict ? error : null;
+
+  const title =
+    restore !== null ? "Restore elsewhere" : isRename ? "Rename artist" : "Move";
+  const submitLabel = restore !== null ? "Restore" : isRename ? "Rename" : "Move";
+  const pendingLabel = restore !== null ? "Restoring…" : "Moving…";
 
   function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -156,8 +227,12 @@ export function MoveDialog({
       return;
     }
     setInvalid(null);
-    move.mutate(buildMoveRequest(target, artist, album), {
-      onSuccess: onMoved,
+    if (props.mode === "restore") {
+      props.restore.submit({ artist: artist.trim(), album: album.trim() });
+      return;
+    }
+    move.mutate(buildMoveRequest(props.target, artist, album), {
+      onSuccess: props.onMoved,
     });
   }
 
@@ -174,7 +249,8 @@ export function MoveDialog({
     return (value: string) => {
       set(value);
       setInvalid(null);
-      if (move.isError) move.reset();
+      if (restore !== null) restore.onEdit?.();
+      else if (move.isError) move.reset();
     };
   }
 
@@ -187,7 +263,7 @@ export function MoveDialog({
     >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>{isRename ? "Rename artist" : "Move"}</DialogTitle>
+          <DialogTitle>{title}</DialogTitle>
           <DialogDescription>{describe(target)}</DialogDescription>
         </DialogHeader>
 
@@ -200,7 +276,7 @@ export function MoveDialog({
             onChange={editField(setArtist)}
           />
 
-          {!isRename && (
+          {showAlbum && (
             <NameCombobox
               label="Album"
               hint={albumHint(target)}
@@ -228,9 +304,9 @@ export function MoveDialog({
             </div>
           )}
 
-          {move.error !== null && conflict === null && (
+          {error !== null && conflict === null && (
             <p role="alert" className="text-sm text-destructive">
-              {move.error.message}
+              {error.message}
             </p>
           )}
 
@@ -243,8 +319,8 @@ export function MoveDialog({
             <Button type="button" variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit" disabled={move.isPending}>
-              {move.isPending ? "Moving…" : isRename ? "Rename" : "Move"}
+            <Button type="submit" disabled={isPending}>
+              {isPending ? pendingLabel : submitLabel}
             </Button>
           </DialogFooter>
         </form>

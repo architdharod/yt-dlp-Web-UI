@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { AlbumGrid } from "@/components/library/AlbumGrid";
+import { DeleteDialog } from "@/components/library/DeleteDialog";
 import { MoveDialog, type MoveTarget } from "@/components/library/MoveDialog";
 import { AlbumHeader } from "@/components/library/AlbumHeader";
 import { ArtistGrid } from "@/components/library/ArtistGrid";
@@ -85,6 +86,7 @@ export function LibraryTab() {
   // a selection the user is still making.
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [moveTarget, setMoveTarget] = useState<MoveTarget | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<MoveTarget | null>(null);
 
   const location = resolveLocation(view, data);
 
@@ -122,6 +124,14 @@ export function LibraryTab() {
     setMoveTarget(target);
   }
 
+  /**
+   * A delete is offered on the same three things a move is, so it takes the
+   * same target: the dialog only has to name what it is about to trash.
+   */
+  function openDelete(target: MoveTarget) {
+    setDeleteTarget(target);
+  }
+
   /** Cancel or Escape: the dialog goes, the ticks the user made stay. */
   function closeMove() {
     setMoveTarget(null);
@@ -141,6 +151,21 @@ export function LibraryTab() {
     setMoveTarget(null);
     if (destination !== null) navigate(destination);
     setSelected(new Set());
+  }
+
+  /**
+   * The delete landed. An artist or an album that has just been trashed is no
+   * longer somewhere to stand, so the user goes up a level; trashed tracks
+   * leave their folder standing. The selection described files that are gone.
+   */
+  function finishDelete() {
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    setSelected(new Set());
+    if (target === null) return;
+    if (target.kind === "artist") navigate(ARTISTS_VIEW);
+    else if (target.kind === "album")
+      navigate({ level: "artist", artistPath: target.artist.path });
   }
 
   function openResult(result: LibrarySearchResult) {
@@ -200,6 +225,7 @@ export function LibraryTab() {
           onSelect={toggleSelected}
           onClearSelection={() => setSelected(new Set())}
           onMove={openMove}
+          onDelete={openDelete}
         />
       )}
 
@@ -212,6 +238,15 @@ export function LibraryTab() {
           library={data}
           onClose={closeMove}
           onMoved={finishMove}
+        />
+      )}
+
+      {deleteTarget !== null && (
+        <DeleteDialog
+          key={moveTargetKey(deleteTarget)}
+          target={deleteTarget}
+          onClose={() => setDeleteTarget(null)}
+          onDeleted={finishDelete}
         />
       )}
     </div>
@@ -292,6 +327,7 @@ function LibraryLevel({
   onSelect,
   onClearSelection,
   onMove,
+  onDelete,
 }: {
   library: LibraryResponse;
   location: LibraryLocation;
@@ -301,6 +337,7 @@ function LibraryLevel({
   onSelect: (path: string, selected: boolean) => void;
   onClearSelection: () => void;
   onMove: (target: MoveTarget) => void;
+  onDelete: (target: MoveTarget) => void;
 }) {
   if (location.level === "artists") {
     if (library.artist_count === 0) {
@@ -322,21 +359,24 @@ function LibraryLevel({
 
   const { artist } = location;
 
-  /** The tracks and albums of this level, for the move actions below. */
-  const moveTracks = (tracks: readonly LibraryTrack[], album: LibraryAlbum | null) =>
-    onMove({ kind: "tracks", artist, album, tracks });
+  /** The tracks and albums of this level, for the row actions below. */
+  const trackTarget = (
+    tracks: readonly LibraryTrack[],
+    album: LibraryAlbum | null,
+  ): MoveTarget => ({ kind: "tracks", artist, album, tracks });
 
-  const trackActions = (tracks: readonly LibraryTrack[], album: LibraryAlbum | null) => ({
-    selected,
-    onSelect,
-    onClearSelection,
-    onMove: (track: LibraryTrack) => moveTracks([track], album),
-    onMoveSelected: () =>
-      moveTracks(
-        tracks.filter((track) => selected.has(track.path)),
-        album,
-      ),
-  });
+  const trackActions = (tracks: readonly LibraryTrack[], album: LibraryAlbum | null) => {
+    const ticked = () => tracks.filter((track) => selected.has(track.path));
+    return {
+      selected,
+      onSelect,
+      onClearSelection,
+      onMove: (track: LibraryTrack) => onMove(trackTarget([track], album)),
+      onMoveSelected: () => onMove(trackTarget(ticked(), album)),
+      onDelete: (track: LibraryTrack) => onDelete(trackTarget([track], album)),
+      onDeleteSelected: () => onDelete(trackTarget(ticked(), album)),
+    };
+  };
 
   if (location.level === "artist") {
     return (
@@ -349,13 +389,22 @@ function LibraryLevel({
           {/* The synthetic bucket is not a folder, so there is nothing to
               rename: its files are sorted by moving them out. */}
           {!artist.synthetic && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => onMove({ kind: "artist", artist })}
-            >
-              Rename
-            </Button>
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onMove({ kind: "artist", artist })}
+              >
+                Rename
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => onDelete({ kind: "artist", artist })}
+              >
+                Delete artist
+              </Button>
+            </>
           )}
         </LibraryBreadcrumb>
         {artist.albums.length > 0 && (
@@ -414,6 +463,13 @@ function LibraryLevel({
           onClick={() => onMove({ kind: "album", artist, album })}
         >
           Move album
+        </Button>
+        <Button
+          variant="destructive"
+          size="sm"
+          onClick={() => onDelete({ kind: "album", artist, album })}
+        >
+          Delete album
         </Button>
       </LibraryBreadcrumb>
       <AlbumHeader artist={artist} album={album} />

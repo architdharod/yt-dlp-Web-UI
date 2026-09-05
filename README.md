@@ -34,6 +34,24 @@ leaving Album blank files the track loose under the artist as a Single. A move r
 move is all-or-nothing — if anything is already in the way the whole move is refused and the conflicting paths are
 listed in the dialog.
 
+### Delete and the trash
+
+Delete is offered on a track, a multi-selection of tracks, a whole album, or a whole artist. One dialog names
+what is going and how many tracks it holds. Nothing is erased: the item moves, as a single entry, to
+`DOWNLOAD_PATH/.trash/<UTC timestamp>/<its original path>`. That is a rename on the same filesystem, so it is
+instant whatever the size, and an album or artist keeps its folder intact, `cover.jpg` included. Folders left
+without audio are cleaned up afterwards, as they are after a move.
+
+The **Trash** tab appears with a count as soon as something is in it. Each entry lists its original path, when it
+was deleted, and its track count, with **Restore** to put it back where it came from. Restore never overwrites:
+if something has taken the old path in the meantime the restore is refused and the move dialog opens so you can
+file the entry elsewhere. **Empty trash** confirms with the total, then removes the contents for good.
+
+Nothing in the trash expires on its own — it sits there until you empty it, and it is invisible everywhere else.
+It never shows in the Library tab, and a trashed track no longer counts as a duplicate, so you can download it
+again without the "already in library" refusal. Deleting something an in-flight job is about to write is refused
+until that job finishes. Navidrome and Lidarr both skip `.trash`; see below.
+
 ## Architecture
 
 ```
@@ -176,17 +194,26 @@ a dismissible banner in the UI and a line in the log.
 create a dedicated user for it rather than reusing your own. Set
 `ND_SCANNER_PURGEMISSING=always` on the Navidrome container (Navidrome 0.56.0 or
 newer), or tracks this app deletes stay in Navidrome's database as unplayable
-entries. Navidrome's own
+entries. The trash needs no configuration of its own: Navidrome skips dot-prefixed
+folders, and the app drops an empty `.ndignore` file into `.trash` as well, so the
+folder stays skipped even if that behaviour ever changes. Navidrome's own
 filesystem watcher usually notices new files by itself; the explicit scan is
 insurance for the setups where it does not (network mounts, some bind mounts).
 
 **Lidarr.** The rescan is sent with `filter=known` and `addNewArtists=false`, so
 only artists Lidarr already tracks are rescanned and nothing this app downloads
-is added to Lidarr's library behind your back. Two settings on the Lidarr side
-matter:
+is added to Lidarr's library behind your back. Three things on the Lidarr side are
+worth knowing:
 
 - Albums you delete here that Lidarr monitors will be searched for again.
   Unmonitor the album in Lidarr if you meant the delete to stick.
+- The trash needs no configuration either, and Lidarr has no folder ignore list to
+  put it in. Lidarr's scanner skips any dot-prefixed folder beneath a root folder,
+  so it never sees `.trash`. Verified against Lidarr **3.1.0.4875** with two
+  identical FLAC files, one in the library and one under `.trash`: every
+  `RescanFolders` found one file and the trashed path appears nowhere in the logs.
+  The test and the source references are in
+  `wayfinder/research/lidarr-hidden-folders.md`.
 - Leave *Settings > Metadata > Tag Audio Files with Metadata* at `no` or
   `newFiles`, and leave *Scrub Existing Tags* off. Scrubbing strips the
   `SOURCEID` and `SOURCEURL` tags this app writes, which is what its duplicate

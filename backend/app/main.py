@@ -6,6 +6,10 @@ Defines all API routes:
   - GET  /library        -- the DOWNLOAD_PATH tree as artists, albums, tracks
   - GET  /library/cover  -- cover art for one album
   - POST /library/move   -- move tracks or an album, or rename an artist
+  - POST /library/delete -- move a track, an album, or an artist to the trash
+  - GET  /library/trash  -- what is in the trash
+  - POST /library/trash/restore -- put one trash entry back
+  - POST /library/trash/empty   -- delete the trash permanently
   - GET  /notices        -- open Navidrome/Lidarr problems worth showing
   - GET  /queue          -- list in-flight and errored jobs
   - GET  /queue/stream   -- SSE stream of job events
@@ -38,17 +42,32 @@ from app.library import (
     invalidate as library_invalidate,
     scan_library,
 )
+from app.library_ops import PartialRenameError
 from app.mover import LIBRARY_WRITE_LOCK, LibraryConflict, move_library_entry
 from app.models import (
     DownloadRequest,
     HealthResponse,
     Job,
+    LibraryDeleteRequest,
+    LibraryDeleteResponse,
     LibraryMoveRequest,
     LibraryMoveResponse,
     LibraryResponse,
     MovedPath,
     Notice,
+    RestoredPath,
     SSEEvent,
+    TrashEmptyResponse,
+    TrashEntry,
+    TrashListResponse,
+    TrashRestoreRequest,
+    TrashRestoreResponse,
+)
+from app.trash import (
+    delete_library_entry,
+    empty_trash,
+    list_trash,
+    restore_trash_entry,
 )
 from app.rescan import (
     NoticeBoard,
@@ -723,6 +742,14 @@ async def move_library_path(request: LibraryMoveRequest) -> LibraryMoveResponse:
                 status_code=409,
                 detail={"message": exc.message, "conflicts": exc.conflicts},
             ) from exc
+        except PartialRenameError as exc:
+            # Not all-or-nothing after all: some files really did move, so the
+            # scan cache and every open tab have to be told before the 500
+            # goes out -- otherwise the tree the user looks at while reading
+            # the error still shows the files where they no longer are.
+            await asyncio.to_thread(library_invalidate)
+            queue_manager.emit_library_changed([""])
+            raise _library_write_failure(exc, "move") from exc
         except OSError as exc:
             logger.exception("Move failed")
             raise HTTPException(
@@ -747,3 +774,169 @@ async def move_library_path(request: LibraryMoveRequest) -> LibraryMoveResponse:
         removed=outcome.removed,
         destination=outcome.destination,
     )
+
+
+def _library_write_failure(exc: BaseException, what: str) -> HTTPException:
+    """Turn the library write exceptions into the responses the API promises.
+
+    Move, delete and restore all raise the same four, and all four mean the
+    same thing to a client: a bad path is 400, a missing one 404, an occupied
+    target or a download in the way 409 with the list, and a filesystem that
+    said no is 500 with its own words.  Kept in one place so the three routes
+    cannot drift apart on what a 409 body looks like.
+    """
+    if isinstance(exc, LibraryPathError):
+        return HTTPException(status_code=400, detail=str(exc))
+    if isinstance(exc, LibraryNotFound):
+        return HTTPException(status_code=404, detail=str(exc))
+    if isinstance(exc, LibraryConflict):
+        return HTTPException(
+            status_code=409,
+            detail={"message": exc.message, "conflicts": exc.conflicts},
+        )
+    if isinstance(exc, PartialRenameError):
+        # The all-or-nothing promise did not hold: some files are somewhere the
+        # user did not put them, and the message has to say where rather than
+        # hand them the filesystem's own words for a half-done operation.
+        logger.exception("%s failed partway", what.capitalize())
+        return HTTPException(
+            status_code=500, detail=f"The {what} failed partway: {exc.detail}"
+        )
+    logger.exception("%s failed", what.capitalize())
+    strerror = getattr(exc, "strerror", None)
+    return HTTPException(status_code=500, detail=f"The {what} failed: {strerror or exc}")
+
+
+@app.post("/library/delete", response_model=LibraryDeleteResponse)
+async def delete_library_path(request: LibraryDeleteRequest) -> LibraryDeleteResponse:
+    """Move a track, a selection of tracks, an album or an artist to the trash.
+
+    Nothing is unlinked: the item is renamed into ``.trash/<id>/`` with its
+    original relative path intact, so Restore is a rename back.  Same lock,
+    same in-flight guard and same 409 shape as the move endpoint -- a download
+    aiming into the folder being deleted is "not now, here is what is in the
+    way", and the dialog shows it exactly as it shows an occupied path.
+    """
+    async with LIBRARY_WRITE_LOCK:
+        # Read inside the lock on the event-loop thread, where the queue's
+        # dicts are only ever mutated; see the move endpoint.
+        in_flight = queue_manager.in_flight_library_targets()
+
+        try:
+            outcome = await asyncio.to_thread(
+                delete_library_entry,
+                root=get_download_path(),
+                path=request.path,
+                paths=request.paths,
+                in_flight=in_flight.targets,
+                unresolved=in_flight.unresolved,
+                unresolved_jobs=in_flight.unresolved_jobs,
+            )
+        except PartialRenameError as exc:
+            # Not all-or-nothing after all: some files really did move, so the
+            # scan cache and every open tab have to be told before the 500
+            # goes out -- otherwise the tree the user looks at while reading
+            # the error still shows the files where they no longer are.
+            await asyncio.to_thread(library_invalidate)
+            queue_manager.emit_library_changed([""])
+            raise _library_write_failure(exc, "delete") from exc
+        except (LibraryPathError, LibraryNotFound, LibraryConflict, OSError) as exc:
+            raise _library_write_failure(exc, "delete") from exc
+
+        # Inside the lock: the next writer's collision check must not run
+        # against a scan cache that still describes the tree we just changed.
+        await asyncio.to_thread(library_invalidate)
+
+    queue_manager.emit_library_changed(outcome.changed)
+
+    return LibraryDeleteResponse(
+        entry=TrashEntry.model_validate(vars(outcome.entry)),
+        removed=outcome.removed,
+    )
+
+
+@app.get("/library/trash", response_model=TrashListResponse)
+async def get_library_trash(response: Response) -> TrashListResponse:
+    """List what is in the trash, newest first.
+
+    Read off the filesystem on every call -- one entry per ``.trash/<id>/``
+    folder -- because the trash has no table behind it either.  ``no-store``
+    for the same reason ``GET /library`` uses it: a stale answer here shows the
+    user a Restore button for something that is no longer there.
+    """
+    entries, track_count = await asyncio.to_thread(list_trash, get_download_path())
+    response.headers["Cache-Control"] = "no-store"
+    return TrashListResponse(
+        entries=[TrashEntry.model_validate(vars(entry)) for entry in entries],
+        track_count=track_count,
+    )
+
+
+@app.post("/library/trash/restore", response_model=TrashRestoreResponse)
+async def restore_library_trash(request: TrashRestoreRequest) -> TrashRestoreResponse:
+    """Put one trash entry back where it came from, or under a new artist.
+
+    All-or-nothing: an occupied target refuses the whole entry with 409 and the
+    full list, and the UI answers that by re-sending this call with an
+    ``artist`` (and maybe an ``album``) the user picked in the move dialog.
+    """
+    async with LIBRARY_WRITE_LOCK:
+        in_flight = queue_manager.in_flight_library_targets()
+
+        try:
+            outcome = await asyncio.to_thread(
+                restore_trash_entry,
+                root=get_download_path(),
+                entry_id=request.id,
+                artist=request.artist,
+                album=request.album,
+                in_flight=in_flight.targets,
+                unresolved=in_flight.unresolved,
+                unresolved_jobs=in_flight.unresolved_jobs,
+            )
+        except PartialRenameError as exc:
+            # Not all-or-nothing after all: some files really did move, so the
+            # scan cache and every open tab have to be told before the 500
+            # goes out -- otherwise the tree the user looks at while reading
+            # the error still shows the files where they no longer are.
+            await asyncio.to_thread(library_invalidate)
+            queue_manager.emit_library_changed([""])
+            raise _library_write_failure(exc, "restore") from exc
+        except (LibraryPathError, LibraryNotFound, LibraryConflict, OSError) as exc:
+            raise _library_write_failure(exc, "restore") from exc
+
+        await asyncio.to_thread(library_invalidate)
+
+    queue_manager.emit_library_changed(outcome.changed)
+
+    return TrashRestoreResponse(
+        restored=[
+            RestoredPath(source=item["source"], target=item["target"])
+            for item in outcome.restored
+        ],
+    )
+
+
+@app.post("/library/trash/empty", response_model=TrashEmptyResponse)
+async def empty_library_trash() -> TrashEmptyResponse:
+    """Delete everything in the trash permanently.
+
+    The only endpoint that unlinks a user's audio, which is why the dialog
+    behind it names the total count.  No in-flight guard: nothing under
+    ``.trash`` is a folder any download can be aiming at.  ``library_changed``
+    still fires with the library root -- Navidrome and Lidarr have to be told
+    to forget what was in there, and the root is the folder that covers it.
+    """
+    async with LIBRARY_WRITE_LOCK:
+        try:
+            removed, track_count = await asyncio.to_thread(
+                empty_trash, get_download_path()
+            )
+        except OSError as exc:
+            raise _library_write_failure(exc, "empty") from exc
+
+        await asyncio.to_thread(library_invalidate)
+
+    queue_manager.emit_library_changed([""])
+
+    return TrashEmptyResponse(removed=removed, track_count=track_count)

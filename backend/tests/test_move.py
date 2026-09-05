@@ -13,13 +13,14 @@ assertions are made against files mutagen really wrote and really read back.
 """
 
 import os
+import time
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 from mutagen.flac import FLAC
 
-from app import library
+from app import library, library_ops
 from app.models import Job, JobKind, JobStatus, SSEEvent
 from app.queue_manager import QueueManager
 from tests.conftest import TINY_JPEG
@@ -597,6 +598,14 @@ def test_giving_both_path_and_paths_is_refused(client):
         json={"path": "Bonobo", "paths": ["Bonobo/Flashlight.flac"], "artist": "X"},
     )
     assert response.status_code == 400
+    assert response.json()["detail"] == "give 'path' or 'paths', not both"
+
+
+def test_giving_neither_path_nor_paths_is_refused(client):
+    """Its own message: "not both" is no help to a caller that gave neither."""
+    response = client.post("/library/move", json={"artist": "X"})
+    assert response.status_code == 400
+    assert response.json()["detail"] == "give either 'path' or 'paths'"
 
 
 def test_an_empty_paths_list_is_refused(client):
@@ -797,11 +806,11 @@ def test_cleanup_never_removes_an_audio_file_that_turned_up(root):
     emptiness check and the removal cannot be one atomic step, so the removal
     itself has to refuse the moment it meets audio.
     """
-    from app.mover import _remove_leftovers
+    from app.library_ops import remove_leftovers
 
     folder = root / "Bonobo" / "Black Sands"
 
-    assert _remove_leftovers(folder) is False
+    assert remove_leftovers(folder) is False
     assert (folder / "Kiara.flac").is_file()
     assert (folder / "Kong.flac").is_file()
 
@@ -832,6 +841,54 @@ def test_a_move_emits_library_changed_with_both_ends(client_and_queue, root):
     changed = [event for event in events if event.event == "library_changed"]
     assert len(changed) == 1
     assert set(changed[0].data["paths"]) == {"Bonobo/Migration", "Bonobo/Black Sands"}
+
+
+def test_a_move_that_stranded_files_still_refreshes_the_tree(
+    client_and_queue, root, monkeypatch
+):
+    """A 500 that says files moved has to be a 500 the open tabs believe.
+
+    The rollback failed, so the tree really did change; leaving the scan cache
+    and the tabs on the old picture would show the user the track still in the
+    album the error has just told them it is no longer in.
+    """
+    client, _manager, events = client_and_queue
+    import app.main as main_module
+
+    invalidations: list[int] = []
+    real_invalidate = main_module.library_invalidate
+
+    def counting() -> None:
+        invalidations.append(1)
+        real_invalidate()
+
+    monkeypatch.setattr(main_module, "library_invalidate", counting)
+
+    def fake_rename_files(pairs):
+        source, target = pairs[0]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(source, target)
+        raise library_ops.PartialRenameError([source], "1 file(s) are somewhere else now")
+
+    monkeypatch.setattr("app.mover.rename_files", fake_rename_files)
+    events.clear()
+
+    response = client.post(
+        "/library/move",
+        json={
+            "paths": ["Bonobo/Migration/Kerala.flac"],
+            "artist": "Bonobo",
+            "album": "Black Sands",
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "The move failed partway: 1 file(s) are somewhere else now"
+    )
+    changed = [event for event in events if event.event == "library_changed"]
+    assert [event.data["paths"] for event in changed] == [[""]]
+    assert invalidations
 
 
 def test_a_move_that_changed_nothing_emits_nothing(client_and_queue, root):
@@ -1365,3 +1422,61 @@ def test_the_prune_leaves_the_cache_alone_when_the_scan_found_no_artists(
 
     assert library.prune_cover_cache({"artists": []}, data_dir) == 0
     assert entry.is_file()
+
+
+def test_the_prune_reclaims_an_abandoned_temp_cover(isolated_paths):
+    """A ``tmp-`` file from a killed process must not sit in the cache forever.
+
+    A fresh one is still somebody's in-flight write and is left alone; an old
+    one belongs to nobody, because the gap between ``mkstemp`` and
+    ``os.replace`` is milliseconds.
+    """
+    _download_dir, data_dir = isolated_paths
+    cache = library.cover_cache_dir(data_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    fresh = cache / "tmp-fresh.tmp"
+    fresh.write_bytes(TINY_JPEG)
+    stale = cache / "tmp-stale.tmp"
+    stale.write_bytes(TINY_JPEG)
+    old = time.time() - library.TEMP_CACHE_MAX_AGE_SECONDS - 60
+    os.utime(stale, (old, old))
+
+    payload = {"artists": [{"albums": [{"path": "Bonobo/Black Sands"}]}]}
+    assert library.prune_cover_cache(payload, data_dir) == 1
+    assert fresh.is_file()
+    assert not stale.exists()
+
+
+def test_a_failed_case_only_rename_leaves_a_visible_folder(root, monkeypatch):
+    """The staging name must never be dot-prefixed.
+
+    A case-only rename goes through a temporary name because the filesystem
+    treats the one-step version as a no-op.  When the second rename fails the
+    folder is left standing under that name -- and under a dot-prefixed one it
+    was hidden from the scanner, from Navidrome and from Lidarr, so the user's
+    album had silently vanished from every view they have of it.
+    """
+    if not _case_insensitive(root):
+        pytest.skip("a case-only rename is a single rename here, with no staging name")
+
+    real_rename = os.rename
+    calls = []
+
+    def failing_rename(source, target):
+        calls.append(target)
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        return real_rename(source, target)
+
+    monkeypatch.setattr(library_ops.os, "rename", failing_rename)
+
+    source = root / "Bonobo"
+    with pytest.raises(OSError):
+        library_ops.rename_folder(source, root / "BONOBO", root)
+
+    leftovers = [entry.name for entry in root.iterdir() if entry.is_dir()]
+    staged = [name for name in leftovers if ".moving-" in name]
+    assert staged, f"expected a staging folder, got {leftovers}"
+    assert not any(name.startswith(".") for name in staged)
+    # And it is a folder the scanner can see, which is the whole point.
+    assert not library._is_hidden(staged[0])

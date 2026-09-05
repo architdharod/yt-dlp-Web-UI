@@ -833,6 +833,16 @@ class QueueManager:
             """
             if job.status in _TERMINAL:
                 return
+            # The order of these two is load-bearing.  This runs on the
+            # download thread while the event loop may be inside
+            # ``in_flight_library_targets`` for a move or a delete, and that
+            # reader takes ``target_guessed is False`` as its licence to
+            # believe ``target_dir``.  Writing the real folder first means the
+            # worst a reader can see is the guess it already distrusted;
+            # clearing the flag first would offer it the *old* guessed folder
+            # as a resolved answer, and the guard would then protect a folder
+            # the download is not going to write into while leaving the one it
+            # is unguarded.
             job.target_dir = target_dir
             job.target_guessed = False
             self._persist(job)

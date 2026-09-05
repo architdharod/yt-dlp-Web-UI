@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { coverUrl, moveLibraryPath } from "@/lib/api";
+import {
+  LibraryMoveConflict,
+  coverUrl,
+  deleteLibraryPath,
+  emptyTrash,
+  getTrash,
+  moveLibraryPath,
+  restoreTrashEntry,
+} from "@/lib/api";
 
 describe("coverUrl", () => {
   it("passes the album path and its cover version", () => {
@@ -83,5 +91,128 @@ describe("moveLibraryPath", () => {
     await expect(moveLibraryPath(request)).rejects.toThrow(
       "artist must not be '.' or '..'",
     );
+  });
+});
+
+
+/** Stub `fetch` with one JSON response, and hand back the mock to inspect. */
+function respondWith(status: number, body: unknown) {
+  const fetchMock = vi.fn().mockResolvedValue(
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+/** The parsed JSON body of the one request the stub received. */
+function sentBody(fetchMock: ReturnType<typeof vi.fn>): unknown {
+  const init = fetchMock.mock.calls[0][1] as RequestInit;
+  return JSON.parse(init.body as string);
+}
+
+const entry = {
+  id: "t1",
+  path: "Bonobo/Black Sands",
+  kind: "album" as const,
+  paths: ["Bonobo/Black Sands/Prelude.flac"],
+  deleted_at: "2026-09-04T11:00:00Z",
+  track_count: 1,
+};
+
+describe("the trash endpoints", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("posts a delete and returns the entry it became", async () => {
+    const fetchMock = respondWith(200, { entry, removed: ["Bonobo"] });
+
+    const result = await deleteLibraryPath({ path: "Bonobo/Black Sands" });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/library/delete");
+    expect(sentBody(fetchMock)).toEqual({ path: "Bonobo/Black Sands" });
+    expect(result.entry.id).toBe("t1");
+  });
+
+  it("carries a selection of tracks as paths", async () => {
+    const fetchMock = respondWith(200, { entry, removed: [] });
+
+    await deleteLibraryPath({ paths: ["a.flac", "b.flac"] });
+
+    expect(sentBody(fetchMock)).toEqual({ paths: ["a.flac", "b.flac"] });
+  });
+
+  it("raises the backend's message when a delete is refused", async () => {
+    respondWith(409, { detail: "a download is writing into Bonobo" });
+
+    await expect(deleteLibraryPath({ path: "Bonobo" })).rejects.toThrow(
+      "a download is writing into Bonobo",
+    );
+  });
+
+  it("reads the trash listing", async () => {
+    const fetchMock = respondWith(200, { entries: [entry], track_count: 1 });
+
+    const result = await getTrash();
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/library/trash");
+    expect(result.entries).toHaveLength(1);
+  });
+
+  it("explains a failed trash listing", async () => {
+    respondWith(500, { detail: "the trash folder is unreadable" });
+
+    await expect(getTrash()).rejects.toThrow("the trash folder is unreadable");
+  });
+
+  it("posts a restore by id", async () => {
+    const fetchMock = respondWith(200, { restored: [] });
+
+    await restoreTrashEntry({ id: "t1" });
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/library/trash/restore");
+    expect(sentBody(fetchMock)).toEqual({ id: "t1" });
+  });
+
+  it("carries the artist and album of a restore aimed somewhere else", async () => {
+    const fetchMock = respondWith(200, { restored: [] });
+
+    await restoreTrashEntry({ id: "t1", artist: "Bonobo", album: "" });
+
+    expect(sentBody(fetchMock)).toEqual({
+      id: "t1",
+      artist: "Bonobo",
+      album: "",
+    });
+  });
+
+  it("throws the conflict a 409 restore carries", async () => {
+    respondWith(409, {
+      detail: {
+        message: "already in the library",
+        conflicts: ["Bonobo/Black Sands"],
+      },
+    });
+
+    const failure = await restoreTrashEntry({ id: "t1" }).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(LibraryMoveConflict);
+    expect((failure as LibraryMoveConflict).conflicts).toEqual([
+      "Bonobo/Black Sands",
+    ]);
+  });
+
+  it("empties the trash and reports what went", async () => {
+    const fetchMock = respondWith(200, { removed: 2, track_count: 13 });
+
+    const result = await emptyTrash();
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/library/trash/empty");
+    expect(result).toEqual({ removed: 2, track_count: 13 });
   });
 });

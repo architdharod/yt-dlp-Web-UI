@@ -76,6 +76,7 @@ describe("useQueueStream", () => {
     expect(invalidated).toEqual([
       queryKeys.queue,
       queryKeys.library,
+      queryKeys.trash,
       queryKeys.notices,
     ]);
   });
@@ -89,6 +90,7 @@ describe("useQueueStream", () => {
     expect(invalidated).toEqual([
       queryKeys.queue,
       queryKeys.library,
+      queryKeys.trash,
       queryKeys.notices,
     ]);
   });

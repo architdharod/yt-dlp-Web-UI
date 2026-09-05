@@ -182,3 +182,87 @@ export interface LibraryMoveResponse {
   removed: string[];
   destination: string | null;
 }
+
+/**
+ * Request body for `POST /library/delete`.
+ *
+ * The same two shapes as a move: `paths` for a selection of tracks from one
+ * folder, `path` for a single track, an album folder, or an artist folder.
+ * Exactly one of the two is sent, and the whole request becomes one trash
+ * entry, so restoring brings an album or an artist back intact.
+ */
+export interface LibraryDeleteRequest {
+  path?: string;
+  paths?: string[];
+}
+
+/**
+ * What kind of thing a trash entry holds.
+ *
+ * `track` is one file, `tracks` a selection from one folder; `album` and
+ * `artist` are whole folders moved as one, which is what lets Restore put the
+ * folder back with its `cover.jpg` and everything else that was in it.
+ */
+export type TrashEntryKind = "artist" | "album" | "track" | "tracks";
+
+/**
+ * One entry in `.trash`, as `GET /library/trash` lists them.
+ *
+ * `path` is the original library path the entry came from — the identity the
+ * UI shows and the target Restore aims at. `paths` are the individual audio
+ * files the entry covers, which is what the restore dialog reads the original
+ * artist and album out of for a multi-track entry. `id` is the handle Restore
+ * takes; nothing else about an entry is stable enough to name it.
+ */
+export interface TrashEntry {
+  id: string;
+  path: string;
+  kind: TrashEntryKind;
+  paths: string[];
+  /** ISO 8601, UTC. */
+  deleted_at: string;
+  track_count: number;
+}
+
+/** The `POST /library/delete` response: the entry made, and folders cleaned up. */
+export interface LibraryDeleteResponse {
+  entry: TrashEntry;
+  removed: string[];
+}
+
+/** The whole `GET /library/trash` response: entries newest first, plus totals. */
+export interface TrashResponse {
+  entries: TrashEntry[];
+  track_count: number;
+}
+
+/**
+ * Request body for `POST /library/trash/restore`.
+ *
+ * `artist` and `album` are omitted for the plain "put it back where it was"
+ * restore, and carry the names the user picked in the move dialog after a 409
+ * said the original path is occupied. A blank `album` files restored tracks
+ * loose under the artist, exactly as it does for a move.
+ */
+export interface TrashRestoreRequest {
+  id: string;
+  artist?: string;
+  album?: string | null;
+}
+
+/** One file's trash path and where the restore put it back. */
+export interface RestoredPath {
+  source: string;
+  target: string;
+}
+
+/** The `POST /library/trash/restore` response. */
+export interface TrashRestoreResponse {
+  restored: RestoredPath[];
+}
+
+/** The `POST /library/trash/empty` response: how much was destroyed. */
+export interface TrashEmptyResponse {
+  removed: number;
+  track_count: number;
+}

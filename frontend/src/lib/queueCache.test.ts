@@ -165,7 +165,7 @@ describe("applyQueueEvent", () => {
     expect(queue()).toBeUndefined();
   });
 
-  it("invalidates the library on library_changed and touches nothing else", () => {
+  it("invalidates the library and the trash on library_changed, and touches the queue not at all", () => {
     queryClient.setQueryData(queryKeys.queue, [job("a")]);
 
     applyQueueEvent(
@@ -173,14 +173,14 @@ describe("applyQueueEvent", () => {
       event("library_changed", "a", { paths: ["Bonobo/Migration/Kerala.flac"] }),
     );
 
-    expect(invalidated).toEqual([queryKeys.library]);
+    expect(invalidated).toEqual([queryKeys.library, queryKeys.trash]);
     expect(queue()!.map((j) => j.id)).toEqual(["a"]);
   });
 
   it("handles a library_changed with no job behind it", () => {
     applyQueueEvent(queryClient, event("library_changed", null, { paths: [] }));
 
-    expect(invalidated).toEqual([queryKeys.library]);
+    expect(invalidated).toEqual([queryKeys.library, queryKeys.trash]);
   });
 });
 
@@ -290,6 +290,7 @@ describe("resyncAfterReconnect", () => {
     expect(invalidated).toEqual([
       queryKeys.queue,
       queryKeys.library,
+      queryKeys.trash,
       queryKeys.notices,
     ]);
   });

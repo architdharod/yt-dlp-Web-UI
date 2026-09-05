@@ -9,7 +9,7 @@ import {
 } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { LibraryTab } from "@/components/LibraryTab";
-import { getLibrary, moveLibraryPath } from "@/lib/api";
+import { deleteLibraryPath, getLibrary, moveLibraryPath } from "@/lib/api";
 import {
   album,
   artist,
@@ -26,10 +26,12 @@ vi.mock("@/lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/api")>()),
   getLibrary: vi.fn(),
   moveLibraryPath: vi.fn(),
+  deleteLibraryPath: vi.fn(),
 }));
 
 const getLibraryMock = vi.mocked(getLibrary);
 const moveMock = vi.mocked(moveLibraryPath);
+const deleteMock = vi.mocked(deleteLibraryPath);
 
 /** Mount the tab against a fresh client, leaving the mock to the caller. */
 function renderLibraryTab() {
@@ -68,6 +70,18 @@ beforeEach(() => {
   getLibraryMock.mockReset();
   moveMock.mockReset();
   moveMock.mockResolvedValue({ moved: [], removed: [], destination: null });
+  deleteMock.mockReset();
+  deleteMock.mockResolvedValue({
+    entry: {
+      id: "t1",
+      path: "Bonobo/Black Sands",
+      kind: "album",
+      paths: [],
+      deleted_at: "2026-09-04T12:00:00Z",
+      track_count: 2,
+    },
+    removed: [],
+  });
 });
 
 describe("LibraryTab", () => {
@@ -702,5 +716,173 @@ describe("LibraryTab moving", () => {
     await waitFor(() =>
       expect(currentCrumb()).toBe("Black Sands (Remastered)"),
     );
+  });
+});
+
+describe("LibraryTab deleting", () => {
+  /** The text of the last breadcrumb, which is the level on screen. */
+  function currentCrumb(): string {
+    return document.querySelector('[aria-current="page"]')?.textContent ?? "";
+  }
+
+  /** Open Bonobo's Black Sands, which has two tracks to tick. */
+  async function openBlackSands() {
+    renderTab();
+    await openBonobo();
+    click(/Black Sands/);
+  }
+
+  /** Press a button inside the confirmation, not the one that opened it. */
+  async function confirm(name: string) {
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name }));
+  }
+
+  /** The question the open confirmation is asking. */
+  async function question(): Promise<string> {
+    const dialog = await screen.findByRole("dialog");
+    return (
+      within(dialog).getByText(/^Move .* to trash\?$/).textContent ?? ""
+    );
+  }
+
+  it("names the artist and its whole track count", async () => {
+    renderTab();
+    await openBonobo();
+
+    click("Delete artist");
+
+    expect(await question()).toBe('Move "Bonobo" (5 tracks) to trash?');
+    expect(
+      screen.getByText("You can restore it from Trash until you empty it."),
+    ).toBeTruthy();
+  });
+
+  it("trashes the artist folder as one path", async () => {
+    renderTab();
+    await openBonobo();
+    click("Delete artist");
+
+    await confirm("Delete");
+
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledTimes(1));
+    expect(deleteMock.mock.calls[0][0]).toEqual({ path: "Bonobo" });
+    // The folder is gone, so the user cannot be standing in it.
+    await waitFor(() => expect(currentCrumb()).toBe(""));
+  });
+
+  it("names the album and its track count", async () => {
+    await openBlackSands();
+
+    click("Delete album");
+
+    expect(await question()).toBe('Move "Black Sands" (2 tracks) to trash?');
+  });
+
+  it("trashes the album folder and drops back to the artist", async () => {
+    await openBlackSands();
+    click("Delete album");
+
+    await confirm("Delete");
+
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledTimes(1));
+    expect(deleteMock.mock.calls[0][0]).toEqual({
+      path: "Bonobo/Black Sands",
+    });
+    await waitFor(() => expect(currentCrumb()).toBe("Bonobo"));
+  });
+
+  /** The first track row's own Delete, next to its Move. */
+  function deleteFirstRow() {
+    fireEvent.click(screen.getAllByRole("button", { name: /^Delete$/ })[0]);
+  }
+
+  it("names one track in the singular", async () => {
+    await openBlackSands();
+
+    deleteFirstRow();
+
+    expect(await question()).toBe('Move "Prelude" (1 track) to trash?');
+  });
+
+  it("sends one track as a one-element paths list", async () => {
+    await openBlackSands();
+    deleteFirstRow();
+
+    await confirm("Delete");
+
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledTimes(1));
+    expect(deleteMock.mock.calls[0][0]).toEqual({
+      paths: ["Bonobo/Black Sands/Prelude.flac"],
+    });
+  });
+
+  it("counts a selection rather than naming it", async () => {
+    await openBlackSands();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Kiara" }));
+
+    click("Delete selected");
+
+    expect(await question()).toBe("Move 2 tracks to trash?");
+  });
+
+  it("sends every ticked path and then drops the selection", async () => {
+    await openBlackSands();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Kiara" }));
+    click("Delete selected");
+
+    await confirm("Delete");
+
+    await waitFor(() => expect(deleteMock).toHaveBeenCalledTimes(1));
+    expect(deleteMock.mock.calls[0][0]).toEqual({
+      paths: [
+        "Bonobo/Black Sands/Prelude.flac",
+        "Bonobo/Black Sands/Kiara.flac",
+      ],
+    });
+    await waitFor(() =>
+      expect(screen.queryByText("2 tracks selected")).toBeNull(),
+    );
+    // The user stays in the album; only its tracks went.
+    expect(currentCrumb()).toBe("Black Sands");
+  });
+
+  it("keeps the selection and trashes nothing when the dialog is cancelled", async () => {
+    await openBlackSands();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select Prelude" }));
+    click("Delete selected");
+
+    await confirm("Cancel");
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(deleteMock).not.toHaveBeenCalled();
+    expect(screen.getByText("1 track selected")).toBeTruthy();
+  });
+
+  it("shows a refused delete in the dialog and leaves the page as it was", async () => {
+    deleteMock.mockRejectedValue(
+      new Error("a download is writing into Bonobo/Black Sands"),
+    );
+    await openBlackSands();
+    click("Delete album");
+
+    await confirm("Delete");
+
+    expect(
+      await screen.findByText("a download is writing into Bonobo/Black Sands"),
+    ).toBeTruthy();
+    expect(currentCrumb()).toBe("Black Sands");
+  });
+
+  it("offers no delete on the synthetic bucket, which is not a folder", async () => {
+    renderTab();
+    await screen.findByRole("button", { name: /Unknown Artist/ });
+    click(/Unknown Artist/);
+
+    expect(screen.queryByRole("button", { name: "Delete artist" })).toBeNull();
+    // Its loose files can still be trashed one by one.
+    expect(screen.getAllByRole("button", { name: /^Delete$/ })).toHaveLength(1);
   });
 });

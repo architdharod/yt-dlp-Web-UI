@@ -9,7 +9,7 @@ import type { LibraryTrack } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
- * The multi-select and Move affordances a track list may be given.
+ * The multi-select, Move, and Delete affordances a track list may be given.
  *
  * All optional: the Singles list on an artist page and the album's track list
  * both get them, but a list rendered somewhere read-only simply leaves them
@@ -24,6 +24,10 @@ export interface TrackListActions {
   onMove?: (track: LibraryTrack) => void;
   /** Move everything currently ticked. */
   onMoveSelected?: () => void;
+  /** Trash one track, from its own row action. */
+  onDelete?: (track: LibraryTrack) => void;
+  /** Trash everything currently ticked. */
+  onDeleteSelected?: () => void;
 }
 
 /** The container format that needs no badge, because almost everything is it. */
@@ -42,7 +46,7 @@ function TrackRow({
   onHighlightMount: (node: HTMLDivElement | null) => void;
   actions: TrackListActions;
 }) {
-  const { selected, onSelect, onMove } = actions;
+  const { selected, onSelect, onMove, onDelete } = actions;
 
   return (
     <div
@@ -90,6 +94,16 @@ function TrackRow({
           onClick={() => onMove(track)}
         >
           Move
+        </Button>
+      )}
+      {onDelete !== undefined && (
+        <Button
+          variant="ghost"
+          size="xs"
+          className="text-destructive opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100"
+          onClick={() => onDelete(track)}
+        >
+          Delete
         </Button>
       )}
       <TrackDetailPopover track={track} />
@@ -158,10 +172,12 @@ function DiscHeading({ disc }: { disc: number }) {
 function SelectionBar({
   count,
   onMoveSelected,
+  onDeleteSelected,
   onClearSelection,
 }: {
   count: number;
   onMoveSelected: () => void;
+  onDeleteSelected?: () => void;
   onClearSelection?: () => void;
 }) {
   return (
@@ -170,6 +186,11 @@ function SelectionBar({
       <Button variant="outline" size="sm" onClick={onMoveSelected}>
         Move selected
       </Button>
+      {onDeleteSelected !== undefined && (
+        <Button variant="destructive" size="sm" onClick={onDeleteSelected}>
+          Delete selected
+        </Button>
+      )}
       {onClearSelection !== undefined && (
         <Button variant="ghost" size="sm" onClick={onClearSelection}>
           Clear
@@ -228,6 +249,7 @@ export function TrackList({
       <SelectionBar
         count={selectedHere}
         onMoveSelected={actions.onMoveSelected}
+        onDeleteSelected={actions.onDeleteSelected}
         onClearSelection={actions.onClearSelection}
       />
     ) : null;

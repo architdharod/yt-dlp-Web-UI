@@ -283,7 +283,9 @@ function applyNoticesEvent(
  * A plain function over a `QueryClient` rather than something inside the hook,
  * so the whole event-to-cache contract is testable without an EventSource.
  *
- *   - `library_changed` invalidates the library query and touches nothing else.
+ *   - `library_changed` invalidates the library and the trash queries: a
+ *     delete, a restore, or an empty-trash changes both, and the event does
+ *     not say which of them happened.
  *   - `notices` replaces the notices query with the open set the event
  *     carries, so a service failure paints a banner — and a cleared one stops
  *     being shown — without a refetch.
@@ -301,6 +303,7 @@ export function applyQueueEvent(
 ): void {
   if (event.event === "library_changed") {
     void queryClient.invalidateQueries({ queryKey: queryKeys.library });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.trash });
     return;
   }
 
@@ -373,6 +376,10 @@ export function resyncAfterReconnect(queryClient: QueryClient): void {
   );
   void queryClient.invalidateQueries(
     { queryKey: queryKeys.library },
+    { cancelRefetch: false },
+  );
+  void queryClient.invalidateQueries(
+    { queryKey: queryKeys.trash },
     { cancelRefetch: false },
   );
   // A notice raised while the stream was down was never delivered, and one the

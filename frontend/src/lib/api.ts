@@ -2,11 +2,17 @@ import type {
   DownloadRequest,
   Job,
   LibraryAlbum,
+  LibraryDeleteRequest,
+  LibraryDeleteResponse,
   LibraryMoveRequest,
   LibraryMoveResponse,
   LibraryResponse,
   Notice,
   SSEEvent,
+  TrashEmptyResponse,
+  TrashResponse,
+  TrashRestoreRequest,
+  TrashRestoreResponse,
 } from "./types";
 
 /**
@@ -255,7 +261,8 @@ export function connectQueueStream(
 }
 
 /**
- * A move the backend refused because something is already in the way.
+ * A move, delete, or restore the backend refused because something is already
+ * in the way.
  *
  * `conflicts` are the target paths that are occupied — every one of them, so
  * the dialog can show the whole list rather than making the user discover them
@@ -295,6 +302,37 @@ function parseConflict(body: unknown): LibraryMoveConflict | null {
 }
 
 /**
+ * `POST` a JSON body to a library endpoint and read the JSON that comes back.
+ *
+ * Every library action shares one error contract: a 409 carries
+ * `{"detail": {"message", "conflicts"}}` and throws a `LibraryConflict` with
+ * the occupied paths; anything else throws a plain Error with the backend's
+ * message. Written once here so delete, restore, and empty-trash cannot drift
+ * from move in how a refusal reaches the UI.
+ */
+async function postLibraryJson<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+
+  if (!res.ok) {
+    // Read once: a 409 whose body is not the conflict shape still has to
+    // produce a message, and a second read of the same body would throw.
+    const text = await res.text().catch(() => "");
+    const parsed = parseJson(text);
+    if (res.status === 409) {
+      const conflict = parseConflict(parsed);
+      if (conflict !== null) throw conflict;
+    }
+    throw new Error(errorDetail(parsed, res.statusText));
+  }
+
+  return res.json() as Promise<T>;
+}
+
+/**
  * Move tracks, move an album to another artist, or rename an artist.
  *
  * Paths travel in the body, never in the URL: a folder called "AC/DC" is a
@@ -305,23 +343,50 @@ function parseConflict(body: unknown): LibraryMoveConflict | null {
 export async function moveLibraryPath(
   request: LibraryMoveRequest,
 ): Promise<LibraryMoveResponse> {
-  const res = await fetch(`${API_BASE_URL}/library/move`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
-  });
+  return postLibraryJson<LibraryMoveResponse>("/library/move", request);
+}
+
+/**
+ * Move a track, a selection of tracks, an album, or an artist to the trash.
+ *
+ * Nothing is destroyed: the backend renames the item under `.trash` and
+ * answers with the entry the Trash tab now lists. A 409 means an in-flight
+ * download is aiming at one of the folders involved.
+ */
+export async function deleteLibraryPath(
+  request: LibraryDeleteRequest,
+): Promise<LibraryDeleteResponse> {
+  return postLibraryJson<LibraryDeleteResponse>("/library/delete", request);
+}
+
+/** Everything currently in `.trash`, newest first. */
+export async function getTrash(signal?: AbortSignal): Promise<TrashResponse> {
+  const res = await fetch(`${API_BASE_URL}/library/trash`, { signal });
 
   if (!res.ok) {
-    // Read once: a 409 whose body is not the conflict shape still has to
-    // produce a message, and a second read of the same body would throw.
-    const text = await res.text().catch(() => "");
-    const body = parseJson(text);
-    if (res.status === 409) {
-      const conflict = parseConflict(body);
-      if (conflict !== null) throw conflict;
-    }
-    throw new Error(errorDetail(body, res.statusText));
+    throw new Error(`Failed to fetch the trash: ${await parseErrorDetail(res)}`);
   }
 
-  return res.json() as Promise<LibraryMoveResponse>;
+  return res.json() as Promise<TrashResponse>;
+}
+
+/**
+ * Put a trash entry back, either where it came from or — with *artist* and
+ * *album* — somewhere else.
+ *
+ * A 409 throws a `LibraryMoveConflict` naming the occupied paths and nothing
+ * has moved, which is what opens the move dialog on a restore.
+ */
+export async function restoreTrashEntry(
+  request: TrashRestoreRequest,
+): Promise<TrashRestoreResponse> {
+  return postLibraryJson<TrashRestoreResponse>(
+    "/library/trash/restore",
+    request,
+  );
+}
+
+/** Destroy the whole of `.trash`. There is nothing to undo this with. */
+export async function emptyTrash(): Promise<TrashEmptyResponse> {
+  return postLibraryJson<TrashEmptyResponse>("/library/trash/empty");
 }

@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import {
   Tabs,
@@ -11,7 +12,7 @@ import { NoticeBanner } from "@/components/NoticeBanner";
 import { TrashTab } from "@/components/TrashTab";
 import { useActiveJobCount } from "@/hooks/useQueueQuery";
 import { useQueueStream } from "@/hooks/useQueueStream";
-import { useTrashCount } from "@/hooks/useTrashCount";
+import { useTrashCount } from "@/hooks/useTrashQuery";
 
 /**
  * The whole app: a tab bar over the three views, with the queue's SSE stream
@@ -22,6 +23,17 @@ export function App() {
   const { error } = useQueueStream();
   const activeJobs = useActiveJobCount();
   const trashCount = useTrashCount();
+  const [tab, setTab] = useState("download");
+
+  // The Trash tab stops existing the moment the last entry is restored or the
+  // trash is emptied, and a `value` naming a tab that is no longer in the list
+  // would leave every panel hidden. The state is reconciled during render
+  // rather than in an effect, so the fallback sticks: an effect would leave
+  // `tab` saying "trash", and refilling the trash would snap the user back
+  // onto a tab they never chose. The derivation below stays as insurance
+  // against the frame between the `setTab` and the re-render.
+  if (tab === "trash" && trashCount === 0) setTab("library");
+  const activeTab = tab === "trash" && trashCount === 0 ? "library" : tab;
 
   return (
     <div className="mx-auto flex h-dvh max-w-2xl flex-col gap-4 overflow-hidden p-4 sm:p-6">
@@ -32,7 +44,8 @@ export function App() {
       */}
       <NoticeBanner />
       <Tabs
-        defaultValue="download"
+        value={activeTab}
+        onValueChange={(value) => setTab(String(value))}
         className="flex min-h-0 flex-1 flex-col gap-4"
       >
         <TabsList variant="line" className="w-full justify-start border-b">

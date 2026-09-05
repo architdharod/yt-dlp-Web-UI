@@ -1091,6 +1091,23 @@ def get_album_cover(rel: str, root: Path | None = None, data_path: Path | None =
     return Cover(data, content_type, f'"{name}"')
 
 
+# How long a ``tmp-`` cover file may sit in the cache directory before the
+# prune treats it as abandoned rather than in-flight.
+TEMP_CACHE_MAX_AGE_SECONDS = 3600
+
+
+def _is_stale_temp(entry: os.DirEntry[str]) -> bool:
+    """Whether a ``tmp-`` cache file is old enough to have been abandoned.
+
+    A file whose age cannot be read is left alone: "I could not stat it" is not
+    evidence that nobody is writing it.
+    """
+    try:
+        return (time.time() - entry.stat().st_mtime) > TEMP_CACHE_MAX_AGE_SECONDS
+    except OSError:  # pragma: no cover - defensive
+        return False
+
+
 def prune_cover_cache(
     payload: dict[str, Any], data_path: Path | None = None
 ) -> int:
@@ -1138,8 +1155,19 @@ def prune_cover_cache(
                 continue
             # A half-written cover another thread is about to rename into
             # place.  It belongs to no album yet, so no prefix of ours can
-            # match it and it would always look stale.
+            # match it and it would always look stale -- but one left behind
+            # by a killed process belongs to nobody at all and would otherwise
+            # sit in the cache forever, so an old one is reclaimed.  An hour is
+            # far longer than the milliseconds between ``mkstemp`` and
+            # ``os.replace`` and far shorter than "forever".
             if entry.name.startswith("tmp-"):
+                if _is_stale_temp(entry):
+                    try:
+                        os.unlink(entry.path)
+                    except OSError as exc:  # pragma: no cover - defensive
+                        logger.debug("Could not prune %s: %s", entry.name, exc)
+                    else:
+                        removed += 1
                 continue
             prefix = entry.name.split("-", 1)[0]
             if prefix in live:

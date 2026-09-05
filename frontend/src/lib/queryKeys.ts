@@ -15,6 +15,13 @@ export const queryKeys = {
    */
   library: ["library"] as const,
   /**
+   * GET /library/trash — the deleted entries waiting to be restored or
+   * destroyed. Everything that writes to the library invalidates this
+   * alongside `library`: a delete fills it, a restore or an empty-trash
+   * drains it, and the tab itself only exists while it is non-empty.
+   */
+  trash: ["trash"] as const,
+  /**
    * GET /notices — the open Navidrome and Lidarr problems. The `notices` SSE
    * event overwrites this key with the whole open set, so a failure — or a
    * clear — that happens while the tab is open needs no refetch.
