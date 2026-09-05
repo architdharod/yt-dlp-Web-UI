@@ -9,30 +9,83 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { submitDownload } from "@/lib/api";
-import type { Job } from "@/lib/types";
+import { probeUrl, submitDownload } from "@/lib/api";
+import { MAX_FOLDER_NAME } from "@/lib/preview";
+import type { CollectionPreview, Job } from "@/lib/types";
 
-interface DownloadFormProps {
-  onJobCreated?: (job: Job) => void;
+/** What the form is waiting on, which is what its button says. */
+type Phase = "idle" | "probing" | "submitting";
+
+const BUTTON_LABEL: Record<Phase, string> = {
+  idle: "Download",
+  probing: "Checking URL...",
+  submitting: "Submitting...",
+};
+
+/**
+ * What the user typed.
+ *
+ * Held by the tab rather than the form: a collection URL replaces the form
+ * with the checklist, and Cancel has to come back to the fields as they were.
+ */
+export interface DownloadFields {
+  url: string;
+  artist: string;
+  album: string;
 }
 
-export function DownloadForm({ onJobCreated }: DownloadFormProps) {
-  const [url, setUrl] = useState("");
-  const [artist, setArtist] = useState("");
-  const [album, setAlbum] = useState("");
-  const [submitting, setSubmitting] = useState(false);
+/** An untouched form, and what a queued download resets it to. */
+export const BLANK_FIELDS: DownloadFields = { url: "", artist: "", album: "" };
+
+interface DownloadFormProps {
+  fields: DownloadFields;
+  onFieldsChange: (fields: DownloadFields) => void;
+  onJobCreated?: (job: Job) => void;
+  /**
+   * A collection URL: hand the checklist over instead of queueing anything.
+   * The trimmed artist goes with it, because the preview the backend answers
+   * with echoes its own suggestion whatever it deduped against.
+   */
+  onCollection?: (preview: CollectionPreview, artist: string) => void;
+}
+
+export function DownloadForm({
+  fields,
+  onFieldsChange,
+  onJobCreated,
+  onCollection,
+}: DownloadFormProps) {
+  const [phase, setPhase] = useState<Phase>("idle");
   const [error, setError] = useState<string | null>(null);
 
-  const canSubmit = url.trim().length > 0 && !submitting;
+  const { url, artist, album } = fields;
+  const canSubmit = url.trim().length > 0 && phase === "idle";
+
+  function setField(field: keyof DownloadFields, value: string) {
+    onFieldsChange({ ...fields, [field]: value });
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!canSubmit) return;
 
-    setSubmitting(true);
+    setPhase("probing");
     setError(null);
 
     try {
+      // Only the backend can tell a track from a collection, so every submit
+      // asks first. The artist goes with the question: it is the folder the
+      // preview's "in library" marks have to be about.
+      const probe = await probeUrl(url.trim(), artist.trim() || null);
+
+      if (probe.type === "collection") {
+        // The fields stay filled — they live in the tab — so Cancel on the
+        // preview comes back to them untouched.
+        onCollection?.(probe.preview, artist.trim());
+        return;
+      }
+
+      setPhase("submitting");
       const job = await submitDownload({
         url: url.trim(),
         artist: artist.trim() || null,
@@ -40,15 +93,13 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
       });
 
       // Clear form on success
-      setUrl("");
-      setArtist("");
-      setAlbum("");
+      onFieldsChange(BLANK_FIELDS);
 
       onJobCreated?.(job);
     } catch (err) {
       setError(err instanceof Error ? err.message : "An unexpected error occurred");
     } finally {
-      setSubmitting(false);
+      setPhase("idle");
     }
   }
 
@@ -57,8 +108,9 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
       <CardHeader>
         <CardTitle>Download Audio</CardTitle>
         <CardDescription>
-          Paste a YouTube or SoundCloud URL to download audio. Single tracks
-          only — playlist and channel URLs are rejected.
+          Paste a YouTube, SoundCloud, or Bandcamp URL. A single track is
+          queued straight away; a playlist, album, or artist page opens a
+          checklist to pick from.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -68,9 +120,9 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
             <Input
               id="url"
               type="url"
-              placeholder="https://youtube.com/watch?v=... or https://soundcloud.com/... (single track)"
+              placeholder="https://youtube.com/watch?v=... or a playlist, album, or artist page"
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={(e) => setField("url", e.target.value)}
               required
             />
           </div>
@@ -82,8 +134,9 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
                 id="artist"
                 type="text"
                 placeholder="Optional"
+                maxLength={MAX_FOLDER_NAME}
                 value={artist}
-                onChange={(e) => setArtist(e.target.value)}
+                onChange={(e) => setField("artist", e.target.value)}
               />
             </div>
 
@@ -93,9 +146,15 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
                 id="album"
                 type="text"
                 placeholder="Optional"
+                maxLength={MAX_FOLDER_NAME}
                 value={album}
-                onChange={(e) => setAlbum(e.target.value)}
+                aria-describedby="album-help"
+                onChange={(e) => setField("album", e.target.value)}
               />
+              <p id="album-help" className="text-xs text-muted-foreground">
+                Ignored for playlists and albums: each track keeps the album the
+                source gave it.
+              </p>
             </div>
           </div>
 
@@ -104,7 +163,7 @@ export function DownloadForm({ onJobCreated }: DownloadFormProps) {
           )}
 
           <Button type="submit" disabled={!canSubmit} size="lg">
-            {submitting ? "Submitting..." : "Download"}
+            {BUTTON_LABEL[phase]}
           </Button>
         </form>
       </CardContent>

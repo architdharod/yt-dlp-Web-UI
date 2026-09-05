@@ -108,7 +108,8 @@ export async function submitDownload(request: DownloadRequest): Promise<Job> {
  * itself comes from the cache, so it costs a library lookup and nothing else.
  *
  * Failures arrive as the backend's own message: 400 for a collection over the
- * 2000-track stop or an unsupported host, 504 when the extraction timed out.
+ * 2000-track stop, 422 for an unsupported host (the body validator rejects it),
+ * 504 when the extraction timed out.
  */
 export async function probeUrl(
   url: string,

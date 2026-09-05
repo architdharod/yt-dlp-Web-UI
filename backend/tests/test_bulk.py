@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from app.downloader import ALREADY_IN_LIBRARY_PREFIX, DownloadError
 from app.file_organizer import resolve_artist_album
 from app.job_store import JobStore
-from app.models import Job, JobKind, JobStatus
+from app.models import MAX_REASON, Job, JobKind, JobStatus
 from app.probe import (
     Enumeration,
     EnumeratedTrack,
@@ -798,6 +798,38 @@ class TestProbeRoute:
         assert preview["in_library"] == 1
         assert preview["rows"][0]["status"] == "in_library"
         assert preview["rows"][0]["reason"] == "Bonobo/Kiara.flac"
+
+    def test_an_over_long_in_library_path_keeps_its_tail(
+        self, client_and_qm, isolated_paths
+    ):
+        """A path longer than MAX_REASON is elided at the *front*.
+
+        The head is the same library root on every row; the tail -- artist,
+        album, file -- is what tells the user which track matched.
+        """
+        client, _ = client_and_qm
+        download_dir, _data = isolated_paths
+        from tests.test_probe import _write_flac
+
+        artist = "A" * 180
+        album = "B" * 180
+        _write_flac(
+            download_dir / artist / album / "Kiara.flac",
+            title="Kiara",
+            tags={"SOURCEID": "youtube:vid1"},
+        )
+
+        with patch("app.main.probe", return_value=_enumeration()):
+            resp = client.post(
+                "/download/probe",
+                json={"url": COLLECTION_URL, "artist": artist},
+            )
+
+        assert resp.status_code == 200
+        reason = resp.json()["preview"]["rows"][0]["reason"]
+        assert len(reason) == MAX_REASON
+        assert reason.startswith("\u2026")
+        assert reason.endswith(f"{album}/Kiara.flac")
 
     def test_a_corrected_artist_dedups_against_that_folder(
         self, client_and_qm, isolated_paths

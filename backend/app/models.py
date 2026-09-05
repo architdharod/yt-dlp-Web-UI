@@ -16,6 +16,7 @@ from pydantic import (
     StringConstraints,
     field_validator,
 )
+from pydantic_core import PydanticCustomError
 
 # Hosts (and their subdomains) that may be submitted for download.  The
 # backend also restricts yt-dlp's extractors, but rejecting at the API edge
@@ -33,22 +34,36 @@ ALLOWED_URL_HOSTS: tuple[str, ...] = (
 
 
 def validate_download_url(url: str) -> str:
-    """Return *url* if it is an http(s) URL on an allowed host, else raise ValueError."""
+    """Return *url* if it is an http(s) URL on an allowed host, else raise.
+
+    The failures are raised as :class:`PydanticCustomError` rather than plain
+    ``ValueError``.  Both end in the same 422 -- ``PydanticCustomError`` is a
+    ``ValueError`` -- but a plain one makes Pydantic prefix the message it
+    shows with ``"Value error, "``, and this message is read by the person who
+    pasted the URL.  Each raise site gets its own ``type`` slug so a client can
+    tell the cases apart without matching on prose.
+    """
     parts = urlsplit(url.strip())
     if parts.scheme not in ("http", "https"):
-        raise ValueError("URL must start with http:// or https://")
+        raise PydanticCustomError(
+            "url_scheme", "URL must start with http:// or https://"
+        )
     host = (parts.hostname or "").lower()
     if not host:
-        raise ValueError("URL has no host")
+        raise PydanticCustomError("url_no_host", "URL has no host")
     try:
         ipaddress.ip_address(host)
     except ValueError:
         pass
     else:
-        raise ValueError("IP-address URLs are not allowed")
+        raise PydanticCustomError(
+            "url_ip_address", "IP-address URLs are not allowed"
+        )
     if not any(host == allowed or host.endswith("." + allowed) for allowed in ALLOWED_URL_HOSTS):
-        raise ValueError(
-            "Unsupported site; allowed hosts are " + ", ".join(ALLOWED_URL_HOSTS)
+        raise PydanticCustomError(
+            "unsupported_site",
+            "Unsupported site; allowed hosts are {hosts}",
+            {"hosts": ", ".join(ALLOWED_URL_HOSTS)},
         )
     return url.strip()
 
@@ -83,6 +98,12 @@ class JobStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+# Longest a folder name may be in a move request.  Not a filesystem limit (255
+# bytes per component is the common one) but a sanity bound: anything longer is
+# a paste accident, and the error is clearer here than from the kernel.
+MAX_FOLDER_NAME = 200
+
+
 class JobKind(str, Enum):
     """What a queue entry actually does.
 
@@ -107,8 +128,16 @@ class DownloadRequest(BaseModel):
         min_length=1,
         description="YouTube, SoundCloud or Bandcamp URL to download",
     )
-    artist: str | None = Field(None, max_length=200, description="Optional artist name for file organization")
-    album: str | None = Field(None, max_length=200, description="Optional album name for file organization")
+    artist: str | None = Field(
+        None,
+        max_length=MAX_FOLDER_NAME,
+        description="Optional artist name for file organization",
+    )
+    album: str | None = Field(
+        None,
+        max_length=MAX_FOLDER_NAME,
+        description="Optional album name for file organization",
+    )
 
     @field_validator("url")
     @classmethod
@@ -371,11 +400,6 @@ class LibraryResponse(BaseModel):
     scanned_at: str = Field(..., description="When this scan ran, ISO 8601 UTC")
 
 
-# Longest a folder name may be in a move request.  Not a filesystem limit (255
-# bytes per component is the common one) but a sanity bound: anything longer is
-# a paste accident, and the error is clearer here than from the kernel.
-MAX_FOLDER_NAME = 200
-
 # Bounds on the path list a move may carry.  A move is a UI gesture over one
 # folder, so a thousand tracks is already far past anything a user selects, and
 # 4096 is the usual PATH_MAX: past either the request is a paste accident or an
@@ -634,6 +658,19 @@ LARGE_COLLECTION_TRACKS = 500
 # hold the result for hours; the user is asked for a narrower URL instead.
 MAX_COLLECTION_TRACKS = 2000
 
+# Bounds on the free text a preview row carries back in a bulk submit.  A title
+# is a display string, so a kilobyte is already absurd; a source id is
+# ``<extractor>:<id>``, which is short by construction.  The preview truncates
+# to exactly these, so no row a probe produced can be rejected by the submit
+# that follows it.
+MAX_TRACK_TITLE = 1000
+MAX_SOURCE_ID = 200
+
+# Longest a preview row's ``reason`` may be.  Display-only -- yt-dlp's own
+# words for why a row cannot be downloaded, or a library path -- so a few lines
+# is all a checklist row can show, and the raw error can be a page long.
+MAX_REASON = 300
+
 
 class ProbeRequest(BaseModel):
     """Schema for POST /download/probe: the URL the user pasted.
@@ -721,6 +758,7 @@ class PreviewRow(BaseModel):
     )
     reason: str | None = Field(
         None,
+        max_length=MAX_REASON,
         description=(
             "The matching library path for ``in_library``, yt-dlp's message "
             "for ``unavailable``, and null for ``available``"
@@ -732,9 +770,14 @@ class CollectionPreview(BaseModel):
     """The checklist behind a collection URL."""
 
     url: str = Field(..., description="The collection URL that was probed")
-    title: str | None = Field(None, description="Collection title from the source")
+    title: str | None = Field(
+        None,
+        max_length=MAX_TRACK_TITLE,
+        description="Collection title from the source",
+    )
     artist: str | None = Field(
         None,
+        max_length=MAX_FOLDER_NAME,
         description=(
             "The artist the source suggests, which the user edits before "
             "submitting; it applies to every selected row"
@@ -783,11 +826,11 @@ class BulkTrack(BaseModel):
     """
 
     url: str = Field(..., min_length=1, description="The track URL to download")
-    title: str | None = Field(None, max_length=1000)
+    title: str | None = Field(None, max_length=MAX_TRACK_TITLE)
     album: str | None = Field(None, max_length=MAX_FOLDER_NAME)
     duration: float | None = Field(None, ge=0)
     thumbnail_url: str | None = Field(None, max_length=MAX_PATH_LENGTH)
-    source_id: str | None = Field(None, max_length=200)
+    source_id: str | None = Field(None, max_length=MAX_SOURCE_ID)
 
     @field_validator("url")
     @classmethod
@@ -811,7 +854,9 @@ class BulkDownloadRequest(BaseModel):
         description="Artist folder every selected track is filed under",
     )
     title: str | None = Field(
-        None, max_length=1000, description="Collection title, shown on the parent row"
+        None,
+        max_length=MAX_TRACK_TITLE,
+        description="Collection title, shown on the parent row",
     )
     tracks: list[BulkTrack] = Field(
         ...,

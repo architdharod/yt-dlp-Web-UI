@@ -50,7 +50,14 @@ from urllib.parse import urlsplit
 import yt_dlp
 
 from app.downloader import _BASE_OPTS, _YtDlpLogger
-from app.models import MAX_COLLECTION_TRACKS
+from app.models import (
+    MAX_COLLECTION_TRACKS,
+    MAX_FOLDER_NAME,
+    MAX_PATH_LENGTH,
+    MAX_REASON,
+    MAX_SOURCE_ID,
+    MAX_TRACK_TITLE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -655,12 +662,40 @@ class _Walk:
             raise CollectionTooLarge()
 
 
+def _cap(value: str | None, limit: int) -> str | None:
+    """*value* trimmed to *limit* characters, or None if nothing is left.
+
+    A preview row travels back to ``POST /download/bulk`` verbatim, so a field
+    longer than the matching :class:`~app.models.BulkTrack` bound would 422 the
+    whole submission over one over-long album name.  Truncating here keeps the
+    row lossy but usable; the child job resolves its own metadata anyway.
+    """
+    if value is None:
+        return None
+    return value[:limit].rstrip() or None
+
+
+def _drop_if_over(value: str | None, limit: int) -> str | None:
+    """*value* if it fits *limit*, None if it does not.
+
+    For the fields where half a value is worse than none.  A truncated
+    ``source_id`` can never equal the uncapped ``<extractor>:<id>``
+    :func:`app.downloader._source_id` writes to ``SOURCEID``, so it would never
+    dedup and, sharing a prefix with a sibling, would silently collapse two
+    rows into one in :meth:`_Walk.add`; a truncated thumbnail URL sticks as a
+    broken image, where ``None`` lets the child job fill in the real one.
+    """
+    if value is None:
+        return None
+    return value if len(value) <= limit else None
+
+
 def _row_for(entry: dict, album: str | None) -> EnumeratedTrack | None:
     """Turn one flat track entry into a preview row, or None if it has no URL."""
     url = _entry_url(entry)
     if url is None:
         return None
-    source_id = flat_source_id(entry)
+    source_id = _drop_if_over(flat_source_id(entry), MAX_SOURCE_ID)
     entry_album = entry.get("album")
     return EnumeratedTrack(
         # The stable key the frontend and the dedup answer both use: the source
@@ -669,11 +704,16 @@ def _row_for(entry: dict, album: str | None) -> EnumeratedTrack | None:
         id=source_id or url,
         url=url,
         source_id=source_id,
-        title=_text(entry.get("title")),
-        album=(entry_album.strip() if isinstance(entry_album, str) and entry_album.strip() else album),
+        title=_cap(_text(entry.get("title")), MAX_TRACK_TITLE),
+        album=_cap(
+            entry_album.strip()
+            if isinstance(entry_album, str) and entry_album.strip()
+            else album,
+            MAX_FOLDER_NAME,
+        ),
         duration=_duration(entry),
-        thumbnail_url=_thumbnail(entry),
-        unavailable_reason=_unavailable_reason(entry),
+        thumbnail_url=_drop_if_over(_thumbnail(entry), MAX_PATH_LENGTH),
+        unavailable_reason=_cap(_unavailable_reason(entry), MAX_REASON),
     )
 
 
@@ -782,8 +822,14 @@ def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
 
     enumeration = Enumeration(
         url=url,
-        title=_text(info.get("title")),
-        artist=_suggested_artist(info, url, source, walk.entry_artists),
+        # Both travel back through ``CollectionPreview``, whose bounds match
+        # these: a channel with a novel-length title, or a suggested artist
+        # lifted from one, must not 500 the preview on the response model.
+        title=_cap(_text(info.get("title")), MAX_TRACK_TITLE),
+        artist=_cap(
+            _suggested_artist(info, url, source, walk.entry_artists),
+            MAX_FOLDER_NAME,
+        ),
         source=source,
         rows=tuple(walk.rows),
         notices=tuple(notices),

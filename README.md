@@ -9,7 +9,13 @@ This is a project for educational purpose, to learn the usage of the library yt-
 ## How It Works
 
 1. Paste a YouTube, SoundCloud or Bandcamp URL into the web UI, optionally specifying artist and album names.
-2. The backend extracts metadata (title, thumbnail, duration) via yt-dlp and returns it immediately.
+   Submitting first asks `POST /download/probe` what is behind the URL.
+2. A single track queues as before: the backend extracts its metadata (title, thumbnail, duration) via yt-dlp and
+   returns it immediately. A playlist, album or artist page opens a checklist instead — **Select all** / **Select
+   none**, rows already in the library unticked, unavailable rows greyed out and unselectable, and an editable
+   artist that re-checks the library as you change it. Above 500 rows nothing is preselected, and 2000 rows is a
+   hard stop asking for a narrower URL. The ticked rows go to `POST /download/bulk`, which queues one parent job
+   with a child per track.
 3. The job enters an async queue and runs a three-stage pipeline: yt-dlp fetches the best audio stream and the
    thumbnail (no postprocessing), an ffmpeg subprocess of ours converts that stream to FLAC, and Mutagen writes the
    tags, the cover art, and the `SOURCEID`/`SOURCEURL` fields that record where the track came from.
@@ -23,8 +29,9 @@ This is a project for educational purpose, to learn the usage of the library yt-
    failed says "tags not fixed" in the job's detail and never fails the download.
 
 Real-time progress is streamed to the browser via Server-Sent Events — no polling. The UI is split into tabs:
-**Download** (the form and the in-flight queue, with a badge counting the jobs still working) and **Library**, with a
-**Trash** tab that appears once something is in it.
+**Download** (the form and the in-flight queue, with a badge counting the jobs still working — an open collection
+checklist takes over this tab until it is submitted or dismissed) and **Library**, with a **Trash** tab that appears
+once something is in it.
 
 Queue rows carry two actions. **Cancel** stops a job that is queued, downloading or converting: running ffmpeg is our
 own process, so it is killed rather than waited out, and every partial and temporary file is removed. Cancelled jobs
@@ -273,7 +280,7 @@ worth knowing:
 
 ## Limitations
 
-- **Collections are API-only so far** — `POST /download` still takes a single track and rejects playlist and channel URLs. Collections have their own two endpoints, `POST /download/probe` (preview the tracks behind a playlist, album, set, or artist page) and `POST /download/bulk` (queue a selection as one parent job with a child per track); the preview UI that drives them arrives in the next phase. The preview comes from a *flat* extraction, so it can only mark a row unavailable when the flat pass says so; SoundCloud DRM is invisible to it (yt-dlp only meets the DRM in a full extraction), and such a track previews as available and then fails in its own child job with yt-dlp's DRM message.
+- **The collection preview is a flat extraction** — it is cheap, and it is thin: a row can only be marked unavailable when the flat pass says so. SoundCloud DRM is invisible to it (yt-dlp only meets the DRM in a full extraction), so such a track previews as available and then fails in its own child job with yt-dlp's DRM message. `POST /download` itself still takes a single track and rejects playlist and channel URLs; collections go through `POST /download/probe` and `POST /download/bulk`.
 - **YouTube, SoundCloud and Bandcamp only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com`, `bandcamp.com` and their subdomains, and rejects everything else with a validation error. No Spotify or other sources.
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
 - **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced. A move onto an occupied path is refused the same way.

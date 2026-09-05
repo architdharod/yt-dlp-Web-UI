@@ -69,6 +69,7 @@ from app.models import (
     LibraryMoveResponse,
     LibraryTagRequest,
     LibraryResponse,
+    MAX_REASON,
     MovedPath,
     Notice,
     PreviewRow,
@@ -652,7 +653,19 @@ async def _build_preview(
         if row.unavailable_reason is not None:
             status, reason = "unavailable", row.unavailable_reason
         elif row.id in matches:
-            status, reason = "in_library", matches[row.id]
+            # A library path is bounded by the filesystem, not by MAX_REASON,
+            # so it is trimmed rather than allowed to 500 the whole preview on
+            # the response model's bound.  The *tail* is what identifies a
+            # file -- artist, album, track -- while the head is the same
+            # library root on every row, so an over-long path keeps its end
+            # behind a leading ellipsis.
+            path = matches[row.id]
+            status = "in_library"
+            reason = (
+                path
+                if len(path) <= MAX_REASON
+                else "…" + path[-(MAX_REASON - 1) :]
+            )
         else:
             status, reason = "available", None
         rows.append(

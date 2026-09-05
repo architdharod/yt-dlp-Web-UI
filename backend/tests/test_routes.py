@@ -831,6 +831,25 @@ class TestUrlValidation:
         resp = client.post("/download", json={"url": url})
         assert resp.status_code == 422
 
+    @pytest.mark.parametrize("path", ["/download", "/download/probe"])
+    def test_the_message_reaches_the_user_without_a_pydantic_prefix(
+        self, path, client
+    ):
+        """The user pasted the URL, so the user reads this message.
+
+        A plain ``ValueError`` in a validator makes Pydantic render it as
+        ``"Value error, Unsupported site; ..."``; the validator raises a
+        ``PydanticCustomError`` so the message arrives as written, under a
+        ``type`` slug a client can match on instead of the prose.
+        """
+        resp = client.post(path, json={"url": "https://example.com/x"})
+
+        assert resp.status_code == 422
+        (error,) = [e for e in resp.json()["detail"] if e["loc"][-1] == "url"]
+        assert error["type"] == "unsupported_site"
+        assert error["msg"].startswith("Unsupported site; allowed hosts are ")
+        assert "Value error" not in error["msg"]
+
     @patch("app.main.extract_metadata")
     def test_supported_url_is_accepted(self, mock_extract, client):
         mock_extract.return_value = _make_metadata()

@@ -20,7 +20,19 @@ from mutagen.flac import FLAC
 from app import probe as probe_module
 from app.dedup import DedupCandidate, find_in_library
 from app.downloader import _source_id
-from app.models import MAX_COLLECTION_TRACKS
+from app.models import (
+    MAX_COLLECTION_TRACKS,
+    MAX_FOLDER_NAME,
+    MAX_PATH_LENGTH,
+    MAX_REASON,
+    MAX_SOURCE_ID,
+    MAX_TRACK_TITLE,
+    BulkDownloadRequest,
+    BulkTrack,
+    CollectionPreview,
+    PreviewRow,
+    ProbeRequest,
+)
 from app.probe import (
     BANDCAMP_NOTICE,
     CollectionTooLarge,
@@ -604,6 +616,161 @@ class TestCapsAndCache:
         with fake_ytdl({PLAYLIST_URL: slow}):
             with pytest.raises((ProbeTimeout, asyncio.TimeoutError)):
                 await probe(PLAYLIST_URL, timeout=0)
+
+
+# ===========================================================================
+# Row field caps
+# ===========================================================================
+
+
+class TestRowFieldCaps:
+    """A preview row must always fit the bulk submit that sends it back.
+
+    The frontend copies rows verbatim into ``POST /download/bulk``, so a field
+    longer than :class:`~app.models.BulkTrack` allows would 422 the whole
+    selection over one over-long name from the source.
+    """
+
+    async def test_an_over_long_title_and_album_come_back_capped(self):
+        info = {
+            **PLAYLIST_INFO,
+            "entries": [
+                _youtube_entry(
+                    1,
+                    title="T" * 1001,
+                    album="A" * 201,
+                    thumbnails=[{"url": "https://img/" + "p" * MAX_PATH_LENGTH}],
+                )
+            ],
+        }
+        with fake_ytdl({PLAYLIST_URL: info}):
+            result = await probe(PLAYLIST_URL)
+
+        (row,) = result.rows
+        assert len(row.title) == MAX_TRACK_TITLE
+        assert len(row.album) == MAX_FOLDER_NAME
+        # An over-long thumbnail URL is dropped rather than truncated: the
+        # child job fills ``thumbnail_url or info["thumbnail"]`` in, so None
+        # lets the real one through where half a URL would stick as a broken
+        # image.
+        assert row.thumbnail_url is None
+
+        # The whole point: the capped row is a legal bulk track.
+        track = BulkTrack(
+            url=row.url,
+            title=row.title,
+            album=row.album,
+            duration=row.duration,
+            thumbnail_url=row.thumbnail_url,
+            source_id=row.source_id,
+        )
+        assert track.title == row.title
+        assert track.album == row.album
+
+    async def test_truncation_does_not_leave_trailing_whitespace(self):
+        info = {
+            **PLAYLIST_INFO,
+            "entries": [_youtube_entry(1, title="T" * 999 + "  tail")],
+        }
+        with fake_ytdl({PLAYLIST_URL: info}):
+            result = await probe(PLAYLIST_URL)
+
+        (row,) = result.rows
+        assert row.title == "T" * 999
+
+    async def test_an_over_long_source_id_is_dropped_not_truncated(self):
+        # A capped source id could never equal the uncapped one the downloader
+        # writes to SOURCEID, and two ids sharing a 200-char prefix would
+        # collapse into one row in the dedup on row id.
+        long_id = "x" * MAX_SOURCE_ID
+        info = {
+            **PLAYLIST_INFO,
+            "entries": [
+                _youtube_entry(1, id=long_id + "a"),
+                _youtube_entry(2, id=long_id + "b"),
+            ],
+        }
+        with fake_ytdl({PLAYLIST_URL: info}):
+            result = await probe(PLAYLIST_URL)
+
+        first, second = result.rows
+        assert first.source_id is None
+        assert second.source_id is None
+        assert first.id == first.url
+        assert second.id == second.url
+        assert first.url != second.url
+
+    async def test_an_over_long_unavailable_reason_is_capped(self):
+        info = {
+            **PLAYLIST_INFO,
+            "entries": [
+                _youtube_entry(1, error="E" * (MAX_REASON + 50)),
+                # A collection of nothing but unavailable rows is refused, so
+                # one good row keeps the preview alive.
+                _youtube_entry(2),
+            ],
+        }
+        with fake_ytdl({PLAYLIST_URL: info}):
+            result = await probe(PLAYLIST_URL)
+
+        row, _ok = result.rows
+        assert len(row.unavailable_reason) == MAX_REASON
+
+        # The whole point: it still fits the response model.
+        assert (
+            PreviewRow(
+                id=row.id,
+                url=row.url,
+                status="unavailable",
+                reason=row.unavailable_reason,
+            ).reason
+            == row.unavailable_reason
+        )
+
+    async def test_an_over_long_suggested_artist_and_title_are_capped(self):
+        # The suggestion is echoed straight back into the form, which posts it
+        # to /download/probe and then to /download/bulk; an uncapped channel
+        # name would 422 both of them.
+        long_name = "A" * 250
+        info = {
+            **PLAYLIST_INFO,
+            "title": "T" * (MAX_TRACK_TITLE + 50),
+            "entries": [
+                _youtube_entry(1, artist=long_name),
+                _youtube_entry(2, artist=long_name),
+            ],
+        }
+        with fake_ytdl({PLAYLIST_URL: info}):
+            result = await probe(PLAYLIST_URL)
+
+        assert len(result.artist) == MAX_FOLDER_NAME
+        assert len(result.title) == MAX_TRACK_TITLE
+
+        # The whole point: both fit every model the suggestion travels through.
+        assert (
+            CollectionPreview(
+                url=result.url,
+                title=result.title,
+                artist=result.artist,
+                source=result.source,
+                rows=[],
+                total=0,
+                in_library=0,
+                unavailable=0,
+                large=False,
+            ).artist
+            == result.artist
+        )
+        assert ProbeRequest(url=PLAYLIST_URL, artist=result.artist).artist == result.artist
+        assert (
+            BulkDownloadRequest(
+                url=PLAYLIST_URL,
+                artist=result.artist,
+                title=result.title,
+                tracks=[BulkTrack(url=result.rows[0].url)],
+            ).artist
+            == result.artist
+        )
 
 
 # ===========================================================================
