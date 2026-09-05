@@ -1,6 +1,10 @@
 fastapi==0.141.1
 uvicorn[standard]==0.52.4
-yt-dlp>=2026.8.19
+# The `default` extra pulls in yt-dlp-ejs, the JavaScript yt-dlp's YouTube
+# extractor runs in the deno runtime the image ships.  Without it yt-dlp would
+# have to fetch those scripts at runtime (--remote-components) or go without
+# them, which is what "Sign in to confirm you're not a bot" usually means.
+yt-dlp[default]>=2026.8.19
 mutagen==1.48.1
 python-multipart==0.0.32
 pydantic==2.13.5

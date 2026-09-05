@@ -222,6 +222,8 @@ All configuration is via environment variables in `.env`:
 | `TAG_FIX_ENABLED`          | `true`                  | Look every finished download up on MusicBrainz and correct its `TITLE`/`ARTIST`. `false` skips the lookup, and no request leaves the container |
 | `MUSICBRAINZ_CONTACT`      | this repository's URL   | Contact (email or URL) in the User-Agent MusicBrainz requires           |
 | `TAG_FIX_TIMEOUT_SECONDS`  | `60`                    | How long one tag lookup may take before the job finishes without it     |
+| `YTDLP_COOKIES_FILE`       | empty (disabled)        | Path *inside the container* to a Netscape-format cookies file yt-dlp should use. See [YouTube asks you to sign in](#youtube-asks-you-to-sign-in) |
+| `YTDLP_COOKIES_HOST_PATH`  | `/dev/null`             | Path *on the host* to that same file. Compose bind-mounts it read-only at `/cookies/youtube.txt` |
 
 These are the effective defaults: `docker-compose.yml` substitutes them when a
 variable is unset or empty, so an incomplete `.env` no longer breaks the stack.
@@ -238,6 +240,80 @@ pre-creates `/config` world-writable, so the named volume compose mounts there
 inherits that mode and is writable whatever `PUID:PGID` you run as. If you
 replace the named volume with a bind mount of a host directory, that directory
 must exist and be writable by `PUID:PGID` yourself.
+
+### YouTube asks you to sign in
+
+Symptom: every YouTube job fails with **"Sign in to confirm you're not a bot"**,
+often after a burst of HTTP 429s in the backend log. This is YouTube rate-limiting
+the datacentre or home IP the container downloads from, not a bug in the app. Two
+things help.
+
+**The image ships a JavaScript runtime.** YouTube's player is protected by a
+challenge that yt-dlp solves by running JavaScript, so the backend image
+installs [deno](https://deno.com) and yt-dlp's `yt-dlp-ejs` scripts. Without
+them yt-dlp logs `No supported JavaScript runtime could be found`, some formats
+disappear, and the bot check fires much sooner. If you see that line in the log,
+your image predates this and needs rebuilding or repulling.
+
+**Give yt-dlp cookies.** A signed-in session gets waved through where an
+anonymous one does not:
+
+1. Export the cookies exactly the way yt-dlp's
+   [Exporting YouTube cookies](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)
+   page describes, because the order of the steps is what keeps the exported
+   session alive:
+
+   1. Open a new **private/incognito window** and sign in to YouTube with a
+      **throwaway Google account**. The file is a live session — anyone who
+      reads it is signed in as that account — and yt-dlp warns that an account
+      it downloads with can be banned, so do not use your main one.
+   2. In that same window and tab, navigate to
+      `https://www.youtube.com/robots.txt`, and make sure it is the only
+      YouTube tab open in the window.
+   3. Export the `youtube.com` cookies with a cookies.txt browser extension
+      (yt-dlp's
+      [FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)
+      covers the Netscape file format and which extensions produce it), then
+      **close the private window**. Closing it is what stops the browser from
+      rotating the exported cookies out from under you.
+
+2. Save the exported `cookies.txt` on the host somewhere the container user can
+   read, e.g. `/srv/music-for-arr/youtube-cookies.txt`, and `chmod 600` it.
+3. Set both variables in `.env` and restart the stack:
+
+   ```
+   YTDLP_COOKIES_HOST_PATH=/srv/music-for-arr/youtube-cookies.txt
+   YTDLP_COOKIES_FILE=/cookies/youtube.txt
+   ```
+
+   `YTDLP_COOKIES_HOST_PATH` is what compose bind-mounts, always **read-only**,
+   at the fixed container path `/cookies/youtube.txt`; `YTDLP_COOKIES_FILE` is
+   what the backend reads. Compose cannot mount a volume conditionally, so the
+   host path defaults to `/dev/null` — with neither variable set the stack
+   starts exactly as before and no cookies are used.
+
+   Get `YTDLP_COOKIES_HOST_PATH` right the first time: if the path does not
+   exist on the host, Docker creates an empty **directory** of that name and
+   mounts it, which the backend then rejects at startup.
+
+   The mount is read-only on purpose, and safe to leave that way: the backend
+   reads the file once at startup into a cookie jar it holds in memory and
+   shares with every download, and never hands yt-dlp a `cookiefile` to write
+   back to. Your file is only ever read. The flip side is that cookies YouTube
+   rotates during a download live only in memory and are lost when the
+   container restarts — re-export the file when the bot check comes back.
+   Cookie contents are never logged — only the path and the number of cookies
+   loaded.
+
+   If `YTDLP_COOKIES_FILE` points at something that is missing, unreadable, not
+   a regular file, or not a Netscape-format cookies file, the backend
+   **refuses to start** and says which, the same way it does for a bad
+   `DOWNLOAD_PATH`.
+
+**Keep `MAX_CONCURRENT_DOWNLOADS` at 2.** Its default. Raising it is the fastest
+way to earn a 429 and, shortly after, the bot check — a bulk job of 40 videos at
+two at a time gets through where six at a time does not. If you are already
+being blocked, wait it out: the block is on the IP and expires.
 
 ## Navidrome and Lidarr
 

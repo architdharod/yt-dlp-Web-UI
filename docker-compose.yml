@@ -45,9 +45,20 @@ services:
       - TAG_FIX_TIMEOUT_SECONDS=${TAG_FIX_TIMEOUT_SECONDS:-60}
       # How long one collection probe may take, end to end.
       - PROBE_TIMEOUT_SECONDS=${PROBE_TIMEOUT_SECONDS:-120}
+      # Cookies for YouTube's "Sign in to confirm you're not a bot" check.
+      # Unset by default; see the README. Set it to the *container* path below,
+      # /cookies/youtube.txt, and point YTDLP_COOKIES_HOST_PATH at the file on
+      # the host. The backend only ever reads the file -- it loads it into an
+      # in-memory cookie jar at startup and never writes one back -- so the
+      # mount below is read-only.
+      - YTDLP_COOKIES_FILE=${YTDLP_COOKIES_FILE:-}
     volumes:
       - ${DOWNLOAD_PATH:-/data/music/downloads}:${DOWNLOAD_PATH:-/data/music/downloads}
       - music-for-arr-data:/config
+      # compose has no conditional mounts, so the default source is /dev/null:
+      # the stack still starts when no cookies file is configured, and nothing
+      # reads /cookies/youtube.txt unless YTDLP_COOKIES_FILE names it.
+      - ${YTDLP_COOKIES_HOST_PATH:-/dev/null}:/cookies/youtube.txt:ro
 
 volumes:
   music-for-arr-data: {}

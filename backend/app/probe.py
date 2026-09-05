@@ -49,7 +49,7 @@ from urllib.parse import urlsplit
 
 import yt_dlp
 
-from app.downloader import _BASE_OPTS, _YtDlpLogger
+from app.downloader import _YtDlpLogger, base_opts, ytdl
 from app.models import (
     MAX_COLLECTION_TRACKS,
     MAX_FOLDER_NAME,
@@ -263,7 +263,7 @@ def _cache_put(url: str, enumeration: Enumeration) -> None:
 def _flat_opts() -> dict:
     """The options every extraction in this module uses.
 
-    Built on :data:`~app.downloader._BASE_OPTS` so the host allowlist
+    Built on :func:`~app.downloader.base_opts` so the host allowlist
     (``allowed_extractors``, which keeps the generic extractor -- and with it
     the whole internal network -- out of reach) and ``noplaylist`` are the same
     ones the downloader runs with.  ``noplaylist`` matters here for the reason
@@ -278,7 +278,7 @@ def _flat_opts() -> dict:
     would do the same but is deprecated in favour of ``playlist_items``.
     """
     return {
-        **_BASE_OPTS,
+        **base_opts(),
         "extract_flat": "in_playlist",
         "ignoreerrors": True,
         "skip_download": True,
@@ -320,7 +320,7 @@ def _extract(url: str) -> dict:
     """One flat extraction, with yt-dlp's failures turned into ProbeError."""
     log = _CapturingLogger()
     try:
-        with yt_dlp.YoutubeDL({**_flat_opts(), "logger": log}) as ydl:
+        with ytdl({**_flat_opts(), "logger": log}) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.YoutubeDLError as exc:
         raise ProbeError(str(exc)) from exc

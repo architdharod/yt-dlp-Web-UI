@@ -40,6 +40,43 @@ jobs:
         working-directory: backend
         run: pytest
 
+  # The image installs deno itself, at a version the Dockerfile pins.  It has
+  # to be the version yt-dlp pins in its `pin-deno` extra, or the runtime
+  # yt-dlp's YouTube extractor gets is not the one it was tested against.  The
+  # extra is declaration-only (nothing installs it), so the pin is read out of
+  # the installed yt-dlp's metadata and compared.
+  #
+  # Its own job, deliberately outside `publish.needs`: yt-dlp bumping the pin
+  # is a housekeeping task, and it should show up as a red check rather than
+  # block the weekly rebuild that keeps `latest` shipping a recent yt-dlp.
+  deno-pin-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check DENO_VERSION matches yt-dlp's pin-deno extra
+        working-directory: backend
+        run: |
+          pin=$(python scripts/deno_pin.py)
+          echo "yt-dlp pins deno $pin"
+          if ! grep -q "ARG DENO_VERSION=$pin" Dockerfile; then
+            echo "::error file=backend/Dockerfile::ARG DENO_VERSION does not match yt-dlp's pin-deno extra ($pin). Bump it and the DENO_SHA256_* checksums."
+            grep -n 'ARG DENO_VERSION=' Dockerfile
+            exit 1
+          fi
+
   frontend-build:
     runs-on: ubuntu-latest
     steps:
@@ -65,6 +102,34 @@ jobs:
       - name: Test
         working-directory: frontend
         run: npm test -- --run
+
+  # The backend image is only built-and-pushed on main, so a PR that breaks the
+  # Dockerfile would otherwise not find out until merge.  Build both platforms
+  # without pushing: the deno install is arch-specific, so amd64 alone would
+  # miss half of it.
+  backend-image:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Needed to build the arm64 image on an amd64 runner.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          platforms: linux/amd64,linux/arm64
+          push: false
+          # backend-pr first: this job writes that scope, so a repeat push to
+          # the same PR reads its own layers back instead of only main's.
+          cache-from: |
+            type=gha,scope=backend-pr
+            type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend-pr
 
   publish:
     needs: [backend-tests, frontend-build]

@@ -33,7 +33,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from app.dedup import DedupCandidate, find_in_library
-from app.downloader import DownloadError, extract_metadata
+from app.downloader import (
+    COOKIES_ENV_VAR,
+    DownloadError,
+    cookies_file,
+    extract_metadata,
+    validate_cookies_file,
+)
 from app.file_organizer import DEFAULT_DOWNLOAD_PATH, resolve_artist_album
 from app.job_store import JobStore, get_data_path, get_db_path
 from app.library import (
@@ -368,6 +374,8 @@ async def lifespan(app: FastAPI):
     logger.info("MUSICBRAINZ_CONTACT      = %s", musicbrainz_contact())
     logger.info("TAG_FIX_TIMEOUT_SECONDS  = %s", queue_manager.tag_fix_timeout)
     logger.info("PROBE_TIMEOUT_SECONDS    = %s", probe_timeout_seconds())
+    # The path only -- never the file, which is a set of live session cookies.
+    logger.info("%-24s = %s", COOKIES_ENV_VAR, cookies_file() or "(not set)")
     for line in describe_config(rescan_config):
         logger.info("%s", line)
     for warning in rescan_config.warnings:
@@ -375,6 +383,7 @@ async def lifespan(app: FastAPI):
 
     _validate_directory("DOWNLOAD_PATH", download_path)
     _validate_directory("DATA_PATH", data_path)
+    validate_cookies_file()
 
     store = JobStore(get_db_path(data_path))
     queue_manager.attach_store(store)

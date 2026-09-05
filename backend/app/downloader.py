@@ -22,6 +22,7 @@ fixing rely on, and the cover art, which is more control than
 junk the source container carried, which ``-map_metadata -1`` now drops).
 """
 
+import contextlib
 import logging
 import os
 import shutil
@@ -34,6 +35,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import yt_dlp
+import yt_dlp.cookies
 from mutagen.flac import FLAC, Picture
 from mutagen.id3 import PictureType
 
@@ -138,8 +140,9 @@ class _YtDlpLogger:
         self._log.warning(msg)
 
 
-# Options shared by every YoutubeDL instance this module creates.
-_BASE_OPTS: dict = {
+# Options shared by every YoutubeDL instance this module creates.  Use
+# :func:`base_opts`, which adds the cookie jar when one is configured.
+_STATIC_OPTS: dict = {
     "quiet": True,
     "no_warnings": True,
     "noprogress": True,
@@ -150,6 +153,135 @@ _BASE_OPTS: dict = {
     "socket_timeout": SOCKET_TIMEOUT_SECONDS,
     "allowed_extractors": ALLOWED_EXTRACTORS,
 }
+
+# Points at a Netscape-format cookies file exported from a signed-in browser.
+# Optional: without it YouTube is fetched anonymously, which is fine until it
+# starts asking the container to prove it is not a bot.
+COOKIES_ENV_VAR = "YTDLP_COOKIES_FILE"
+
+# The one cookie jar every YoutubeDL in this process shares, loaded once at
+# startup by :func:`load_cookie_jar`.
+#
+# Not `cookiefile`: yt-dlp *writes the jar back* to that path when a YoutubeDL
+# is closed (YoutubeDL.close -> save_cookies -> cookiejar.save), with a plain
+# open('w') and no locking, so two downloads finishing at once shred the file
+# between them -- permanently, since it is also the file the next run reads.
+# Assigning the jar to `ydl.cookiejar` instead leaves `cookiefile` unset, which
+# makes save_cookies a no-op, so nothing is ever written: the configured file
+# is read once and only read.  The stdlib CookieJar this inherits from holds an
+# RLock across every add/extract, so one jar shared by concurrent downloads is
+# safe -- and better than a jar each, because a cookie YouTube rotates in
+# during one download is there for the next.
+_cookie_jar: "yt_dlp.cookies.YoutubeDLCookieJar | None" = None
+
+
+def cookies_file() -> str | None:
+    """The configured cookies file, or ``None`` when the feature is off.
+
+    docker compose substitutes an unset variable with an empty string, so
+    ``""`` counts as unset rather than as a path to nowhere.
+    """
+    return os.environ.get(COOKIES_ENV_VAR) or None
+
+
+def load_cookie_jar() -> None:
+    """Read the configured cookies file into the process-wide jar.
+
+    Called from :func:`validate_cookies_file` at startup, so a file that is
+    not actually loadable -- a JSON export from the wrong extension, a file
+    that is not Netscape format at all -- stops the container at boot with a
+    message rather than failing every download for the rest of its life.
+
+    Nothing about the file's *contents* is ever logged.
+
+    Raises:
+        RuntimeError: If the file cannot be parsed as a Netscape cookies file.
+    """
+    global _cookie_jar
+    # Cleared first, so a reload that fails leaves no stale jar behind.
+    _cookie_jar = None
+    path = cookies_file()
+    if path is None:
+        return
+    jar = yt_dlp.cookies.YoutubeDLCookieJar(path)
+    try:
+        jar.load()
+    # LoadError (a malformed Netscape file) is an OSError; a binary or UTF-16
+    # file raises UnicodeDecodeError, which is a ValueError.  Both are the
+    # same mistake to the user, so both get the same message.
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"{COOKIES_ENV_VAR} {path!r} could not be read as a cookies file: "
+            f"{exc}. It must be a Netscape-format export (the first line is "
+            '"# Netscape HTTP Cookie File"), not a JSON one. See the README.'
+        ) from exc
+    _cookie_jar = jar
+    # The count, never the cookies.
+    logger.info("Loaded %d cookies from %s %s", len(jar), COOKIES_ENV_VAR, path)
+
+
+def validate_cookies_file() -> None:
+    """Fail fast when ``YTDLP_COOKIES_FILE`` points at nothing usable.
+
+    Called from the app lifespan.  A cookies file that silently does not load
+    is the worst outcome: downloads keep failing with YouTube's bot check and
+    nothing says why.
+
+    Raises:
+        RuntimeError: If the variable is set but the path is not a readable,
+            loadable Netscape cookies file.
+    """
+    path = cookies_file()
+    if path is None:
+        return
+    candidate = Path(path)
+    if candidate.exists() and not candidate.is_file():
+        raise RuntimeError(
+            f"{COOKIES_ENV_VAR} {path!r} exists but is not a regular file. "
+            "Under docker compose this usually means YTDLP_COOKIES_HOST_PATH "
+            "is unset, so its /dev/null default was bind-mounted at that "
+            f"path: set YTDLP_COOKIES_HOST_PATH to the cookies file on the "
+            f"host, or unset {COOKIES_ENV_VAR}."
+        )
+    if not candidate.is_file():
+        raise RuntimeError(
+            f"{COOKIES_ENV_VAR} {path!r} does not exist or is not a file. "
+            "Point it at a Netscape-format cookies file readable by the "
+            f"container user, or unset {COOKIES_ENV_VAR}."
+        )
+    if not os.access(candidate, os.R_OK):
+        raise RuntimeError(
+            f"{COOKIES_ENV_VAR} {path!r} is not readable by this process. "
+            "Fix its ownership/permissions (the container runs as "
+            f"PUID:PGID) or unset {COOKIES_ENV_VAR}."
+        )
+    load_cookie_jar()
+
+
+def base_opts() -> dict:
+    """The yt-dlp options every extraction in this app starts from.
+
+    A fresh dict each call, because callers routinely add to what they get
+    back.  Cookies are *not* in here; they reach yt-dlp as the shared jar
+    :func:`ytdl` attaches.
+    """
+    return dict(_STATIC_OPTS)
+
+
+@contextlib.contextmanager
+def ytdl(opts: dict):
+    """A ``YoutubeDL`` for ``opts``, wired to the shared cookie jar.
+
+    The only way this module constructs one.  ``params={"cookiejar": ...}``
+    would be ignored -- ``YoutubeDL.cookiejar`` is a ``cached_property`` -- so
+    the jar is assigned onto the instance, which has to happen before the
+    first request and does.
+    """
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        if _cookie_jar is not None:
+            ydl.cookiejar = _cookie_jar
+        yield ydl
+
 
 # YouTube auto-generated artist channels are named "<Artist> - Topic".
 _TOPIC_SUFFIX = " - Topic"
@@ -346,7 +478,7 @@ def extract_metadata(url: str) -> TrackMetadata:
     logger.info("Extracting metadata for URL: %s", url)
 
     opts = {
-        **_BASE_OPTS,
+        **base_opts(),
         "skip_download": True,
         # This is only a quick probe; the download phase retries properly.
         "retries": 1,
@@ -354,7 +486,7 @@ def extract_metadata(url: str) -> TrackMetadata:
     }
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with ytdl(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.YoutubeDLError as exc:
         logger.error("Metadata extraction failed for %s: %s", url, exc)
@@ -1090,10 +1222,10 @@ def download_audio(
     # job here for minutes before the download proper even starts.  `retries` is
     # deliberately left alone: it governs the file downloaders, which the real
     # download below still wants to be persistent.
-    probe_opts = {**_BASE_OPTS, "skip_download": True, "extractor_retries": 1}
+    probe_opts = {**base_opts(), "skip_download": True, "extractor_retries": 1}
     info: dict | None = None
     try:
-        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        with ytdl(probe_opts) as ydl:
             info = ydl.extract_info(job.url, download=False)
     except yt_dlp.utils.YoutubeDLError as exc:
         logger.warning(
@@ -1191,7 +1323,7 @@ def download_audio(
     # put the best audio stream and the thumbnail on disk.  Everything after
     # that is ours, which is what makes it interruptible.
     opts = {
-        **_BASE_OPTS,
+        **base_opts(),
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         # Everything -- the raw audio, .part/.ytdl scratch, the thumbnail
@@ -1214,7 +1346,7 @@ def download_audio(
             # hook, so the stop button is read once more before any bytes are
             # fetched.
             _raise_if_cancelled(cancel)
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with ytdl(opts) as ydl:
                 result_info = ydl.extract_info(job.url, download=True)
 
             source_audio = _downloaded_audio_path(result_info)
