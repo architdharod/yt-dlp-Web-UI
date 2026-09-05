@@ -8,7 +8,7 @@ This is a project for educational purpose, to learn the usage of the library yt-
 
 ## How It Works
 
-1. Paste a YouTube or SoundCloud URL into the web UI, optionally specifying artist and album names.
+1. Paste a YouTube, SoundCloud or Bandcamp URL into the web UI, optionally specifying artist and album names.
 2. The backend extracts metadata (title, thumbnail, duration) via yt-dlp and returns it immediately.
 3. The job enters an async queue and runs a three-stage pipeline: yt-dlp fetches the best audio stream and the
    thumbnail (no postprocessing), an ffmpeg subprocess of ours converts that stream to FLAC, and Mutagen writes the
@@ -202,6 +202,7 @@ All configuration is via environment variables in `.env`:
 | `DOWNLOAD_TIMEOUT_SECONDS` | `900`                   | Per-job timeout in seconds (15 min)                      |
 | `DATA_PATH`                | `/config`               | Directory holding `queue.db`, the persistent job queue; leave as-is under compose, it is a named volume |
 | `MAX_CONCURRENT_DOWNLOADS` | `2`                     | Maximum simultaneous downloads                           |
+| `PROBE_TIMEOUT_SECONDS`    | `120`                   | How long `POST /download/probe` may spend enumerating a collection before it answers 504 |
 | `PUID`                     | `1000`                  | UID the backend container runs as                        |
 | `PGID`                     | `1000`                  | GID the backend container runs as                        |
 | `CORS_ORIGINS`             | unset                   | Dev only: comma-separated browser origins allowed to call the API directly. Not needed for the compose stack, where the UI is same-origin behind nginx. |
@@ -272,8 +273,8 @@ worth knowing:
 
 ## Limitations
 
-- **Single tracks only** — playlist and channel URLs are rejected with an error; only the single track behind a URL is ever downloaded.
-- **YouTube and SoundCloud only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com` and their subdomains, and rejects everything else with a validation error. No Spotify, Bandcamp, or other sources.
+- **Collections are API-only so far** — `POST /download` still takes a single track and rejects playlist and channel URLs. Collections have their own two endpoints, `POST /download/probe` (preview the tracks behind a playlist, album, set, or artist page) and `POST /download/bulk` (queue a selection as one parent job with a child per track); the preview UI that drives them arrives in the next phase. The preview comes from a *flat* extraction, so it can only mark a row unavailable when the flat pass says so; SoundCloud DRM is invisible to it (yt-dlp only meets the DRM in a full extraction), and such a track previews as available and then fails in its own child job with yt-dlp's DRM message.
+- **YouTube, SoundCloud and Bandcamp only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com`, `bandcamp.com` and their subdomains, and rejects everything else with a validation error. No Spotify or other sources.
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
 - **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced. A move onto an occupied path is refused the same way.
 - **No authentication** — designed for private/internal networks.

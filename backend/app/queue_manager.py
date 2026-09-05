@@ -15,6 +15,13 @@ State machine::
     error ──► queued  (retry)
     error ──► gone    (dismiss)
 
+A *bulk parent* (``JobKind.BULK``, phase 10) runs no machine of its own: it has
+no thread, no slot and no URL to fetch, and its status is **derived** from its
+children on every one of their transitions and written to its row from there
+(:meth:`QueueManager._refresh_parent`).  Cancel on a parent cascades to every
+child that has not finished; Retry belongs to the failed child, never to the
+parent; Dismiss on the parent takes every child with it.
+
 A *manual tagging job* (``JobKind.TAGGING``, phase 9) is the same machine with
 the download taken out: ``queued ──► tagging ──► done``, plus ``error`` for a
 lookup that could not happen and ``cancelled`` for one the user stopped.  It
@@ -78,6 +85,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from app.downloader import (
+    ALREADY_IN_LIBRARY_PREFIX,
     FFMPEG_TERMINATE_GRACE_SECONDS,
     CancelToken,
     DownloadError,
@@ -157,6 +165,14 @@ RETENTION_DAYS = 7
 # user who retries twice does not spend the job's restart budget.
 MAX_RESTART_ATTEMPTS = 3
 RESTART_GIVE_UP_MESSAGE = f"interrupted by restart {MAX_RESTART_ATTEMPTS} times"
+
+# The 400 a Retry on a bulk parent gets.  A parent has nothing of its own to
+# re-run -- it is the sum of its children -- so the only meaningful retry is on
+# the child that failed, and saying so is more use than "wrong status".
+BULK_RETRY_MESSAGE = (
+    "A bulk download has nothing of its own to retry; retry the failed track "
+    "instead"
+)
 
 # How long a timed-out job's thread may take to unwind before its concurrency
 # slot is released anyway.  Cancelling the run signals ffmpeg, which its thread
@@ -482,7 +498,9 @@ class QueueManager:
         app serves its first request -- so a URL restored from a previous run
         blocks a resubmission just like a freshly queued one.
         """
-        for job in self._jobs.values():
+        # ``list(...)`` for the same reason as in :meth:`children_of`: this is
+        # reachable from a worker thread, and the loop may be inserting.
+        for job in list(self._jobs.values()):
             if job.url == url and job.status in _IN_FLIGHT:
                 return job
         return None
@@ -541,6 +559,328 @@ class QueueManager:
                 return job
         return None
 
+    # ------------------------------------------------------------------
+    # Bulk parents and their children
+    # ------------------------------------------------------------------
+
+    def add_bulk_job(
+        self,
+        parent: Job,
+        children: list[Job],
+        already_in_library: dict[str, str] | None = None,
+    ) -> Job:
+        """Queue a bulk download: one parent row and one child per track.
+
+        The parent is written first, because every child row carries a
+        ``parent_id`` foreign key at it, and because a crash between the two
+        must leave a parent the next boot can re-derive rather than orphans.
+
+        Each child then takes one of three shapes before it is ever dispatched:
+
+        * **already in the library** -- ``already_in_library`` maps a child's
+          id to the library path the dedup rule matched.  The child is created
+          directly in ``error`` with
+          :data:`~app.downloader.ALREADY_IN_LIBRARY_PREFIX` and that path,
+          which is the same string a single download's own duplicate check
+          writes, so the frontend renders it as "Skipped" with no Retry.  It is
+          persisted (the user asked for it and deserves to see why it did not
+          happen) but never dispatched and it takes no download slot;
+        * **already in flight** -- the URL is queued or running somewhere else,
+          including earlier in this same submission.  Also ``error``, with the
+          job it collided with named;
+        * anything else is ``queued`` and dispatched, in the order the user
+          selected them, through the ordinary download slots.
+
+        Children resolve their own metadata when they run: the preview's flat
+        pass gives a title and sometimes a duration, and the download pipeline
+        probes properly anyway (source enumeration research), so paying for a
+        full extraction per row at submit time would be minutes of waiting for
+        data that is about to be fetched again.
+
+        Args:
+            parent: The ``BULK`` job, carrying the collection URL, the title and
+                the artist the user chose.
+            children: ``DOWNLOAD`` jobs with ``parent_id`` already set, in the
+                order they should run.
+            already_in_library: child id -> the library path that matched.
+
+        Returns:
+            The parent, with its derived status written.
+
+        Raises:
+            QueueError: the collection URL already has an in-flight parent --
+                the same rule a single download's duplicate check applies.
+        """
+        duplicate = self.find_in_flight(parent.url)
+        if duplicate is not None:
+            raise QueueError(
+                f"This URL is already in the queue (job {duplicate.id}, "
+                f"{duplicate.status.value})"
+            )
+
+        skipped = already_in_library or {}
+        self._jobs[parent.id] = parent
+        self._persist(parent)
+        logger.info(
+            "Bulk job %s added: url=%s, artist=%r, %d child job(s)",
+            parent.id,
+            parent.url,
+            parent.artist,
+            len(children),
+        )
+
+        # One pass over the queue instead of one per child: a 2000-track
+        # submission would otherwise be 2000 scans of a dict that is 2000
+        # entries longer each time.  A child queued here is added to the same
+        # index, so a URL that appears twice in one submission still collides
+        # with itself.  First writer wins, matching ``find_in_flight``.
+        in_flight_by_url: dict[str, Job] = {}
+        for job in list(self._jobs.values()):
+            if job.status in _IN_FLIGHT and job.url:
+                in_flight_by_url.setdefault(job.url, job)
+
+        dispatch: list[str] = []
+        for child in children:
+            library_path = skipped.get(child.id)
+            if library_path:
+                # No in-flight check at all: the answer cannot change what this
+                # child says, and the row is already the more useful one.
+                child.status = JobStatus.ERROR
+                child.error = f"{ALREADY_IN_LIBRARY_PREFIX}{library_path}"
+            else:
+                in_flight = in_flight_by_url.get(child.url)
+                if in_flight is not None:
+                    child.status = JobStatus.ERROR
+                    child.error = (
+                        f"This URL is already in the queue (job {in_flight.id}, "
+                        f"{in_flight.status.value})"
+                    )
+                else:
+                    child.status = JobStatus.QUEUED
+                    if child.url:
+                        in_flight_by_url[child.url] = child
+                    dispatch.append(child.id)
+            self._jobs[child.id] = child
+
+        # One transaction for every child, after the parent's own row is
+        # committed (the foreign key points at it).  Dispatch waits for that
+        # commit: a child that starts downloading before its row exists could
+        # write a status update the restart would then have nothing to attach
+        # to.
+        self._persist_many(children)
+
+        for job_id in dispatch:
+            self._dispatch(job_id)
+
+        # Written and announced once, after every child exists: a refresh per
+        # child would emit N status_change events for a parent whose status
+        # only settles at the end of the loop.
+        self._refresh_parent(parent.id)
+        return parent
+
+    def children_of(self, parent_id: str) -> list[Job]:
+        """This parent's child jobs, oldest first.
+
+        ``created_at`` order rather than dict order, so the queue shows the
+        children in the order the user selected them however they were stored.
+
+        Iterates a ``list`` snapshot rather than ``_jobs.values()`` directly
+        because this is one of the few queue reads that happens **off the event
+        loop**: a download worker thread's ``on_phase("converting")`` hook
+        reaches ``_update_status`` and so ``_refresh_parent`` from inside
+        yt-dlp, and :meth:`add_bulk_job` is meanwhile inserting a child per
+        iteration on the loop.  Without the snapshot that is a "dictionary
+        changed size during iteration" raised inside an unrelated child's
+        download, which fails it with "Unexpected error".
+        """
+        return sorted(
+            (job for job in list(self._jobs.values()) if job.parent_id == parent_id),
+            key=lambda job: job.created_at,
+        )
+
+    @staticmethod
+    def derive_bulk_status(children: Iterable[Job]) -> JobStatus:
+        """The status a bulk parent has, given its children.
+
+        The ticket's rule, in its order: anything running makes the parent
+        ``downloading``; else anything waiting makes it ``queued``; else a
+        failure outranks a cancellation, because an error is what the user
+        still has to act on; else everything finished and the parent is
+        ``done``.
+
+        A parent with no children left is ``done``.  That is the honest answer
+        for the two ways it happens -- every child dismissed, or the retention
+        sweep having taken them -- and it is also what makes such a parent
+        leave the queue view instead of sitting there for ever.
+        """
+        statuses = [child.status for child in children]
+        if any(
+            status
+            in (JobStatus.DOWNLOADING, JobStatus.CONVERTING, JobStatus.TAGGING)
+            for status in statuses
+        ):
+            return JobStatus.DOWNLOADING
+        if any(status is JobStatus.QUEUED for status in statuses):
+            return JobStatus.QUEUED
+        if any(status is JobStatus.ERROR for status in statuses):
+            return JobStatus.ERROR
+        if any(status is JobStatus.CANCELLED for status in statuses):
+            return JobStatus.CANCELLED
+        return JobStatus.DONE
+
+    @staticmethod
+    def _is_skipped(job: Job) -> bool:
+        """Whether this child failed only because the track was already there.
+
+        The downloader ends a duplicate as an error carrying
+        :data:`~app.downloader.ALREADY_IN_LIBRARY_PREFIX`, and that is the
+        right shape -- the reason has to stay visible and there is nothing to
+        retry -- but it is not work still to be done, so the parent's "N of M"
+        counts it as finished.
+        """
+        return job.status is JobStatus.ERROR and bool(
+            job.error and job.error.startswith(ALREADY_IN_LIBRARY_PREFIX)
+        )
+
+    def _refresh_parent(self, parent_id: str | None, emit: bool = True) -> None:
+        """Re-derive a parent from its children after one of them moved.
+
+        Called after every child transition.  Two things come out of it:
+
+        * the derived status is **written to the parent row**.  The column is
+          ``NOT NULL`` and ``load_active`` filters on it, so a parent whose
+          status lived only in a ``GET /queue`` computation would not survive a
+          restart -- and the retention sweep, which reads the same column, would
+          never reap it either.  ``finished_at`` follows the status, including
+          back to ``None`` when a retried child brings the parent back to life;
+        * a synthetic ``status_change`` for the parent carrying ``progress_done``
+          of ``progress_total`` -- children finished, of children in total,
+          where a skipped duplicate counts as finished -- which is the "N of M"
+          the queue row shows.  Emitted on every child change,
+          not only when the parent's status changes, because N moves while the
+          status stands still.
+
+        *emit* is False during boot restore, where there is nobody connected to
+        hear it and every client refetches ``GET /queue`` anyway.
+        """
+        parent = self._jobs.get(parent_id) if parent_id else None
+        if parent is None or parent.kind is not JobKind.BULK:
+            return
+        children = self.children_of(parent.id)
+        status = self.derive_bulk_status(children)
+
+        parent.progress_total = len(children)
+        # Skipped duplicates count as done: the parent of a collection whose
+        # tracks were all already in the library reads "12 of 12", not "0 of
+        # 12".  Its *status* is still ``error`` -- ``derive_bulk_status`` is
+        # deliberately untouched -- so the skip reason stays on screen.
+        parent.progress_done = sum(
+            1
+            for child in children
+            if child.status is JobStatus.DONE or self._is_skipped(child)
+        )
+        parent.progress = (
+            100.0 * parent.progress_done / parent.progress_total
+            if parent.progress_total
+            else 0.0
+        )
+        # The parent has no error of its own; the failed child carries it.  The
+        # field is cleared so a parent that goes back in flight after a retry
+        # does not keep a stale one.
+        parent.error = None
+
+        if status is not parent.status:
+            old_status = parent.status.value
+            parent.status = status
+            if status not in _TERMINAL:
+                parent.finished_at = None
+            self._persist(parent)
+            logger.info("Bulk job %s: %s -> %s", parent.id, old_status, status.value)
+
+        if emit:
+            self._emit_event("status_change", parent)
+
+    def _delete_job(self, job_id: str) -> None:
+        """Drop one job from the queue and from the table, children included.
+
+        The row's ``ON DELETE CASCADE`` takes a parent's children with it in
+        SQLite (the store opens with ``foreign_keys=ON``), but the in-memory
+        mirror has no such thing, so the children are dropped here explicitly --
+        otherwise a dismissed parent's children would live on in ``GET /queue``
+        until the process restarted.
+        """
+        for child in self.children_of(job_id):
+            self._jobs.pop(child.id, None)
+            self._active_runs.pop(child.id, None)
+        self._jobs.pop(job_id, None)
+        self._active_runs.pop(job_id, None)
+        if self._store is not None:
+            try:
+                self._store.delete(job_id)
+            except Exception:
+                # The row outliving the dict costs one stale entry after the
+                # next restart, which is a great deal better than a 500 on a
+                # button whose whole purpose is tidying up.
+                logger.exception("Could not delete job %s from the store", job_id)
+
+    def queue_view(self) -> list[Job]:
+        """The queue as ``GET /queue`` returns it: parents with children nested.
+
+        Top level is what still needs attention -- in-flight and errored
+        standalone downloads and tagging jobs, exactly as before, plus bulk
+        parents whose *derived* status is in flight or error -- in insertion
+        order.  A child never appears at the top level, and a parent nests
+        **all** of its children whatever their status: a bulk of ten with nine
+        done is still one row that expands to ten, and hiding the finished nine
+        would make "1 of 10" unreadable.
+
+        A done or cancelled parent is omitted with its children, like any other
+        finished job.
+
+        The nested jobs are copies (``model_copy``), never the queue's own Job
+        objects: ``children`` is a response shape, and hanging it off the live
+        object would leave every later reader -- the store, an SSE payload, the
+        next request -- carrying a snapshot that is already stale.
+        """
+        view: list[Job] = []
+        for entry in list(self._jobs.values()):
+            if entry.parent_id:
+                continue
+            if entry.status in _SWEEPABLE:
+                continue
+            if entry.kind is JobKind.BULK:
+                view.append(
+                    entry.model_copy(
+                        update={
+                            "children": [
+                                child.model_copy(update={"children": []})
+                                for child in self.children_of(entry.id)
+                            ]
+                        }
+                    )
+                )
+            else:
+                view.append(entry)
+        return view
+
+    def with_children(self, job: Job) -> Job:
+        """*job* as a route returns it: a bulk parent carries its children.
+
+        The single-job counterpart of :meth:`queue_view`, for the routes that
+        answer with one job (submit, cancel, retry).  Anything that is not a
+        parent is returned unchanged, children empty.
+        """
+        if job.kind is not JobKind.BULK:
+            return job
+        return job.model_copy(
+            update={
+                "children": [
+                    child.model_copy(update={"children": []})
+                    for child in self.children_of(job.id)
+                ]
+            }
+        )
+
     def in_flight_library_targets(self) -> InFlightTargets:
         """The library folders in-flight jobs are going to write into.
 
@@ -575,7 +915,7 @@ class QueueManager:
         targets: list[str] = []
         unresolved_jobs: list[str] = []
         tagging_paths: list[str] = []
-        for job in self._jobs.values():
+        for job in list(self._jobs.values()):
             if job.status not in _IN_FLIGHT:
                 continue
             # Only downloads create folders in the library.  A bulk parent and
@@ -666,6 +1006,11 @@ class QueueManager:
         job = self._jobs.get(job_id)
         if job is None:
             raise JobNotFound(f"Job {job_id!r} not found")
+        if job.kind is JobKind.BULK:
+            # Checked before the status test so the answer is the useful one:
+            # a parent in `error` is exactly the parent a user would press
+            # Retry on, and "only ERROR jobs can be retried" would be a lie.
+            raise QueueError(BULK_RETRY_MESSAGE)
         if job.status != JobStatus.ERROR:
             raise QueueError(
                 f"Job {job_id!r} is in {job.status.value!r} status, only ERROR jobs can be retried"
@@ -711,6 +1056,9 @@ class QueueManager:
         self._emit_event("status_change", job)
 
         logger.info("Job %s retried, re-queued for processing", job.id)
+        # A retried child puts its parent back in flight (ticket): the derived
+        # status is recomputed and written before the child can start moving.
+        self._refresh_parent(job.parent_id)
         if job.kind is JobKind.TAGGING:
             self._dispatch_tagging_job(job.id)
         else:
@@ -766,6 +1114,11 @@ class QueueManager:
         MusicBrainz request is already open stops at the next checkpoint,
         because that request cannot be interrupted.
 
+        A **bulk parent** is not signalled at all: it has no thread and no
+        status of its own.  The cancel cascades to every child that has not
+        finished -- queued children straight to ``cancelled``, running ones
+        signalled -- and the parent follows them as each one reports back.
+
         A *manual tagging job* in ``tagging`` is the one case that does end in
         ``cancelled``: nothing was downloaded, so the word describes exactly
         what happened.  It is signalled through the same persisted flag, which
@@ -790,6 +1143,10 @@ class QueueManager:
                 "only queued or running jobs can be cancelled"
             )
 
+        if job.kind is JobKind.BULK:
+            self._cancel_children(job)
+            return job
+
         if job.status == JobStatus.QUEUED:
             self._finish_cancelled(job_id)
             return job
@@ -798,6 +1155,31 @@ class QueueManager:
         self._cancel_run(job_id)
         return job
 
+    def _cancel_children(self, parent: Job) -> None:
+        """Cascade a parent's cancel to every child that has not finished.
+
+        Each child is cancelled exactly as it would be on its own: a queued one
+        goes straight to ``cancelled`` here, a running one is only signalled and
+        reaches ``cancelled`` when its thread has stopped ffmpeg and cleaned up.
+        The parent's own status is not written here -- it is derived, and each
+        child's transition refreshes it -- so a parent whose last child is still
+        unwinding stays in flight until it really has stopped.
+        """
+        children = self.children_of(parent.id)
+        logger.info(
+            "Bulk job %s: cancelling %d child job(s) still in flight",
+            parent.id,
+            sum(1 for child in children if child.status in _IN_FLIGHT),
+        )
+        for child in children:
+            if child.status not in _IN_FLIGHT:
+                continue
+            if child.status is JobStatus.QUEUED:
+                self._finish_cancelled(child.id)
+            else:
+                self._cancel_run(child.id)
+        self._refresh_parent(parent.id)
+
     def dismiss_job(self, job_id: str) -> None:
         """Forget an errored job entirely: no row, no queue entry, no history.
 
@@ -805,6 +1187,15 @@ class QueueManager:
         retention sweep never drops -- they sit in the queue until somebody says
         they have been seen.  Everything else either leaves on its own or is
         still running.
+
+        Two bulk rules ride on the same check.  Dismissing a **parent** (whose
+        derived status is ``error``, so at least one child failed) deletes the
+        parent and every child, however far the rest of them got: the user is
+        saying they are done with the whole request.  Dismissing the last
+        failed **child** of a parent whose others are all ``done`` deletes the
+        parent and those children too -- "all done or dismissed" is the
+        ticket's rule -- because a ``done`` parent left behind is a queue row
+        nobody can act on.
 
         Raises:
             JobNotFound: If no such job exists.
@@ -819,17 +1210,29 @@ class QueueManager:
                 "only errored jobs can be dismissed"
             )
 
-        self._jobs.pop(job_id, None)
-        self._active_runs.pop(job_id, None)
-        if self._store is not None:
-            try:
-                self._store.delete(job_id)
-            except Exception:
-                # The row outliving the dict costs one stale entry after the
-                # next restart, which is a great deal better than a 500 on a
-                # button whose whole purpose is tidying up.
-                logger.exception("Could not delete job %s from the store", job_id)
+        parent_id = job.parent_id
+        self._delete_job(job_id)
         logger.info("Job %s dismissed", job_id)
+
+        if parent_id is None:
+            return
+        parent = self._jobs.get(parent_id)
+        if parent is None:
+            return
+        siblings = self.children_of(parent_id)
+        if all(child.status is JobStatus.DONE for child in siblings):
+            # "A parent whose children are all done or dismissed is deleted
+            # with them" (ticket).  Dismissing the last failed child of a bulk
+            # is the user saying they are finished with it, and leaving a
+            # ``done`` parent behind would put a row in the queue that nothing
+            # can ever remove but the retention sweep.
+            logger.info(
+                "Bulk job %s has nothing left but finished children; removing it",
+                parent_id,
+            )
+            self._delete_job(parent_id)
+            return
+        self._refresh_parent(parent_id)
 
     # ------------------------------------------------------------------
     # Persistence
@@ -856,6 +1259,12 @@ class QueueManager:
         Scratch directories left behind by jobs the store no longer knows about
         are removed too; nothing is running yet, so any of them is stale.
 
+        A restored bulk parent also gets its **finished** children back, which
+        ``load_active`` does not return: they are what the parent's "N of M" is
+        counted from and what its queue row expands to, and a restart that
+        dropped them would show a nearly finished bulk as if it had barely
+        started.
+
         A ``tagging`` row is the exception to all of that: its FLAC is finished
         and filed, so there is nothing to download again.  It stays in
         ``tagging`` and is dispatched straight onto the tagging worker, without
@@ -879,13 +1288,37 @@ class QueueManager:
         restored = sorted(self._store.load_active(), key=lambda j: j.created_at)
         for job in restored:
             self._jobs[job.id] = job
+            # A bulk parent has no work of its own: its stored status is the
+            # last value derived from its children, and re-deriving it below is
+            # the whole of its recovery.  Running it through the interrupted
+            # path would remove a scratch directory that never existed and,
+            # worse, re-queue and dispatch the *collection* URL as a download.
+            if job.kind is JobKind.BULK:
+                continue
             if job.status in _INTERRUPTED:
                 self._recover_interrupted(job)
+
+        # ``load_active`` skips ``done``/``cancelled`` rows, which for a bulk
+        # parent is most of what it is made of: a parent halfway through 50
+        # tracks has 20 finished children the query left behind, and without
+        # them the restored parent would say "0 of 30".  They are loaded here
+        # and put straight into the dict, but deliberately kept out of
+        # ``restored`` -- they are finished, so there is nothing to recover, to
+        # dispatch, or to count in the log line.  ``setdefault`` because an
+        # active child is already in the dict with its *recovered* status, and
+        # the stored row would undo that.
+        children = self._store.load_children_of(
+            [job.id for job in restored if job.kind is JobKind.BULK]
+        )
+        for child in children:
+            self._jobs.setdefault(child.id, child)
 
         remove_orphan_temp_dirs({job.id for job in restored})
 
         # The user's original queue order is preserved across the restart.
         for job in restored:
+            if job.kind is JobKind.BULK:
+                continue
             if job.kind is JobKind.TAGGING:
                 # A manual tagging job has no download half at all: whichever
                 # of the two in-flight states it was in, what it needs is the
@@ -896,6 +1329,15 @@ class QueueManager:
                 self._dispatch(job.id)
             elif job.status == JobStatus.TAGGING:
                 self._dispatch_tagging(job.id)
+
+        # After every child is back in the dict with its recovered status, so
+        # each parent derives from what will actually run.  A parent whose
+        # children have all been swept derives to ``done`` and leaves the queue
+        # view; no events, because nothing is connected yet and clients refetch
+        # ``GET /queue`` when their stream reconnects.
+        for job in restored:
+            if job.kind is JobKind.BULK:
+                self._refresh_parent(job.id, emit=False)
 
         if restored:
             logger.info(
@@ -1095,7 +1537,14 @@ class QueueManager:
         id the store reports as pruned is dropped from the dict as well, so the
         dict never keeps a job the table has forgotten.
 
-        Returns the number of jobs removed.
+        Only top-level jobs are candidates.  A bulk parent's children leave
+        with the parent and never on their own: a parent that is still working
+        through a 200-track collection has done children older than the cutoff,
+        and reaping those would rewrite its "N of M" and eventually retire the
+        live parent as ``done`` with nothing under it.
+
+        Returns the number of top-level jobs removed; the children that went
+        with them are logged.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
 
@@ -1105,14 +1554,33 @@ class QueueManager:
             # Memory-only mode (unit tests): apply the same rule to the dict.
             removed = [
                 job_id
-                for job_id, job in self._jobs.items()
-                if job.status in _SWEEPABLE
+                for job_id, job in list(self._jobs.items())
+                if job.parent_id is None
+                and job.status in _SWEEPABLE
                 and (job.finished_at or job.updated_at) < cutoff
             ]
 
         for job_id in removed:
             self._jobs.pop(job_id, None)
             self._active_runs.pop(job_id, None)
+        # A pruned parent takes its children with it in the table (ON DELETE
+        # CASCADE); the in-memory mirror has no cascade, so a child whose
+        # parent has just gone is dropped here.  This is the only way a child
+        # ever leaves the sweep, which is deliberate -- see the docstring.
+        orphans = [
+            job_id
+            for job_id, job in list(self._jobs.items())
+            if job.parent_id and job.parent_id not in self._jobs
+        ]
+        for job_id in orphans:
+            self._jobs.pop(job_id, None)
+            self._active_runs.pop(job_id, None)
+        if removed:
+            logger.info(
+                "Retention sweep dropped %d job(s) and %d child job(s)",
+                len(removed),
+                len(orphans),
+            )
         return len(removed)
 
     # ------------------------------------------------------------------
@@ -1955,6 +2423,7 @@ class QueueManager:
         self._persist(job)
         logger.info("Job %s: %s -> %s", job_id, old_status, JobStatus.CANCELLED.value)
         self._emit_event("status_change", job)
+        self._refresh_parent(job.parent_id)
 
     def _record_result_path(self, job: Job, result: Path | str | None) -> None:
         """Remember where the finished file landed, relative to DOWNLOAD_PATH.
@@ -1996,6 +2465,7 @@ class QueueManager:
         logger.info("Job %s: %s -> %s", job_id, old_status, JobStatus.ERROR.value)
         self._emit_event("status_change", job)
         self._emit_event("error", job)
+        self._refresh_parent(job.parent_id)
 
     def _persist(self, job: Job) -> None:
         """Stamp the job's timestamps and write it through to the store.
@@ -2024,6 +2494,33 @@ class QueueManager:
             # A failed write must not take the download down with it: the job
             # simply will not survive a restart.
             logger.exception("Could not persist job %s", job.id)
+
+    def _persist_many(self, jobs: list[Job]) -> None:
+        """Stamp and write a whole set of jobs in one store transaction.
+
+        The batch form of :meth:`_persist`, for :meth:`add_bulk_job`: 2000
+        single-statement autocommit writes are 2000 commits on the event loop,
+        and one ``executemany`` is one.  Same stamping rules, same "a failed
+        write must not take the submission down" contract.
+
+        Anything these rows reference by foreign key -- a bulk parent -- must
+        already be persisted.
+        """
+        if not jobs:
+            return
+        now = datetime.now(timezone.utc)
+        for job in jobs:
+            job.updated_at = now
+            if job.status in _TERMINAL:
+                job.finished_at = now
+            if job.status in (JobStatus.DONE, JobStatus.ERROR):
+                job.cancel_requested = False
+        if self._store is None:
+            return
+        try:
+            self._store.upsert_many(jobs)
+        except Exception:
+            logger.exception("Could not persist %d job(s)", len(jobs))
 
     def _update_status(self, job_id: str, status: JobStatus) -> None:
         """Update a job's status, persist it, and emit a status_change event.
@@ -2062,6 +2559,7 @@ class QueueManager:
         self._persist(job)
         logger.info("Job %s: %s -> %s", job_id, old_status, status.value)
         self._emit_event("status_change", job)
+        self._refresh_parent(job.parent_id)
 
     def emit_library_changed(self, paths: list[str], job_id: str | None = None) -> None:
         """Tell every client that files under ``DOWNLOAD_PATH`` changed.
@@ -2104,6 +2602,12 @@ class QueueManager:
             # yet" from "this kind of job has no N of M".
             "progress_done": job.progress_done,
             "progress_total": job.progress_total,
+            # Always present, and ``parent_id`` null for anything standalone.
+            # A client that has never seen a job -- a bulk child that started
+            # while the queue view was showing only its parent -- can place the
+            # event from these two alone instead of having to refetch.
+            "kind": job.kind.value,
+            "parent_id": job.parent_id,
         }
         if job.error:
             data["error"] = job.error

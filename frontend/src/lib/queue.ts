@@ -1,4 +1,8 @@
-import type { Job, JobStatus } from "@/lib/types";
+import {
+  ALREADY_IN_LIBRARY_PREFIX,
+  type Job,
+  type JobStatus,
+} from "@/lib/types";
 
 /** Statuses that keep a job at the top of the queue and count towards the badge. */
 export const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
@@ -15,7 +19,14 @@ export const ACTIVE_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
  */
 export const CANCELLABLE_STATUSES: ReadonlySet<JobStatus> = ACTIVE_STATUSES;
 
-/** How many jobs are still working — the number on the Download tab badge. */
+/**
+ * How many jobs are still working — the number on the Download tab badge.
+ *
+ * Top-level rows only. A bulk parent counts once however many children it is
+ * running, because the badge counts the things the user submitted, and
+ * `GET /queue` never lists a child at the top level anyway — a collection of
+ * forty tracks must not read as forty downloads.
+ */
 export function countActiveJobs(jobs: readonly Job[] | undefined): number {
   if (!jobs) return 0;
   return jobs.reduce(
@@ -37,4 +48,60 @@ export function sortJobs(jobs: readonly Job[]): Job[] {
     // Within the same group, sort newest first (descending by created_at)
     return b.created_at.localeCompare(a.created_at);
   });
+}
+
+/**
+ * Whether a job that ended as an error was in fact a skipped duplicate.
+ *
+ * The backend has no "skipped" status: a download whose track is already under
+ * the target artist ends as an error carrying the already-in-library prefix.
+ * Nothing went wrong and retrying would fail identically, so the queue reads
+ * it neutrally and offers no Retry.
+ */
+export function isSkipped(job: Job): boolean {
+  return job.error?.startsWith(ALREADY_IN_LIBRARY_PREFIX) ?? false;
+}
+
+/** How a bulk parent's children are getting on, for its one-line summary. */
+export interface ChildCounts {
+  done: number;
+  /** Errors that are real failures — the ones a Retry is offered for. */
+  failed: number;
+  /** Errors that are duplicates the backend refused to download again. */
+  skipped: number;
+  cancelled: number;
+  /** Queued, downloading, converting, or tagging: still to come. */
+  active: number;
+}
+
+/**
+ * Tally a bulk parent's children by outcome.
+ *
+ * The parent's own `progress_done`/`progress_total` say "3 of 12"; this is the
+ * line under it that says what became of the other nine. Skips are split out
+ * of the error count because a collection where half the tracks were already
+ * in the library has not half failed.
+ *
+ * A parent with no `children` (one built from an SSE snapshot before the
+ * refetch has landed) tallies zeroes rather than throwing.
+ */
+export function childCounts(parent: Job): ChildCounts {
+  const counts: ChildCounts = {
+    done: 0,
+    failed: 0,
+    skipped: 0,
+    cancelled: 0,
+    active: 0,
+  };
+
+  for (const child of parent.children ?? []) {
+    if (child.status === "done") counts.done += 1;
+    else if (child.status === "cancelled") counts.cancelled += 1;
+    else if (child.status === "error") {
+      if (isSkipped(child)) counts.skipped += 1;
+      else counts.failed += 1;
+    } else if (ACTIVE_STATUSES.has(child.status)) counts.active += 1;
+  }
+
+  return counts;
 }

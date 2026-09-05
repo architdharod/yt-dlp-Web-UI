@@ -45,6 +45,7 @@ function taggingJob(path: string): Job {
   return {
     id: `tag-${path}`,
     kind: "tagging",
+    parent_id: null,
     url: "",
     status: "queued",
     title: path.slice(path.lastIndexOf("/") + 1),

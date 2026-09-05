@@ -5,8 +5,11 @@ import { queueQueryOptions } from "@/hooks/useQueueQuery";
 import {
   addJobToCache,
   applyQueueEvent,
+  parentIdOfCachedJob,
   removeJobFromCache,
+  replaceJobInCache,
   resyncAfterReconnect,
+  setJobActionError,
 } from "@/lib/queueCache";
 import { queryKeys } from "@/lib/queryKeys";
 import type { Job, JobStatus, Notice, SSEEvent } from "@/lib/types";
@@ -19,6 +22,7 @@ function job(id: string, status: JobStatus = "downloading"): Job {
   return {
     id,
     kind: "download",
+    parent_id: null,
     url: `https://example.com/${id}`,
     status,
     title: id,
@@ -124,6 +128,7 @@ describe("applyQueueEvent", () => {
 
     expect(queue()![0]).toMatchObject({
       kind: "tagging",
+      parent_id: null,
       status: "tagging",
       path: "Bonobo/Black Sands",
       progress_done: 0,
@@ -148,12 +153,14 @@ describe("applyQueueEvent", () => {
       event("status_change", "a", {
         status: "tagging",
         kind: "download",
+        parent_id: null,
         path: "somewhere/else",
       }),
     );
 
     expect(queue()![0]).toMatchObject({
       kind: "tagging",
+      parent_id: null,
       path: "Bonobo/Black Sands",
     });
   });
@@ -712,5 +719,254 @@ describe("invalidating while a fetch is in flight", () => {
 
     releaseAll([job("a")]);
     unsubscribe();
+  });
+});
+
+/**
+ * A bulk parent and its children, the shape `GET /queue` answers with: the
+ * parent at the top level, every child nested under it whatever its status,
+ * and no child listed on its own.
+ */
+function parent(children: Job[], status: JobStatus = "downloading"): Job {
+  return {
+    ...job("p1", status),
+    kind: "bulk",
+    title: "Black Sands",
+    progress_done: 0,
+    progress_total: children.length,
+    children,
+  };
+}
+
+/** A child of "p1". */
+function childJob(id: string, status: JobStatus = "queued"): Job {
+  return { ...job(id, status), parent_id: "p1" };
+}
+
+/** The children of the one cached parent. */
+function children(): Job[] {
+  return queue()![0].children!;
+}
+
+/** An event as the backend emits it for a child: `parent_id` in the data. */
+function childEvent(
+  name: string,
+  jobId: string,
+  data: Record<string, unknown> = {},
+): SSEEvent {
+  return event(name, jobId, { kind: "download", parent_id: "p1", ...data });
+}
+
+describe("a bulk parent's children in the cache", () => {
+  it("patches the child the event names, not the parent", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([childJob("c1"), childJob("c2")]),
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      childEvent("status_change", "c2", {
+        status: "downloading",
+        title: "Kong",
+      }),
+    );
+
+    expect(queue()!.map((j) => j.id)).toEqual(["p1"]);
+    expect(children().map((c) => c.status)).toEqual(["queued", "downloading"]);
+    expect(children()[1].title).toBe("Kong");
+    // The parent's own fields are the backend's to derive; a child event says
+    // nothing about them.
+    expect(queue()![0].status).toBe("downloading");
+    expect(invalidated).toEqual([]);
+  });
+
+  it("keeps a child that finishes, because GET /queue keeps listing it", () => {
+    // Dropping done children would make the parent's counts lie: "3 done"
+    // is read off the children themselves.
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([childJob("c1"), childJob("c2")]),
+    ]);
+
+    applyQueueEvent(queryClient, childEvent("status_change", "c1", { status: "done" }));
+    applyQueueEvent(
+      queryClient,
+      childEvent("status_change", "c2", { status: "cancelled" }),
+    );
+
+    expect(children().map((c) => c.status)).toEqual(["done", "cancelled"]);
+    expect(queue()!.map((j) => j.id)).toEqual(["p1"]);
+  });
+
+  it("marks a failed child errored and keeps its message", () => {
+    queryClient.setQueryData(queryKeys.queue, [parent([childJob("c1")])]);
+
+    applyQueueEvent(
+      queryClient,
+      childEvent("error", "c1", { error: "ffmpeg exploded" }),
+    );
+
+    expect(children()[0]).toMatchObject({
+      status: "error",
+      error: "ffmpeg exploded",
+    });
+  });
+
+  it("finds a child even when the event carries no parent_id", () => {
+    // Belt and braces: the search falls back to scanning the parents rather
+    // than treating the child as an unknown job and refetching for it.
+    queryClient.setQueryData(queryKeys.queue, [parent([childJob("c1")])]);
+
+    applyQueueEvent(
+      queryClient,
+      event("progress", "c1", { progress: 40, parent_id: null }),
+    );
+
+    expect(children()[0].progress).toBe(40);
+    expect(invalidated).toEqual([]);
+  });
+
+  it("patches the parent's own fields without touching its children", () => {
+    const kids = [childJob("c1", "done"), childJob("c2", "downloading")];
+    queryClient.setQueryData(queryKeys.queue, [parent(kids)]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "p1", {
+        status: "downloading",
+        progress_done: 1,
+        progress_total: 2,
+        kind: "bulk",
+        parent_id: null,
+      }),
+    );
+
+    expect(queue()![0]).toMatchObject({ progress_done: 1, progress_total: 2 });
+    expect(children()).toBe(kids);
+  });
+
+  it("drops the parent once its derived status is done", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([childJob("c1", "done")]),
+      job("other"),
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "p1", { status: "done", parent_id: null }),
+    );
+
+    expect(queue()!.map((j) => j.id)).toEqual(["other"]);
+  });
+
+  it("refetches for a child another client submitted, so it can be shown", () => {
+    // The snapshot in the event has no url or created_at to build a row from,
+    // and the parent has to be re-read anyway for its derived counts.
+    queryClient.setQueryData(queryKeys.queue, [parent([childJob("c1")])]);
+
+    applyQueueEvent(
+      queryClient,
+      childEvent("status_change", "c-new", { status: "downloading" }),
+    );
+
+    expect(invalidated).toEqual([queryKeys.queue]);
+    expect(children().map((c) => c.id)).toEqual(["c1"]);
+  });
+
+  it("refetches for a child whose parent it has never seen", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a")]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "c1", { status: "downloading", parent_id: "p9" }),
+    );
+
+    expect(invalidated).toEqual([queryKeys.queue]);
+  });
+});
+
+describe("row actions on a nested child", () => {
+  it("puts a retried child back under its parent", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([childJob("c1", "error"), childJob("c2", "done")]),
+    ]);
+
+    replaceJobInCache(queryClient, {
+      ...childJob("c1", "queued"),
+      title: "Kong",
+    });
+
+    expect(queue()!.map((j) => j.id)).toEqual(["p1"]);
+    expect(children().map((c) => [c.id, c.status])).toEqual([
+      ["c1", "queued"],
+      ["c2", "done"],
+    ]);
+    expect(children()[0].title).toBe("Kong");
+  });
+
+  it("removes a dismissed child and leaves the parent standing", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([childJob("c1", "error"), childJob("c2", "done")]),
+    ]);
+
+    removeJobFromCache(queryClient, "c1");
+
+    expect(queue()!.map((j) => j.id)).toEqual(["p1"]);
+    expect(children().map((c) => c.id)).toEqual(["c2"]);
+  });
+
+  it("writes a refused action onto the child row that asked for it", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([childJob("c1"), childJob("c2")]),
+    ]);
+
+    setJobActionError(queryClient, "c2", "Job already finished");
+
+    expect(children()[1].error).toBe("Job already finished");
+    expect(children()[0].error).toBeNull();
+  });
+
+  it("names the parent a job hangs off, and nothing for a top-level one", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([childJob("c1")]),
+      job("a"),
+    ]);
+
+    expect(parentIdOfCachedJob(queryClient, "c1")).toBe("p1");
+    expect(parentIdOfCachedJob(queryClient, "p1")).toBeNull();
+    expect(parentIdOfCachedJob(queryClient, "a")).toBeNull();
+    expect(parentIdOfCachedJob(queryClient, "nobody")).toBeNull();
+  });
+});
+
+describe("reconciling a snapshot that nests children", () => {
+  beforeEach(() => {
+    vi.mocked(getQueue).mockReset();
+  });
+
+  it("keeps a dismissed child out of a response that still lists it", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    let release!: (jobs: Job[]) => void;
+    vi.mocked(getQueue).mockReturnValue(
+      new Promise<Job[]>((resolve) => {
+        release = resolve;
+      }),
+    );
+    client.setQueryData(queryKeys.queue, [
+      parent([childJob("c1", "error"), childJob("c2", "done")]),
+    ]);
+
+    const fetching = client.fetchQuery(queueQueryOptions(client));
+    await vi.waitFor(() => expect(getQueue).toHaveBeenCalled());
+    removeJobFromCache(client, "c1");
+
+    // The server answered from before the dismiss landed.
+    release([parent([childJob("c1", "error"), childJob("c2", "done")])]);
+    await fetching;
+
+    const cached = client.getQueryData<Job[]>(queryKeys.queue)!;
+    expect(cached.map((j) => j.id)).toEqual(["p1"]);
+    expect(cached[0].children!.map((c) => c.id)).toEqual(["c2"]);
   });
 });

@@ -36,6 +36,22 @@ export type JobKind = "download" | "bulk" | "tagging";
 export interface Job {
   id: string;
   kind: JobKind;
+  /**
+   * The bulk parent this job is a child of, or null for a top-level job.
+   *
+   * `GET /queue` never lists a child at the top level, so a job with a
+   * `parent_id` is only ever reached through its parent's `children` — but
+   * every SSE event carries the field, which is what lets the cache go
+   * straight to the parent holding the child the event is about.
+   */
+  parent_id: string | null;
+  /**
+   * The children of a bulk parent, in `created_at` order — every one of them,
+   * whatever its status, because a finished or cancelled track still has to be
+   * accounted for under the collection it came from. Absent on anything that
+   * is not a `bulk` parent, and never nested more than one level deep.
+   */
+  children?: Job[];
   url: string;
   status: JobStatus;
   title: string | null;
@@ -77,10 +93,138 @@ export interface DownloadRequest {
 }
 
 /**
+ * Request body for POST /download/probe.
+ *
+ * `artist` is the folder the form is currently showing, and only the dedup
+ * pass reads it: sending it marks the preview's rows against the folder the
+ * tracks would really land in. Omitted, the backend dedups against its own
+ * suggestion.
+ */
+export interface ProbeRequest {
+  url: string;
+  artist?: string | null;
+}
+
+/** Where a collection came from, which decides the notices the preview shows. */
+export type CollectionSource =
+  | "youtube"
+  | "soundcloud"
+  | "bandcamp"
+  | "other";
+
+/**
+ * Whether a previewed track can be downloaded.
+ *
+ * `in_library` is the dedup rule's verdict (`SOURCEID`, then normalised title,
+ * under the target artist) and only unticks the row — it can still be
+ * submitted, and the backend then skips it with a visible reason.
+ * `unavailable` is a row nothing can be done with, a DRM SoundCloud track
+ * being the case that made this exist; `reason` says which.
+ */
+export type PreviewRowStatus = "available" | "in_library" | "unavailable";
+
+/**
+ * One track in a collection preview, as the flat enumeration found it.
+ *
+ * `id` is the preview's own row handle (the checklist's key), not a job id —
+ * no job exists until the selection is submitted. `source_id` is the
+ * extractor's id for the track, which is what dedup matched on. `title` is
+ * nullable because the flat pass often has none: a Bandcamp `/track/` row
+ * arrives as a bare URL and nothing else.
+ */
+export interface PreviewRow {
+  id: string;
+  url: string;
+  source_id: string | null;
+  title: string | null;
+  album: string | null;
+  duration: number | null;
+  thumbnail_url: string | null;
+  status: PreviewRowStatus;
+  reason: string | null;
+}
+
+/**
+ * The flat enumeration of a collection: everything the checklist needs.
+ *
+ * `total`, `in_library`, and `unavailable` are counts over `rows`, sent
+ * rather than derived so the header reads the same as the backend's own view.
+ * `large` is the 500-row flag: above it nothing is preselected and the preview
+ * warns. `notices` are source-level remarks ("Bandcamp streams are 128 kbps"),
+ * not errors — the 2000-row stop is a 400 instead.
+ */
+export interface CollectionPreview {
+  url: string;
+  title: string | null;
+  artist: string | null;
+  source: CollectionSource;
+  rows: PreviewRow[];
+  total: number;
+  in_library: number;
+  unavailable: number;
+  large: boolean;
+  notices: string[];
+}
+
+/**
+ * What `POST /download/probe` made of a URL.
+ *
+ * A discriminated union on `type`: a single item queues straight through the
+ * download form as it always has, and a collection opens the preview. The
+ * probe is the only thing that knows which a URL is, so the form cannot decide
+ * from the URL shape.
+ */
+export type ProbeResponse =
+  | {
+      type: "track";
+      title: string | null;
+      duration: number | null;
+      thumbnail_url: string | null;
+      artist: string | null;
+      album: string | null;
+    }
+  | { type: "collection"; preview: CollectionPreview };
+
+/**
+ * One selected track in a bulk submission.
+ *
+ * The metadata the preview already has travels with the selection so the child
+ * row reads properly while it waits; the child job resolves the rest itself
+ * when it runs.
+ */
+export interface BulkTrack {
+  url: string;
+  title: string | null;
+  album: string | null;
+  duration: number | null;
+  thumbnail_url: string | null;
+  source_id: string | null;
+}
+
+/**
+ * Request body for `POST /download/bulk`: the parent and its children in one
+ * post.
+ *
+ * `artist` is the field the user edited above the checklist and applies to
+ * every child, which is what makes the whole collection land under one artist
+ * folder. 409 means this collection is already in the queue.
+ */
+export interface BulkDownloadRequest {
+  url: string;
+  artist: string;
+  title: string | null;
+  tracks: BulkTrack[];
+}
+
+/**
  * Payload for Server-Sent Events from GET /queue/stream.
  *
  * `job_id` is null for events that are not about one job — `library_changed`
  * is emitted for moves, deletes, and tag writes that no job produced.
+ *
+ * `data` always carries `kind` and `parent_id` alongside the job snapshot, so
+ * an event about a child of a bulk parent can be routed to the parent holding
+ * it without searching the whole cache.
  */
 export interface SSEEvent {
   event: string;

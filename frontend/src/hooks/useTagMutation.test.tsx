@@ -18,6 +18,7 @@ function taggingJob(path: string): Job {
   return {
     id: "job-1",
     kind: "tagging",
+    parent_id: null,
     url: "",
     status: "queued",
     title: "Black Sands",

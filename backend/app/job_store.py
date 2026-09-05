@@ -33,6 +33,7 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 
 from app.models import Job, JobKind, JobStatus
 
@@ -44,6 +45,10 @@ DB_FILENAME = "queue.db"
 # Statuses a job never comes back from and that the retention sweep may drop.
 # ``error`` is deliberately absent: an errored job stays until it is dismissed.
 TERMINAL_STATUSES: tuple[JobStatus, ...] = (JobStatus.DONE, JobStatus.CANCELLED)
+
+# How many ids one ``IN (...)`` may carry.  SQLite's default limit is 999 bound
+# parameters per statement; 900 leaves room for the other placeholders.
+_MAX_IN_PARAMS = 900
 
 # Columns of the ``jobs`` table, in the order the row tuple carries them.
 _COLUMNS: tuple[str, ...] = (
@@ -69,6 +74,21 @@ _COLUMNS: tuple[str, ...] = (
     "created_at",
     "updated_at",
     "finished_at",
+)
+
+# The three SQL fragments every upsert is built from.  Joined once at import
+# rather than per call: a bulk submission writes 2000 rows in one go, and
+# rebuilding the same three strings 2000 times on the event loop is pure waste.
+_COLUMN_LIST = ", ".join(_COLUMNS)
+_PLACEHOLDERS = ", ".join("?" for _ in _COLUMNS)
+_UPDATE_ASSIGNMENTS = ", ".join(
+    f"{column} = excluded.{column}"
+    for column in _COLUMNS
+    if column not in ("id", "created_at")
+)
+_UPSERT_SQL = (
+    f"INSERT INTO jobs ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS}) "
+    f"ON CONFLICT(id) DO UPDATE SET {_UPDATE_ASSIGNMENTS}"
 )
 
 # Each entry is one schema version: the statements that take the database from
@@ -363,24 +383,50 @@ class JobStore:
         ``created_at`` order, so an update must not be able to move a job to the
         back of the queue.
         """
-        placeholders = ", ".join("?" for _ in _COLUMNS)
-        columns = ", ".join(_COLUMNS)
-        updates = ", ".join(
-            f"{column} = excluded.{column}"
-            for column in _COLUMNS
-            if column not in ("id", "created_at")
-        )
         with self._lock:
             if self._closed:
                 # Shutdown races an executor thread's last write; there is
                 # nothing to persist to any more and nothing to report.
                 logger.debug("Job store closed, dropping write for job %s", job.id)
                 return
-            self._conn.execute(
-                f"INSERT INTO jobs ({columns}) VALUES ({placeholders}) "
-                f"ON CONFLICT(id) DO UPDATE SET {updates}",
-                self._to_row(job),
-            )
+            self._conn.execute(_UPSERT_SQL, self._to_row(job))
+
+    def upsert_many(self, jobs: Sequence[Job]) -> None:
+        """Insert or update many jobs in one transaction.
+
+        The batch counterpart of :meth:`upsert`, for the one caller that writes
+        a whole set of rows at once: a bulk submission of 2000 children.  Doing
+        that as 2000 autocommit statements is 2000 fsyncs on the event loop;
+        one explicit transaction with ``executemany`` is a single commit, and
+        the rows are durable together -- there is no moment where half a bulk's
+        children exist.
+
+        Rows already written by a foreign key (a bulk parent) must be committed
+        *before* this call, since the children reference it.
+        """
+        if not jobs:
+            return
+        rows = [self._to_row(job) for job in jobs]
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, dropping %d write(s)", len(rows))
+                return
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.executemany(_UPSERT_SQL, rows)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                # Anything at all, not only ``sqlite3.Error``: a
+                # ``KeyboardInterrupt`` or a ``sqlite3.Warning`` that left the
+                # transaction open would make every later write on this
+                # connection part of a batch nobody is going to commit.  The
+                # rollback itself is best-effort -- if even that fails there is
+                # nothing left to do but say so and let the original error out.
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    logger.exception("Rollback of a bulk job write failed")
+                raise
 
     def delete(self, job_id: str) -> bool:
         """Delete one job row (and, via ``ON DELETE CASCADE``, its children).
@@ -425,6 +471,39 @@ class JobStore:
             ).fetchone()
         return self._to_job(row) if row is not None else None
 
+    def load_children_of(self, parent_ids: Sequence[str]) -> list[Job]:
+        """Every child row of the given parents, oldest first.
+
+        The complement of :meth:`load_active`, which deliberately skips
+        ``done``/``cancelled`` rows: a bulk parent's finished children are
+        exactly what its "N of M" is counted from, so a restart that reloaded
+        only the active ones would show a parent that had downloaded 40 of 50
+        tracks as "0 of 10".
+
+        Chunked at :data:`_MAX_IN_PARAMS` ids per statement, well inside
+        SQLite's variable limit, so a restore with thousands of parents cannot
+        raise ``too many SQL variables``.
+        """
+        ids = [job_id for job_id in parent_ids if job_id]
+        if not ids:
+            return []
+        rows: list[sqlite3.Row] = []
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, returning no children")
+                return []
+            for start in range(0, len(ids), _MAX_IN_PARAMS):
+                chunk = ids[start : start + _MAX_IN_PARAMS]
+                placeholders = ", ".join("?" for _ in chunk)
+                rows.extend(
+                    self._conn.execute(
+                        f"SELECT * FROM jobs WHERE parent_id IN ({placeholders}) "
+                        "ORDER BY created_at ASC",
+                        chunk,
+                    ).fetchall()
+                )
+        return [self._to_job(row) for row in rows]
+
     def prune_terminal(self, older_than: datetime) -> list[str]:
         """Delete ``done``/``cancelled`` rows that finished before *older_than*.
 
@@ -432,9 +511,12 @@ class JobStore:
         in-memory mirror.  ``finished_at`` should always be set on a terminal
         row; ``updated_at`` is the fallback for rows written by an older build.
 
-        Note: deleting a row cascades to its children, so reaping a bulk parent
-        reaps its child downloads with it.  Phase 10 has to decide when a bulk
-        parent counts as terminal before any parent row is ever stored.
+        Only top-level rows are considered (``parent_id IS NULL``).  A child
+        leaves only with its parent, through the row's ``ON DELETE CASCADE``:
+        a bulk parent that is still working is full of ``done`` children older
+        than the cutoff, and sweeping those out from under it would silently
+        rewrite its "N of M" and, once the last one went, retire a live parent
+        as ``done``.
         """
         cutoff = _to_iso(older_than)
         terminal = [status.value for status in TERMINAL_STATUSES]
@@ -445,6 +527,7 @@ class JobStore:
                 return []
             rows = self._conn.execute(
                 f"SELECT id FROM jobs WHERE status IN ({placeholders}) "
+                "AND parent_id IS NULL "
                 "AND COALESCE(finished_at, updated_at) < ?",
                 (*terminal, cutoff),
             ).fetchall()

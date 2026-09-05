@@ -25,6 +25,10 @@ ALLOWED_URL_HOSTS: tuple[str, ...] = (
     "youtube.com",
     "youtu.be",
     "soundcloud.com",
+    # Every Bandcamp artist lives on a subdomain (``zoekeating.bandcamp.com``),
+    # which the ``endswith("." + allowed)`` test below covers; the bare domain
+    # is listed so a label page pasted without a subdomain is accepted too.
+    "bandcamp.com",
 )
 
 
@@ -98,7 +102,11 @@ class JobKind(str, Enum):
 class DownloadRequest(BaseModel):
     """Schema for POST /download request body."""
 
-    url: str = Field(..., min_length=1, description="YouTube or SoundCloud URL to download")
+    url: str = Field(
+        ...,
+        min_length=1,
+        description="YouTube, SoundCloud or Bandcamp URL to download",
+    )
     artist: str | None = Field(None, max_length=200, description="Optional artist name for file organization")
     album: str | None = Field(None, max_length=200, description="Optional album name for file organization")
 
@@ -192,6 +200,15 @@ class Job(BaseModel):
             "Whether the user asked for this job to stop.  Persisted so a "
             "restart during a cancel finishes the job as cancelled instead of "
             "re-queuing it; never part of an SSE payload."
+        ),
+    )
+    children: list["Job"] = Field(
+        default_factory=list,
+        description=(
+            "The child downloads of a bulk parent, oldest first.  Response "
+            "shape only: never persisted (the children are rows of their own, "
+            "found by ``parent_id``) and never part of an SSE payload, which "
+            "carries one job at a time.  Always empty on a child."
         ),
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Job creation timestamp")
@@ -598,3 +615,220 @@ class TrashEmptyResponse(BaseModel):
 
     removed: int = Field(0, description="Entries removed")
     track_count: int = Field(0, description="Audio files removed")
+
+
+# ---------------------------------------------------------------------------
+# Collection probe and bulk downloads
+# ---------------------------------------------------------------------------
+# The bulk flow is two requests: ``POST /download/probe`` says whether a URL is
+# one track or a collection and, for a collection, returns the checklist the
+# user picks from; ``POST /download/bulk`` sends the picked rows back as one
+# parent job with a child per track.
+
+# Above this many rows the preview warns and starts with nothing selected: a
+# 600-track channel is almost never what somebody meant to download in one go.
+LARGE_COLLECTION_TRACKS = 500
+
+# Hard stop.  Enumerating more than this is minutes of yt-dlp calls for a
+# selection nobody is going to make one checkbox at a time, and the queue would
+# hold the result for hours; the user is asked for a narrower URL instead.
+MAX_COLLECTION_TRACKS = 2000
+
+
+class ProbeRequest(BaseModel):
+    """Schema for POST /download/probe: the URL the user pasted.
+
+    ``artist`` is optional and only affects the dedup pass: it is the artist
+    folder the form is currently showing, so that a user who corrects the
+    suggestion sees "in library" recomputed against the folder the tracks would
+    actually land in.  Omitted (or blank), the source's own suggestion is used.
+    """
+
+    url: str = Field(
+        ...,
+        min_length=1,
+        description="The URL to classify: a track, or a collection to preview",
+    )
+    artist: str | None = Field(
+        None,
+        max_length=MAX_FOLDER_NAME,
+        description="Artist folder to check the preview's rows against",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        return validate_download_url(value)
+
+    @field_validator("artist")
+    @classmethod
+    def _check_artist(cls, value: str | None) -> str | None:
+        # Unlike the bulk request's, a blank artist here is not an error: the
+        # form sends whatever is in the box, and an empty box simply means
+        # "use the suggestion".
+        if value is None:
+            return None
+        return value.strip() or None
+
+
+class ProbeTrackResponse(BaseModel):
+    """The probe's answer for a URL that is a single track.
+
+    The same fields ``POST /download`` would have extracted, so the form can
+    show the track and queue it without probing twice.  Every one of them is
+    optional: a probe that reached the page but could not read a title is still
+    a usable answer, and the download resolves its own metadata anyway.
+    """
+
+    type: Literal["track"] = "track"
+    title: str | None = Field(None, description="Track title from the flat extraction")
+    duration: float | None = Field(None, description="Length in seconds")
+    thumbnail_url: str | None = Field(None, description="Thumbnail URL from the source CDN")
+    artist: str | None = Field(None, description="Artist yt-dlp reported, if any")
+    album: str | None = Field(None, description="Album yt-dlp reported, if any")
+
+
+class PreviewRow(BaseModel):
+    """One track in a collection preview.
+
+    ``status`` drives the checklist: ``available`` rows start ticked,
+    ``in_library`` rows start unticked with the matching library path in
+    ``reason``, and ``unavailable`` rows cannot be selected at all and carry
+    yt-dlp's own words for why.
+    """
+
+    id: str = Field(
+        ...,
+        description=(
+            "Stable key for this row: its source id, or its URL when the "
+            "source gave no id.  What the frontend keys the checklist on and "
+            "what the dedup answer is returned against."
+        ),
+    )
+    url: str = Field(..., description="The URL a child job would download")
+    source_id: str | None = Field(
+        None, description="``<extractor>:<id>``, the same shape SOURCEID carries"
+    )
+    title: str | None = Field(None, description="Track title, when the source gave one")
+    album: str | None = Field(
+        None,
+        description="Album from the source; null means the track becomes a loose Single",
+    )
+    duration: float | None = Field(None, description="Length in seconds, when known")
+    thumbnail_url: str | None = Field(None, description="Thumbnail URL, when known")
+    status: Literal["available", "in_library", "unavailable"] = Field(
+        ..., description="Whether this row can be, or is worth, downloading"
+    )
+    reason: str | None = Field(
+        None,
+        description=(
+            "The matching library path for ``in_library``, yt-dlp's message "
+            "for ``unavailable``, and null for ``available``"
+        ),
+    )
+
+
+class CollectionPreview(BaseModel):
+    """The checklist behind a collection URL."""
+
+    url: str = Field(..., description="The collection URL that was probed")
+    title: str | None = Field(None, description="Collection title from the source")
+    artist: str | None = Field(
+        None,
+        description=(
+            "The artist the source suggests, which the user edits before "
+            "submitting; it applies to every selected row"
+        ),
+    )
+    source: Literal["youtube", "soundcloud", "bandcamp", "other"] = Field(
+        ..., description="Which source this came from, for the per-source notices"
+    )
+    rows: list[PreviewRow] = Field(default_factory=list)
+    total: int = Field(..., description="Number of rows")
+    in_library: int = Field(..., description="Rows the dedup rule already found on disk")
+    unavailable: int = Field(..., description="Rows that cannot be downloaded")
+    large: bool = Field(
+        ...,
+        description=(
+            f"More than {LARGE_COLLECTION_TRACKS} rows, so the UI warns and "
+            "preselects nothing"
+        ),
+    )
+    notices: list[str] = Field(
+        default_factory=list,
+        description="Source caveats worth showing above the list",
+    )
+
+
+class ProbeCollectionResponse(BaseModel):
+    """The probe's answer for a URL that is a playlist, album, set or channel."""
+
+    type: Literal["collection"] = "collection"
+    preview: CollectionPreview
+
+
+# Discriminated on ``type`` so a client can branch without guessing from the
+# shape, and so the OpenAPI schema names both arms.
+ProbeResponse = Annotated[
+    ProbeTrackResponse | ProbeCollectionResponse, Field(discriminator="type")
+]
+
+
+class BulkTrack(BaseModel):
+    """One selected row on its way back to the backend.
+
+    Everything but the URL is what the preview showed and may be null: a child
+    resolves its own metadata when it runs, so these are only what the queue
+    can display in the meantime.
+    """
+
+    url: str = Field(..., min_length=1, description="The track URL to download")
+    title: str | None = Field(None, max_length=1000)
+    album: str | None = Field(None, max_length=MAX_FOLDER_NAME)
+    duration: float | None = Field(None, ge=0)
+    thumbnail_url: str | None = Field(None, max_length=MAX_PATH_LENGTH)
+    source_id: str | None = Field(None, max_length=200)
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        return validate_download_url(value)
+
+
+class BulkDownloadRequest(BaseModel):
+    """Schema for POST /download/bulk: the selection, plus where it goes.
+
+    ``artist`` is the one placement decision the user makes, and it applies to
+    every track; the album travels per row because that is how the source gives
+    it (bulk flow ticket).  A blank album means a loose Single under the artist.
+    """
+
+    url: str = Field(..., min_length=1, description="The collection URL these rows came from")
+    artist: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_FOLDER_NAME,
+        description="Artist folder every selected track is filed under",
+    )
+    title: str | None = Field(
+        None, max_length=1000, description="Collection title, shown on the parent row"
+    )
+    tracks: list[BulkTrack] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_COLLECTION_TRACKS,
+        description="The rows the user selected, in the order they were shown",
+    )
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        return validate_download_url(value)
+
+    @field_validator("artist")
+    @classmethod
+    def _check_artist(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("artist must not be blank")
+        return stripped

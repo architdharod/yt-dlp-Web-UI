@@ -17,6 +17,7 @@ function job(id: string, status: JobStatus = "downloading"): Job {
   return {
     id,
     kind: "download",
+    parent_id: null,
     url: `https://example.com/${id}`,
     status,
     title: id,
@@ -159,5 +160,60 @@ describe("addJob", () => {
     act(() => result.current.addJob(job("b", "queued")));
 
     expect(queue().map((j) => j.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("dismissing one track of a collection", () => {
+  /** A bulk parent holding *kids*. */
+  function parent(kids: Job[]): Job {
+    return {
+      ...job("p1", "error"),
+      kind: "bulk",
+      title: "Black Sands",
+      children: kids,
+    };
+  }
+
+  /** A child of "p1". */
+  function child(id: string, status: JobStatus): Job {
+    return { ...job(id, status), parent_id: "p1" };
+  }
+
+  it("takes the child out and asks the backend what became of the parent", async () => {
+    // The backend deletes a parent whose remaining children are all done, so
+    // only a refetch can say whether the collapsed parent row still exists.
+    vi.mocked(dismissJob).mockResolvedValue(undefined);
+    const invalidated: unknown[] = [];
+    const { result } = render([parent([child("c1", "error"), child("c2", "done")])]);
+    vi.spyOn(queryClient, "invalidateQueries").mockImplementation(
+      (filters?: unknown) => {
+        invalidated.push((filters as { queryKey?: unknown })?.queryKey);
+        return Promise.resolve();
+      },
+    );
+
+    act(() => result.current.dismissJob("c1"));
+
+    await waitFor(() =>
+      expect(queue()[0].children!.map((c) => c.id)).toEqual(["c2"]),
+    );
+    expect(invalidated).toEqual([queryKeys.queue]);
+  });
+
+  it("does not refetch for a top-level dismiss, which changes nothing else", async () => {
+    vi.mocked(dismissJob).mockResolvedValue(undefined);
+    const invalidated: unknown[] = [];
+    const { result } = render([job("a", "error")]);
+    vi.spyOn(queryClient, "invalidateQueries").mockImplementation(
+      (filters?: unknown) => {
+        invalidated.push((filters as { queryKey?: unknown })?.queryKey);
+        return Promise.resolve();
+      },
+    );
+
+    act(() => result.current.dismissJob("a"));
+
+    await waitFor(() => expect(queue()).toEqual([]));
+    expect(invalidated).toEqual([]);
   });
 });

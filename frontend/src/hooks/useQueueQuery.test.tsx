@@ -15,6 +15,7 @@ function job(id: string, status: JobStatus): Job {
   return {
     id,
     kind: "download",
+    parent_id: null,
     url: `https://example.com/${id}`,
     status,
     title: id,

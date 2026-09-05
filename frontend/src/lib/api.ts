@@ -1,4 +1,5 @@
 import type {
+  BulkDownloadRequest,
   DownloadRequest,
   Job,
   LibraryAlbum,
@@ -9,6 +10,8 @@ import type {
   LibraryResponse,
   LibraryTagRequest,
   Notice,
+  ProbeRequest,
+  ProbeResponse,
   SSEEvent,
   TrashEmptyResponse,
   TrashResponse,
@@ -80,6 +83,68 @@ async function parseErrorDetail(res: Response): Promise<string> {
  */
 export async function submitDownload(request: DownloadRequest): Promise<Job> {
   const res = await fetch(`${API_BASE_URL}/download`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+  });
+
+  if (!res.ok) {
+    throw new Error(await parseErrorDetail(res));
+  }
+
+  return res.json() as Promise<Job>;
+}
+
+/**
+ * Ask the backend what a URL is before anything is queued.
+ *
+ * A single item answers `{type: "track"}` and the form submits it as it always
+ * has; a playlist, album, or artist page answers with the flat preview the
+ * checklist is built from. The enumeration is cached per URL for the session,
+ * so re-opening a preview costs nothing.
+ *
+ * Passing `artist` re-runs the dedup pass against that folder instead of the
+ * suggested one, which is what a corrected artist needs; the enumeration
+ * itself comes from the cache, so it costs a library lookup and nothing else.
+ *
+ * Failures arrive as the backend's own message: 400 for a collection over the
+ * 2000-track stop or an unsupported host, 504 when the extraction timed out.
+ */
+export async function probeUrl(
+  url: string,
+  artist?: string | null,
+): Promise<ProbeResponse> {
+  const body: ProbeRequest = { url };
+  if (artist != null && artist !== "") {
+    body.artist = artist;
+  }
+
+  const res = await fetch(`${API_BASE_URL}/download/probe`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    throw new Error(await parseErrorDetail(res));
+  }
+
+  return res.json() as Promise<ProbeResponse>;
+}
+
+/**
+ * Queue a selection from a collection preview: one bulk parent and one child
+ * per track, created together.
+ *
+ * The answer is the parent with its `children` already populated, which is
+ * what goes straight into the queue cache — no child is ever listed at the top
+ * level, so the parent is the only row there is to add. 409 means this
+ * collection is already in the queue.
+ */
+export async function submitBulkDownload(
+  request: BulkDownloadRequest,
+): Promise<Job> {
+  const res = await fetch(`${API_BASE_URL}/download/bulk`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),

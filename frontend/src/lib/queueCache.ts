@@ -12,6 +12,132 @@ const TERMINAL_HIDDEN_STATUSES: ReadonlySet<Job["status"]> = new Set<
 >(["done", "cancelled"]);
 
 /**
+ * Where a job sits in the cached list.
+ *
+ * `GET /queue` is two levels deep and no deeper: top-level rows, and the
+ * `children` of a bulk parent. Every patch below therefore has to say which of
+ * the two it found, because the rules differ — a top-level job that reaches
+ * `done` leaves the cache, while a child that reaches `done` stays under its
+ * parent, since the endpoint keeps listing it there.
+ */
+interface JobLocation {
+  /** Index within the top-level list, or within the parent's `children`. */
+  index: number;
+  /** The parent's index in the top-level list, or null for a top-level job. */
+  parentIndex: number | null;
+}
+
+/**
+ * Find a job by id at either level.
+ *
+ * *parentId* is the `parent_id` an SSE event carries: given one, the search
+ * goes straight to that parent and looks no further, which is what keeps a
+ * child event off a scan of every parent's children. Without one — an action
+ * taken from a row, which knows only the id it clicked — the top level is
+ * tried first and the children are then scanned.
+ */
+function locateJob(
+  jobs: readonly Job[],
+  jobId: string,
+  parentId?: string | null,
+): JobLocation | null {
+  const childIn = (parentIndex: number): JobLocation | null => {
+    const index =
+      jobs[parentIndex].children?.findIndex((c) => c.id === jobId) ?? -1;
+    return index === -1 ? null : { index, parentIndex };
+  };
+
+  if (typeof parentId === "string") {
+    const parentIndex = jobs.findIndex((j) => j.id === parentId);
+    return parentIndex === -1 ? null : childIn(parentIndex);
+  }
+
+  const index = jobs.findIndex((j) => j.id === jobId);
+  if (index !== -1) return { index, parentIndex: null };
+
+  for (let i = 0; i < jobs.length; i += 1) {
+    const found = childIn(i);
+    if (found !== null) return found;
+  }
+  return null;
+}
+
+/** The job *location* points at. */
+function jobAt(jobs: readonly Job[], location: JobLocation): Job {
+  return location.parentIndex === null
+    ? jobs[location.index]
+    : jobs[location.parentIndex].children![location.index];
+}
+
+/**
+ * Rewrite the job at *location* — or drop it, for a null *next* — leaving
+ * every other job's identity intact so React re-renders only what changed.
+ *
+ * A patched child rebuilds its parent object, which is unavoidable: the parent
+ * row shows counts over its children, so it has to change when one of them
+ * does.
+ */
+function withJobAt(
+  jobs: readonly Job[],
+  location: JobLocation,
+  next: Job | null,
+): Job[] {
+  if (location.parentIndex === null) {
+    if (next === null) return jobs.filter((_, i) => i !== location.index);
+    const out = [...jobs];
+    out[location.index] = next;
+    return out;
+  }
+
+  const parent = jobs[location.parentIndex];
+  const children = parent.children!;
+  const out = [...jobs];
+  out[location.parentIndex] = {
+    ...parent,
+    children:
+      next === null
+        ? children.filter((_, i) => i !== location.index)
+        : children.map((c, i) => (i === location.index ? next : c)),
+  };
+  return out;
+}
+
+/**
+ * Apply *patch* to the job *jobId* wherever it sits. A patch answering null
+ * removes the job; an id unknown at both levels leaves the list untouched.
+ */
+function patchJob(
+  jobs: readonly Job[],
+  jobId: string,
+  parentId: string | null | undefined,
+  patch: (job: Job) => Job | null,
+): Job[] {
+  const location = locateJob(jobs, jobId, parentId);
+  if (location === null) return jobs as Job[];
+  return withJobAt(jobs, location, patch(jobAt(jobs, location)));
+}
+
+/**
+ * The id of the bulk parent holding *jobId*, or null when it is a top-level
+ * job or is not cached at all.
+ *
+ * The dismiss action needs it: the backend may delete the parent along with
+ * the last child that was not `done`, so a child dismiss has to be followed by
+ * a refetch, while a top-level dismiss does not.
+ */
+export function parentIdOfCachedJob(
+  queryClient: QueryClient,
+  jobId: string,
+): string | null {
+  const jobs = readQueue(queryClient);
+  if (jobs === undefined) return null;
+  const location = locateJob(jobs, jobId);
+  return location === null || location.parentIndex === null
+    ? null
+    : jobs[location.parentIndex].id;
+}
+
+/**
  * Ids removed from the `["queue"]` cache since the last `GET /queue` went out,
  * kept per `QueryClient` so tests (and any second client) stay independent.
  *
@@ -106,6 +232,21 @@ export function beginQueueFetch(queryClient: QueryClient): void {
  * fresher state. One the stream has since removed is not in the cache at all
  * and so is not re-appended.
  */
+/**
+ * A parent without the children dropped since the fetch went out.
+ *
+ * A dismissed child is deleted server-side, but a `GET /queue` that left
+ * before the dismiss still nests it under its parent — and the response is
+ * written into the cache unconditionally, so without this the row would come
+ * back and never leave again.
+ */
+function withoutDroppedChildren(job: Job, dropped: ReadonlySet<string>): Job {
+  const children = job.children;
+  if (children === undefined) return job;
+  const kept = children.filter((child) => !dropped.has(child.id));
+  return kept.length === children.length ? job : { ...job, children: kept };
+}
+
 export function reconcileQueueSnapshot(
   queryClient: QueryClient,
   jobs: Job[],
@@ -113,7 +254,12 @@ export function reconcileQueueSnapshot(
   const dropped = droppedIds(queryClient);
   const added = addedIds(queryClient);
 
-  const kept = dropped.size === 0 ? jobs : jobs.filter((job) => !dropped.has(job.id));
+  const kept =
+    dropped.size === 0
+      ? jobs
+      : jobs
+          .filter((job) => !dropped.has(job.id))
+          .map((job) => withoutDroppedChildren(job, dropped));
   if (added.size === 0) return kept;
 
   const cached = queryClient.getQueryData<Job[]>(queryKeys.queue) ?? [];
@@ -146,9 +292,11 @@ function numberOrNull(
  *
  * The backend's `_emit_event` sends status, progress, title, thumbnail_url,
  * duration, artist and album on every event type, plus the N-of-M counters,
- * and error/detail when they are set. `kind` and `path` are *not* in that
- * snapshot — they never change over a job's life anyway, so the cached row
- * keeps whatever `GET /queue` (or the creating response) gave it.
+ * and error/detail when they are set. `kind`, `parent_id` and `path` are *not*
+ * merged — they never change over a job's life, so the cached row keeps
+ * whatever `GET /queue` (or the creating response) gave it. Neither are
+ * `children`: a parent's synthetic `status_change` carries its own derived
+ * fields only, and the children it holds are patched by their own events.
  */
 export function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
   const merged = { ...job };
@@ -229,20 +377,29 @@ export function addJobToCache(queryClient: QueryClient, job: Job): void {
   );
 }
 
-/** Replace a job with a fresher copy from an API response. */
+/**
+ * Replace a job with a fresher copy from an API response.
+ *
+ * The copy carries its own `parent_id`, so a retried child goes back under the
+ * parent it came from rather than being appended to the top level.
+ */
 export function replaceJobInCache(queryClient: QueryClient, job: Job): void {
   writeQueue(queryClient, (jobs) =>
-    jobs.map((j) => (j.id === job.id ? job : j)),
+    patchJob(jobs, job.id, job.parent_id, () => job),
   );
 }
 
-/** Drop a job from the in-flight view. */
+/**
+ * Drop a job from the in-flight view — a top-level row, or one child of a bulk
+ * parent, which is what a dismissed child is: the backend deleted that row and
+ * left the parent standing.
+ */
 export function removeJobFromCache(
   queryClient: QueryClient,
   jobId: string,
 ): void {
   recordDrop(queryClient, jobId);
-  writeQueue(queryClient, (jobs) => jobs.filter((j) => j.id !== jobId));
+  writeQueue(queryClient, (jobs) => patchJob(jobs, jobId, undefined, () => null));
 }
 
 /**
@@ -257,7 +414,7 @@ export function setJobActionError(
   message: string,
 ): void {
   writeQueue(queryClient, (jobs) =>
-    jobs.map((j) => (j.id === jobId ? { ...j, error: message } : j)),
+    patchJob(jobs, jobId, undefined, (job) => ({ ...job, error: message })),
   );
 }
 
@@ -325,9 +482,11 @@ function applyNoticesEvent(
  *   - `notices` replaces the notices query with the open set the event
  *     carries, so a service failure paints a banner — and a cleared one stops
  *     being shown — without a refetch.
- *   - An event for a job the cache does not hold means the view is stale
- *     (submitted from another tab, or restored after a backend restart), so the
- *     queue query is invalidated. The snapshot in the event is deliberately not
+ *   - An event for a job the cache does not hold at *either* level — top row
+ *     or child of a bulk parent — means the view is stale (submitted from
+ *     another tab, or restored after a backend restart), so the queue query is
+ *     invalidated; the refetch brings the whole parent back with the child in
+ *     it. The snapshot in the event is deliberately not
  *     used to build a job: it carries only the user-visible fields, not `url`
  *     or `created_at`.
  *   - Otherwise the snapshot is merged into the job, and a job that has reached
@@ -350,7 +509,15 @@ export function applyQueueEvent(
 
   const jobs = readQueue(queryClient);
   const jobId = event.job_id;
-  if (jobId === null || jobs === undefined || !jobs.some((j) => j.id === jobId)) {
+  // Every job event carries the parent it belongs to (null when it has none),
+  // which is what takes a child's event straight to the parent holding it.
+  const parentId =
+    typeof event.data.parent_id === "string" ? event.data.parent_id : undefined;
+  if (
+    jobId === null ||
+    jobs === undefined ||
+    locateJob(jobs, jobId, parentId) === null
+  ) {
     // `cancelRefetch` lives on the *second* argument (InvalidateOptions), not
     // on the filters, and it defaults to true: with data already in the cache
     // an invalidation would cancel the in-flight GET /queue and start it over.
@@ -372,10 +539,10 @@ export function applyQueueEvent(
   }
 
   writeQueue(queryClient, (current) => {
-    const idx = current.findIndex((j) => j.id === jobId);
-    if (idx === -1) return current;
+    const location = locateJob(current, jobId, parentId);
+    if (location === null) return current;
 
-    const job = mergeSnapshot(current[idx], event.data);
+    const job = mergeSnapshot(jobAt(current, location), event.data);
 
     if (event.event === "error") {
       // The error event is the verdict even if the snapshot lags behind it.
@@ -390,14 +557,19 @@ export function applyQueueEvent(
       if (job.status === "queued") job.detail = null;
     }
 
-    if (TERMINAL_HIDDEN_STATUSES.has(job.status)) {
+    // A finished top-level row leaves, because `GET /queue` omits it. A
+    // finished *child* stays: the endpoint nests every child of a bulk parent
+    // whatever its status, and the parent's counts are read off them — drop
+    // the done ones and "3 done · 1 failed" would come out as "1 failed".
+    if (
+      location.parentIndex === null &&
+      TERMINAL_HIDDEN_STATUSES.has(job.status)
+    ) {
       recordDrop(queryClient, jobId);
-      return current.filter((j) => j.id !== jobId);
+      return withJobAt(current, location, null);
     }
 
-    const next = [...current];
-    next[idx] = job;
-    return next;
+    return withJobAt(current, location, job);
   });
 }
 

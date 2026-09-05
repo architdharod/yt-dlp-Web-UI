@@ -373,7 +373,10 @@ the API.
 - [ ] Probing a single video URL returns `{type: "track"}`; probing a YouTube playlist returns a preview payload
       with one row per entry, album grouping where present, and dedup status per row.
 - [ ] Tracks already under the target artist (by `SOURCEID`, then normalised title) are marked "in library";
-      a SoundCloud DRM track is marked unavailable.
+      rows the flat pass reports unavailable (`availability`, `live_status`, or an `ignoreerrors` entry error)
+      are marked unavailable. SoundCloud DRM is not visible to the flat pass -- yt-dlp only reaches the
+      transcodings loop under a full extraction -- so a DRM track previews as available and fails in its child
+      job with yt-dlp's DRM message.
 - [ ] Submitting 3 of 10 rows to `/download/bulk` creates one parent and 3 children; the parent row shows
       "0 of 3" and disappears when all are done; a failed child keeps the parent visible with Retry.
 - [ ] Cancel on the parent cancels every non-terminal child; restart mid-bulk resumes the remaining children.

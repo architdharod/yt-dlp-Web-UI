@@ -450,6 +450,134 @@ class TestLoadActive:
         assert [job.id for job in store.load_active()] == ["job-0", "job-1", "job-2"]
 
 
+class TestUpsertMany:
+    """The batch write a bulk submission's children go through."""
+
+    def test_a_batch_round_trips(self, store):
+        jobs = [
+            _make_job(id=f"job-{index}", title=f"Track {index}")
+            for index in range(5)
+        ]
+
+        store.upsert_many(jobs)
+
+        assert [store.get(f"job-{index}").title for index in range(5)] == [
+            f"Track {index}" for index in range(5)
+        ]
+
+    def test_a_batch_updates_rows_that_already_exist(self, store):
+        store.upsert(_make_job(id="job-0", title="Old"))
+
+        store.upsert_many(
+            [_make_job(id="job-0", title="New"), _make_job(id="job-1", title="Also new")]
+        )
+
+        assert store.get("job-0").title == "New"
+        assert store.get("job-1").title == "Also new"
+
+    def test_an_empty_batch_is_a_no_op(self, store):
+        store.upsert_many([])
+
+        assert store.load_active() == []
+
+    def test_a_non_sqlite_error_still_rolls_the_batch_back(self, store, tmp_path):
+        """``BEGIN`` must never outlive the call that opened it.
+
+        ``sqlite3.Warning`` is not a ``sqlite3.Error``, so a batch that raised
+        one used to leave the transaction open -- and every later write on the
+        connection would then sit inside a batch nobody was going to commit.
+        """
+        real = store._conn
+
+        class _Failing:
+            """The real connection, minus a working ``executemany``."""
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+            def executemany(self, *args, **kwargs):
+                raise sqlite3.Warning("bad batch")
+
+        store._conn = _Failing()
+        try:
+            with pytest.raises(sqlite3.Warning):
+                store.upsert_many([_make_job(id="job-0"), _make_job(id="job-1")])
+        finally:
+            store._conn = real
+
+        assert not store._conn.in_transaction
+        assert store.get("job-0") is None
+
+        # The connection is usable again, and a following write is durable
+        # rather than trapped in the abandoned transaction.
+        store.upsert(_make_job(id="job-2", title="After the failure"))
+        other = sqlite3.connect(tmp_path / "queue.db")
+        try:
+            row = other.execute(
+                "SELECT title FROM jobs WHERE id = ?", ("job-2",)
+            ).fetchone()
+        finally:
+            other.close()
+        assert row == ("After the failure",)
+
+    def test_children_can_reference_a_parent_written_first(self, store):
+        store.upsert(_make_job(id="bulk", kind=JobKind.BULK))
+
+        store.upsert_many(
+            [
+                _make_job(id="child-1", parent_id="bulk"),
+                _make_job(id="child-2", parent_id="bulk"),
+            ]
+        )
+
+        assert store.get("child-2").parent_id == "bulk"
+
+
+class TestLoadChildrenOf:
+    """A restart has to get a parent's *finished* children back too."""
+
+    def test_every_child_comes_back_whatever_its_status(self, store):
+        store.upsert(_make_job(id="bulk", kind=JobKind.BULK))
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for index, status in enumerate(
+            (JobStatus.DONE, JobStatus.CANCELLED, JobStatus.QUEUED)
+        ):
+            store.upsert(
+                _make_job(
+                    id=f"child-{index}",
+                    parent_id="bulk",
+                    status=status,
+                    created_at=base + timedelta(minutes=index),
+                )
+            )
+
+        children = store.load_children_of(["bulk"])
+
+        assert [job.id for job in children] == ["child-0", "child-1", "child-2"]
+
+    def test_only_the_named_parents_children_come_back(self, store):
+        for parent_id in ("bulk-a", "bulk-b"):
+            store.upsert(_make_job(id=parent_id, kind=JobKind.BULK))
+            store.upsert(_make_job(id=f"{parent_id}-child", parent_id=parent_id))
+        store.upsert(_make_job(id="standalone"))
+
+        assert [job.id for job in store.load_children_of(["bulk-a"])] == [
+            "bulk-a-child"
+        ]
+
+    def test_no_parents_is_no_query(self, store):
+        assert store.load_children_of([]) == []
+
+    def test_more_parents_than_sqlites_variable_limit(self, store):
+        """The ids are chunked, so a thousand parents is not a bad statement."""
+        parents = [f"bulk-{index}" for index in range(1000)]
+        for parent_id in parents:
+            store.upsert(_make_job(id=parent_id, kind=JobKind.BULK))
+            store.upsert(_make_job(id=f"{parent_id}-child", parent_id=parent_id))
+
+        assert len(store.load_children_of(parents)) == 1000
+
+
 # ===========================================================================
 # Retention
 # ===========================================================================
@@ -500,6 +628,30 @@ class TestPruneTerminal:
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=7)
         assert store.prune_terminal(cutoff) == []
+
+    def test_a_child_row_is_never_swept_on_its_own(self, store):
+        """Children leave with their parent, through the row's cascade.
+
+        A parent still working through a long collection has done children
+        older than the cutoff, and taking those would rewrite its "N of M".
+        """
+        store.upsert(_make_job(id="bulk", kind=JobKind.BULK, status=JobStatus.ERROR))
+        self._finished(store, "child-old", JobStatus.DONE, 400)
+        child = store.get("child-old")
+        child.parent_id = "bulk"
+        store.upsert(child)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        assert store.prune_terminal(cutoff) == []
+        assert store.get("child-old") is not None
+
+    def test_a_swept_parent_takes_its_children_with_it(self, store):
+        self._finished(store, "bulk", JobStatus.DONE, 400)
+        store.upsert(_make_job(id="child", parent_id="bulk", status=JobStatus.DONE))
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        assert store.prune_terminal(cutoff) == ["bulk"]
+        assert store.get("child") is None
 
     def test_falls_back_to_updated_at_when_finished_at_is_null(self, store):
         old = datetime.now(timezone.utc) - timedelta(days=30)

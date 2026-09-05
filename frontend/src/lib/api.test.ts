@@ -6,9 +6,12 @@ import {
   emptyTrash,
   getTrash,
   moveLibraryPath,
+  probeUrl,
   restoreTrashEntry,
+  submitBulkDownload,
   tagLibraryPath,
 } from "@/lib/api";
+import type { BulkDownloadRequest } from "@/lib/types";
 
 describe("coverUrl", () => {
   it("passes the album path and its cover version", () => {
@@ -226,6 +229,7 @@ describe("tagLibraryPath", () => {
   const job = {
     id: "j1",
     kind: "tagging",
+    parent_id: null,
     url: "",
     status: "queued",
     title: "Black Sands",
@@ -276,6 +280,196 @@ describe("tagLibraryPath", () => {
 
     await expect(tagLibraryPath({ path: "Nope.flac" })).rejects.toThrow(
       "no such track",
+    );
+  });
+});
+
+describe("probeUrl", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("posts the URL and reads back a single track", async () => {
+    const fetchMock = respondWith(200, {
+      type: "track",
+      title: "Kong",
+      duration: 240,
+      thumbnail_url: null,
+      artist: "Bonobo",
+      album: null,
+    });
+
+    const probed = await probeUrl("https://youtu.be/abc");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/download/probe");
+    expect((fetchMock.mock.calls[0][1] as RequestInit).method).toBe("POST");
+    expect(sentBody(fetchMock)).toEqual({ url: "https://youtu.be/abc" });
+    // The union is discriminated on `type`, so the caller narrows on it.
+    expect(probed.type).toBe("track");
+  });
+
+  it("reads back a collection preview with its rows and counts", async () => {
+    respondWith(200, {
+      type: "collection",
+      preview: {
+        url: "https://youtube.com/playlist?list=X",
+        title: "Black Sands",
+        artist: "Bonobo",
+        source: "youtube",
+        rows: [
+          {
+            id: "r1",
+            url: "https://youtu.be/1",
+            source_id: "youtube:1",
+            title: "Prelude",
+            album: "Black Sands",
+            duration: 71,
+            thumbnail_url: null,
+            status: "in_library",
+            reason: "already in library",
+          },
+        ],
+        total: 1,
+        in_library: 1,
+        unavailable: 0,
+        large: false,
+        notices: [],
+      },
+    });
+
+    const probed = await probeUrl("https://youtube.com/playlist?list=X");
+
+    expect(probed.type).toBe("collection");
+    if (probed.type !== "collection") throw new Error("expected a collection");
+    expect(probed.preview.rows[0].status).toBe("in_library");
+    expect(probed.preview.in_library).toBe(1);
+  });
+
+  it("sends the artist the form is showing so dedup runs against it", async () => {
+    const fetchMock = respondWith(200, {
+      type: "track",
+      title: "Kong",
+      duration: 240,
+      thumbnail_url: null,
+      artist: "Bonobo",
+      album: null,
+    });
+
+    await probeUrl("https://youtu.be/abc", "Zoe Keating");
+
+    expect(sentBody(fetchMock)).toEqual({
+      url: "https://youtu.be/abc",
+      artist: "Zoe Keating",
+    });
+  });
+
+  it("leaves the artist out when there is none to send", async () => {
+    const fetchMock = respondWith(200, {
+      type: "track",
+      title: "Kong",
+      duration: 240,
+      thumbnail_url: null,
+      artist: null,
+      album: null,
+    });
+
+    await probeUrl("https://youtu.be/abc", "");
+
+    expect(sentBody(fetchMock)).toEqual({ url: "https://youtu.be/abc" });
+  });
+
+  it("raises the 2000-track stop as the backend worded it", async () => {
+    respondWith(400, {
+      detail: "This collection has more than 2000 tracks; try a narrower URL.",
+    });
+
+    await expect(probeUrl("https://youtube.com/@huge")).rejects.toThrow(
+      "This collection has more than 2000 tracks; try a narrower URL.",
+    );
+  });
+
+  it("raises a timeout with the backend's message", async () => {
+    respondWith(504, { detail: "the source took too long to answer" });
+
+    await expect(probeUrl("https://youtube.com/@slow")).rejects.toThrow(
+      "the source took too long to answer",
+    );
+  });
+});
+
+describe("submitBulkDownload", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const request: BulkDownloadRequest = {
+    url: "https://youtube.com/playlist?list=X",
+    artist: "Bonobo",
+    title: "Black Sands",
+    tracks: [
+      {
+        url: "https://youtu.be/1",
+        title: "Prelude",
+        album: "Black Sands",
+        duration: 71,
+        thumbnail_url: null,
+        source_id: "youtube:1",
+      },
+    ],
+  };
+
+  const parent = {
+    id: "p1",
+    kind: "bulk",
+    parent_id: null,
+    url: request.url,
+    status: "queued",
+    title: "Black Sands",
+    thumbnail_url: null,
+    duration: null,
+    progress: 0,
+    error: null,
+    artist: "Bonobo",
+    album: null,
+    progress_done: 0,
+    progress_total: 1,
+    created_at: "2026-09-05T09:00:00Z",
+    children: [
+      {
+        id: "c1",
+        kind: "download",
+        parent_id: "p1",
+        url: "https://youtu.be/1",
+        status: "queued",
+        title: "Prelude",
+        thumbnail_url: null,
+        duration: 71,
+        progress: 0,
+        error: null,
+        artist: "Bonobo",
+        album: "Black Sands",
+        created_at: "2026-09-05T09:00:00Z",
+      },
+    ],
+  };
+
+  it("posts the whole selection and returns the parent with its children", async () => {
+    const fetchMock = respondWith(200, parent);
+
+    const created = await submitBulkDownload(request);
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/download/bulk");
+    expect(sentBody(fetchMock)).toEqual(request);
+    expect(created.kind).toBe("bulk");
+    expect(created.children).toHaveLength(1);
+    expect(created.children![0].parent_id).toBe("p1");
+  });
+
+  it("raises the 409 a collection already in the queue answers with", async () => {
+    respondWith(409, { detail: "this collection is already in the queue" });
+
+    await expect(submitBulkDownload(request)).rejects.toThrow(
+      "this collection is already in the queue",
     );
   });
 });

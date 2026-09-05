@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
+from app.dedup import DedupCandidate, find_in_library
 from app.downloader import DownloadError, extract_metadata
 from app.file_organizer import DEFAULT_DOWNLOAD_PATH, resolve_artist_album
 from app.job_store import JobStore, get_data_path, get_db_path
@@ -55,6 +56,9 @@ from app.library_ops import (
 )
 from app.mover import LIBRARY_WRITE_LOCK, LibraryConflict, move_library_entry
 from app.models import (
+    LARGE_COLLECTION_TRACKS,
+    BulkDownloadRequest,
+    CollectionPreview,
     DownloadRequest,
     HealthResponse,
     Job,
@@ -67,6 +71,11 @@ from app.models import (
     LibraryResponse,
     MovedPath,
     Notice,
+    PreviewRow,
+    ProbeCollectionResponse,
+    ProbeRequest,
+    ProbeResponse,
+    ProbeTrackResponse,
     RestoredPath,
     SSEEvent,
     TrashEmptyResponse,
@@ -74,6 +83,16 @@ from app.models import (
     TrashListResponse,
     TrashRestoreRequest,
     TrashRestoreResponse,
+)
+from app.probe import (
+    CollectionTooLarge,
+    EmptyCollection,
+    Enumeration,
+    ProbeError,
+    ProbeTimeout,
+    SingleTrack,
+    probe,
+    probe_timeout_seconds,
 )
 from app.trash import (
     delete_library_entry,
@@ -347,6 +366,7 @@ async def lifespan(app: FastAPI):
     logger.info("TAG_FIX_ENABLED          = %s", tag_fix_enabled())
     logger.info("MUSICBRAINZ_CONTACT      = %s", musicbrainz_contact())
     logger.info("TAG_FIX_TIMEOUT_SECONDS  = %s", queue_manager.tag_fix_timeout)
+    logger.info("PROBE_TIMEOUT_SECONDS    = %s", probe_timeout_seconds())
     for line in describe_config(rescan_config):
         logger.info("%s", line)
     for warning in rescan_config.warnings:
@@ -539,6 +559,210 @@ async def submit_download(request: DownloadRequest) -> Job:
     return job
 
 
+@app.post("/download/probe", response_model=ProbeResponse)
+async def probe_download(request: ProbeRequest):
+    """Say whether a URL is one track or a collection, and preview the collection.
+
+    The Download tab's one URL box submits here first (bulk flow ticket): a
+    single track comes back as ``{"type": "track"}`` and the form queues it
+    through ``POST /download`` exactly as before, while anything yt-dlp calls a
+    playlist comes back as a checklist for the user to pick from.
+
+    The enumeration is cached per URL for half an hour, but the per-row dedup
+    status is **not**: it is recomputed here on every call, from the library
+    scan cache, so a user who downloads half a preview and comes back sees the
+    other half marked "in library".
+
+    Errors, and why each is the code it is:
+
+    * **400** with the "more than 2000 tracks" sentence -- the enumeration
+      stopped; the request was for a narrower URL, not a failure of ours;
+    * **400** "Failed to probe: ..." -- yt-dlp could not read the URL at all;
+    * **400** for a collection with nothing downloadable in it -- an empty
+      Bandcamp subdomain answers with an empty playlist rather than an error
+      (enumeration research), and "0 tracks" is not a preview;
+    * **504** -- the probe outlived ``PROBE_TIMEOUT_SECONDS``.  A gateway
+      timeout rather than a 500: nothing is wrong, the source is just slow, and
+      trying again or pasting a narrower URL is the answer.
+    """
+    try:
+        result = await probe(request.url)
+    except (CollectionTooLarge, EmptyCollection) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ProbeError as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to probe: {exc}") from exc
+    except ProbeTimeout as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+
+    if isinstance(result, SingleTrack):
+        return ProbeTrackResponse(
+            title=result.title,
+            duration=result.duration,
+            thumbnail_url=result.thumbnail_url,
+            artist=result.artist,
+            album=result.album,
+        )
+    return ProbeCollectionResponse(
+        preview=await _build_preview(result, request.artist)
+    )
+
+
+async def _build_preview(
+    enumeration: Enumeration, artist: str | None = None
+) -> CollectionPreview:
+    """Turn an enumeration into the checklist, dedup status and all.
+
+    The dedup pass runs against *artist* -- the artist the caller says the form
+    is showing -- and against the source's own suggestion when the caller gives
+    none, since that is the folder the tracks would be filed under if the user
+    submitted without editing it.  Editing the artist re-probes (the
+    enumeration is cached, so that is nearly free) rather than being answered
+    from here, which keeps this endpoint one question.  ``CollectionPreview.artist``
+    is always the source's suggestion, whatever the dedup ran against.
+
+    ``unavailable`` wins over ``in_library``: a row nobody can download is not
+    made more selectable by also being on disk.
+    """
+    against = artist or enumeration.artist
+    matches: dict[str, str] = {}
+    if against:
+        # Against the *folder* the download would land in, not the name typed
+        # into the form: ``sanitize_component`` rewrites "AC/DC" to "AC⧸DC" and
+        # strips the leading dots off "...And You Will Know Us", and dedup
+        # matching the raw name would find no folder and call a library full of
+        # those tracks empty.
+        folder, _album = resolve_artist_album(against, None, None, None)
+        matches = await asyncio.to_thread(
+            find_in_library,
+            folder,
+            [
+                DedupCandidate(
+                    id=row.id,
+                    url=row.url,
+                    source_id=row.source_id,
+                    title=row.title,
+                )
+                for row in enumeration.rows
+                if row.unavailable_reason is None
+            ],
+        )
+
+    rows: list[PreviewRow] = []
+    for row in enumeration.rows:
+        if row.unavailable_reason is not None:
+            status, reason = "unavailable", row.unavailable_reason
+        elif row.id in matches:
+            status, reason = "in_library", matches[row.id]
+        else:
+            status, reason = "available", None
+        rows.append(
+            PreviewRow(
+                id=row.id,
+                url=row.url,
+                source_id=row.source_id,
+                title=row.title,
+                album=row.album,
+                duration=row.duration,
+                thumbnail_url=row.thumbnail_url,
+                status=status,
+                reason=reason,
+            )
+        )
+
+    return CollectionPreview(
+        url=enumeration.url,
+        title=enumeration.title,
+        artist=enumeration.artist,
+        source=enumeration.source,
+        rows=rows,
+        total=len(rows),
+        in_library=sum(1 for row in rows if row.status == "in_library"),
+        unavailable=sum(1 for row in rows if row.status == "unavailable"),
+        large=len(rows) > LARGE_COLLECTION_TRACKS,
+        notices=list(enumeration.notices),
+    )
+
+
+@app.post("/download/bulk", response_model=Job)
+async def submit_bulk_download(request: BulkDownloadRequest) -> Job:
+    """Queue a selection from a collection preview: one parent, one child each.
+
+    The artist is the user's single placement decision and applies to every
+    track; the album travels per row, as the source gave it, and a row without
+    one becomes a loose Single under the artist (bulk flow ticket).  Each
+    child's ``target_dir`` is resolved here from the same function the
+    downloader uses, so the move guard knows where every child is going the
+    moment the request returns rather than only once it starts.
+
+    No metadata is extracted: a preview row's title is enough to show in the
+    queue, and the download pipeline probes properly when the child runs.  What
+    *is* done up front is the on-disk dedup, once for the whole selection --
+    the user may have submitted rows the preview marked "in library", and those
+    children are created already ``error``-ed with "already in library: <path>"
+    instead of downloading a second copy.
+
+    **409** when the same collection URL already has an in-flight parent, which
+    is the duplicate rule single downloads already follow.
+    """
+    artist = request.artist.strip()
+    parent = Job(
+        id=str(uuid.uuid4()),
+        kind=JobKind.BULK,
+        url=request.url,
+        title=request.title,
+        artist=artist,
+    )
+
+    # The folder every child will land in, which is what dedup has to look in:
+    # ``sanitize_component`` rewrites a name like "AC/DC" on its way to disk, so
+    # the raw form value would match no folder at all.
+    artist_folder, _no_album = resolve_artist_album(artist, None, None, None)
+
+    children: list[Job] = []
+    for track in request.tracks:
+        target_artist, target_album = resolve_artist_album(artist, track.album, None, None)
+        children.append(
+            Job(
+                id=str(uuid.uuid4()),
+                kind=JobKind.DOWNLOAD,
+                parent_id=parent.id,
+                url=track.url,
+                title=track.title,
+                duration=track.duration,
+                thumbnail_url=track.thumbnail_url,
+                artist=artist,
+                album=track.album or None,
+                target_dir=(
+                    f"{target_artist}/{target_album}" if target_album else target_artist
+                ),
+                # Never a guess: the artist came from the form and the album
+                # from the source, so this really is the folder the child will
+                # file into.
+                target_guessed=False,
+            )
+        )
+
+    already_in_library = await asyncio.to_thread(
+        find_in_library,
+        artist_folder,
+        [
+            DedupCandidate(
+                id=child.id,
+                url=child.url,
+                source_id=track.source_id,
+                title=child.title,
+            )
+            for child, track in zip(children, request.tracks)
+        ],
+    )
+
+    try:
+        queue_manager.add_bulk_job(parent, children, already_in_library)
+    except QueueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return queue_manager.with_children(parent)
+
+
 @app.get("/queue", response_model=list[Job])
 async def get_queue() -> list[Job]:
     """Return the in-flight and errored jobs with their current state.
@@ -546,8 +770,13 @@ async def get_queue() -> list[Job]:
     Done and cancelled jobs are omitted: the queue view is about what still
     needs attention.  They live on in the database until the retention sweep
     drops them.
+
+    A bulk parent is one top-level row whose ``children`` carry every child it
+    has, whatever their status, and whose own status is derived from them; its
+    children never appear at the top level.  A parent that has derived to done
+    or cancelled is omitted with its children, like any other finished job.
     """
-    return queue_manager.get_jobs()
+    return queue_manager.queue_view()
 
 
 @app.get("/queue/stream")
@@ -613,7 +842,7 @@ async def retry_job(job_id: str) -> Job:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except QueueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return job
+    return queue_manager.with_children(job)
 
 
 @app.post("/queue/{job_id}/cancel", response_model=Job)
@@ -628,6 +857,10 @@ async def cancel_job(job_id: str) -> Job:
     A job that has already finished, failed or been cancelled is a **400**: the
     client is acting on a view that is out of date, and pretending the call
     worked would tell the user a finished track was not filed.
+
+    Cancelling a **bulk parent** cancels every child that has not finished and
+    answers with the parent and its children; the parent reaches ``cancelled``
+    once the last running child's thread has stopped.
     """
     try:
         job = queue_manager.cancel_job(job_id)
@@ -635,7 +868,7 @@ async def cancel_job(job_id: str) -> Job:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except QueueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return job
+    return queue_manager.with_children(job)
 
 
 @app.post("/queue/{job_id}/dismiss", status_code=204)
