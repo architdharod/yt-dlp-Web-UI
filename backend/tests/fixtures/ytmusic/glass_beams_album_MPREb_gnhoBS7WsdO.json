@@ -1,0 +1,181 @@
+{
+ "title": "Mahal",
+ "type": "EP",
+ "thumbnails": [
+  {
+   "url": "https://yt3.googleusercontent.com/wYlWFKXohrbzhq8omvwFubk01_SoEsh_DnRFAefWWvwXBgEXS7wOVIOEvJuyBoMq4kPV1RKrH3_DiBwG9g=w60-h60-l90-rj",
+   "width": 60,
+   "height": 60
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/wYlWFKXohrbzhq8omvwFubk01_SoEsh_DnRFAefWWvwXBgEXS7wOVIOEvJuyBoMq4kPV1RKrH3_DiBwG9g=w120-h120-l90-rj",
+   "width": 120,
+   "height": 120
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/wYlWFKXohrbzhq8omvwFubk01_SoEsh_DnRFAefWWvwXBgEXS7wOVIOEvJuyBoMq4kPV1RKrH3_DiBwG9g=w226-h226-l90-rj",
+   "width": 226,
+   "height": 226
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/wYlWFKXohrbzhq8omvwFubk01_SoEsh_DnRFAefWWvwXBgEXS7wOVIOEvJuyBoMq4kPV1RKrH3_DiBwG9g=w544-h544-l90-rj",
+   "width": 544,
+   "height": 544
+  }
+ ],
+ "isExplicit": false,
+ "year": "2024",
+ "artists": [
+  {
+   "name": "Glass Beams",
+   "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+  }
+ ],
+ "trackCount": 5,
+ "duration": "18 minutes",
+ "audioPlaylistId": "OLAK5uy_kFTFBqdirBET1yxSmWT-eCg1Yvo50zIR4",
+ "likeStatus": "INDIFFERENT",
+ "tracks": [
+  {
+   "videoId": "wLjq5oUrc7Q",
+   "title": "Horizon",
+   "artists": [
+    {
+     "name": "Glass Beams",
+     "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+    }
+   ],
+   "album": "Mahal",
+   "likeStatus": "INDIFFERENT",
+   "inLibrary": false,
+   "pinnedToListenAgain": false,
+   "feedbackTokens": {
+    "add": null,
+    "remove": "AB9zfpK_Yh1iiURTwUUdB4NfeodfCx45b1v6P1LVsoLr2ncYCzifDY_KA6BRVv62Y3uHRpF9djEao0omfMBdFkU-Q5PHZLUe9g"
+   },
+   "thumbnails": null,
+   "isAvailable": true,
+   "isExplicit": false,
+   "videoType": "MUSIC_VIDEO_TYPE_OMV",
+   "views": "703K plays",
+   "communityVoteStatus": null,
+   "trackNumber": 1,
+   "duration": "0:43",
+   "duration_seconds": 43,
+   "creditsBrowseId": "MPTCvzro-uV8Fl4"
+  },
+  {
+   "videoId": "zJh2wkikFlI",
+   "title": "Mahal",
+   "artists": [
+    {
+     "name": "Glass Beams",
+     "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+    }
+   ],
+   "album": "Mahal",
+   "likeStatus": "INDIFFERENT",
+   "inLibrary": false,
+   "pinnedToListenAgain": false,
+   "feedbackTokens": {
+    "add": null,
+    "remove": "AB9zfpKl2jqMNplBsOLKDwd2VE7XmRIAnRaLPI4F18xTI2JklV-ro6ypQfOLvEHbkZ-QA9PAisNI7Uzw-xrJ3rEgtLtRvb5_yw"
+   },
+   "thumbnails": null,
+   "isAvailable": true,
+   "isExplicit": false,
+   "videoType": "MUSIC_VIDEO_TYPE_OMV",
+   "views": "5.3M plays",
+   "communityVoteStatus": null,
+   "trackNumber": 2,
+   "duration": "3:22",
+   "duration_seconds": 202,
+   "creditsBrowseId": "MPTC0kzzdmyiND0"
+  },
+  {
+   "videoId": "B7speCoZbpY",
+   "title": "Orb",
+   "artists": [
+    {
+     "name": "Glass Beams",
+     "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+    }
+   ],
+   "album": "Mahal",
+   "likeStatus": "INDIFFERENT",
+   "inLibrary": false,
+   "pinnedToListenAgain": false,
+   "feedbackTokens": {
+    "add": null,
+    "remove": "AB9zfpJSvOr0rdL_PwVhTGAS-5SdDeqI_emXb3fOVOktDa2xHc__4dBar0uY6py_YVrWnsasjerxe0VyEZsWE0hEV6RVLMyPeg"
+   },
+   "thumbnails": null,
+   "isAvailable": true,
+   "isExplicit": false,
+   "videoType": "MUSIC_VIDEO_TYPE_OMV",
+   "views": "2.2M plays",
+   "communityVoteStatus": null,
+   "trackNumber": 3,
+   "duration": "4:54",
+   "duration_seconds": 294,
+   "creditsBrowseId": "MPTC-476mGZVl8I"
+  },
+  {
+   "videoId": "U1FPaUbRJ8U",
+   "title": "Snake Oil",
+   "artists": [
+    {
+     "name": "Glass Beams",
+     "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+    }
+   ],
+   "album": "Mahal",
+   "likeStatus": "INDIFFERENT",
+   "inLibrary": false,
+   "pinnedToListenAgain": false,
+   "feedbackTokens": {
+    "add": null,
+    "remove": "AB9zfpIld5detnWvwcfnilR1z7km3JpobwlnQJDwN-Ol-UnG1io-Q4WtpiwjN7GbD7bHS6tfuGxAUlOdD2o4h4_R2XHtevxtmA"
+   },
+   "thumbnails": null,
+   "isAvailable": true,
+   "isExplicit": false,
+   "videoType": "MUSIC_VIDEO_TYPE_OMV",
+   "views": "1.6M plays",
+   "communityVoteStatus": null,
+   "trackNumber": 4,
+   "duration": "4:56",
+   "duration_seconds": 296,
+   "creditsBrowseId": "MPTCqcraR6poCHk"
+  },
+  {
+   "videoId": "y5iz0wrO4_I",
+   "title": "Black Sand",
+   "artists": [
+    {
+     "name": "Glass Beams",
+     "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+    }
+   ],
+   "album": "Mahal",
+   "likeStatus": "INDIFFERENT",
+   "inLibrary": false,
+   "pinnedToListenAgain": false,
+   "feedbackTokens": {
+    "add": null,
+    "remove": "AB9zfpLDEa9FpbBFRPsn6EeckmeU5Rt3mbLRmr5Av4RGpnkXXmmwNN7GDGX9DgvdptRRa4aeK_hyvWef_k8DwlDohrkIqpbjXA"
+   },
+   "thumbnails": null,
+   "isAvailable": true,
+   "isExplicit": false,
+   "videoType": "MUSIC_VIDEO_TYPE_OMV",
+   "views": "1.8M plays",
+   "communityVoteStatus": null,
+   "trackNumber": 5,
+   "duration": "4:39",
+   "duration_seconds": 279,
+   "creditsBrowseId": "MPTCv_mpRUw_JDk"
+  }
+ ],
+ "duration_seconds": 1114
+}

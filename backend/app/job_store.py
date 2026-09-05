@@ -62,6 +62,7 @@ _COLUMNS: tuple[str, ...] = (
     "duration",
     "artist",
     "album",
+    "album_final",
     "path",
     "target_dir",
     "target_guessed",
@@ -145,6 +146,15 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # own costs one ALTER and keeps "error means the job failed" true.
     (
         "ALTER TABLE jobs ADD COLUMN detail TEXT",
+    ),
+    # Version 3 (phase 12): a bulk child enumerated through YouTube Music
+    # knows its album is the whole answer -- a Single deliberately has none --
+    # and the downloader has to know that too, or a restart would hand the
+    # child back to yt-dlp's album and refile a loose Single into a folder the
+    # preview never showed.  A flag rather than a sentinel album, because
+    # "no album" and "album unknown" are both a NULL in this column.
+    (
+        "ALTER TABLE jobs ADD COLUMN album_final INTEGER NOT NULL DEFAULT 0",
     ),
 )
 
@@ -317,6 +327,7 @@ class JobStore:
             job.duration,
             job.artist,
             job.album,
+            int(job.album_final),
             job.path,
             job.target_dir,
             int(job.target_guessed),
@@ -349,6 +360,7 @@ class JobStore:
             duration=row["duration"],
             artist=row["artist"],
             album=row["album"],
+            album_final=bool(row["album_final"]),
             path=row["path"],
             target_dir=row["target_dir"],
             target_guessed=bool(row["target_guessed"]),

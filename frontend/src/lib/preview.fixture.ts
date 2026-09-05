@@ -20,6 +20,7 @@ export function previewRow(
     source_id: `youtube:${id}`,
     title: `Track ${id}`,
     album: "Black Sands",
+    album_final: false,
     duration: 214,
     thumbnail_url: null,
     status: "available",

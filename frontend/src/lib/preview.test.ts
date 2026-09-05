@@ -137,9 +137,22 @@ describe("buildBulkRequest", () => {
       url: available.url,
       title: available.title,
       album: available.album,
+      album_final: available.album_final,
       duration: available.duration,
       thumbnail_url: available.thumbnail_url,
       source_id: available.source_id,
     });
+  });
+
+  it("forwards album_final so the backend knows the album is the whole answer", () => {
+    const single = previewRow("s", { album: null, album_final: true });
+    const request = buildBulkRequest(
+      collectionPreview([single]),
+      "Glass Beams",
+      new Set(["s"]),
+    );
+
+    expect(request.tracks[0].album).toBeNull();
+    expect(request.tracks[0].album_final).toBe(true);
   });
 });

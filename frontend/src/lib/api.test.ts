@@ -411,6 +411,7 @@ describe("submitBulkDownload", () => {
         url: "https://youtu.be/1",
         title: "Prelude",
         album: "Black Sands",
+        album_final: false,
         duration: 71,
         thumbnail_url: null,
         source_id: "youtube:1",

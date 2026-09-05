@@ -1239,9 +1239,32 @@ def download_audio(
 
     if info is not None:
         _reject_collections(info, job.url)
-        title = info.get("title") or job.title or "Unknown Title"
+        # A child of a bulk parent was enumerated: its title and album came
+        # from the collection listing, and yt-dlp is looking at one video.
+        # Where the two disagree the enumeration wins -- but the two fields
+        # are gated differently.
+        #
+        # Title: on the parent alone, because every enumerated child's title
+        # came from a listing and is what the preview showed.  The enumeration
+        # has the track's name ("Horizon"), yt-dlp has the video's ("Glass
+        # Beams - 'Horizon' (Official Audio)"); the file and the tag have to
+        # be the first.  A row's title may have been truncated by
+        # ``probe._cap`` on its way through the preview, and that truncated
+        # title is still the row the user ticked, so it still wins.
+        enumerated = job.parent_id is not None
+        # Album: only where the source read the *release*, which is what
+        # ``album_final`` says.  There the answer is whole, empty included --
+        # a Single deliberately has no album, and taking yt-dlp's would refile
+        # a loose Single into a folder the preview never mentioned.  A row
+        # from the flat pass carries no such promise: its empty album is a
+        # listing that had none, so yt-dlp still fills it in, as it does for a
+        # plain ``POST /download``.
+        enumerated_album = job.parent_id is not None and job.album_final
+        title = (job.title if enumerated and job.title else None) or (
+            info.get("title") or job.title or "Unknown Title"
+        )
         ytdlp_artist = _pick_artist(info)
-        ytdlp_album = info.get("album")
+        ytdlp_album = None if enumerated_album else info.get("album")
         logger.info(
             "yt-dlp metadata: title=%r, artist=%r, album=%r",
             title,

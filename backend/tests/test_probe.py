@@ -363,7 +363,14 @@ class TestSubCollections:
         with fake_ytdl({releases_url: releases, OLAK_URL: OLAK_INFO}) as ydl:
             result = await probe(releases_url)
 
-        assert ydl.calls == [releases_url, OLAK_URL]
+        # A ``/@handle`` URL is offered to YouTube Music first (phase 12), so
+        # the channel root is resolved before the flat pass runs.  Here the
+        # resolution finds nothing and the walk proceeds exactly as it did.
+        assert ydl.calls == [
+            "https://www.youtube.com/@bonobo",
+            releases_url,
+            OLAK_URL,
+        ]
         assert [row.album for row in result.rows] == ["Black Sands", "Black Sands"]
 
     async def test_a_soundcloud_set_carries_its_album(self):

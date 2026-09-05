@@ -9,6 +9,14 @@ enumeration research).  The consequence is that a row's metadata is thin, and
 deliberately so: a child job resolves its own title, duration and thumbnail
 when it runs, and the preview only has to be good enough to tick boxes in.
 
+One URL shape does not go through yt-dlp at all: a YouTube channel
+(``/channel/UC…``, ``/@handle``, ``music.youtube.com/browse/…``) is asked of
+YouTube Music first, through :mod:`app.ytmusic`, because YouTube Music holds
+the same artist as a *discography* -- albums, EPs and singles with track lists
+-- where the channel holds uploads.  A channel YouTube Music does not know as
+an artist falls through to the flat pass below, which is what everything else
+does from the start.
+
 What this module does, in order:
 
 * one flat extraction of the pasted URL.  ``_type`` missing or ``"video"`` is a
@@ -43,7 +51,7 @@ import re
 import threading
 import time
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -52,31 +60,33 @@ import yt_dlp
 from app.downloader import _YtDlpLogger, base_opts, ytdl
 from app.models import (
     MAX_COLLECTION_TRACKS,
+    MAX_CONCURRENT_PROBES,
     MAX_FOLDER_NAME,
     MAX_PATH_LENGTH,
     MAX_REASON,
     MAX_SOURCE_ID,
+    MAX_SUBCOLLECTIONS,
     MAX_TRACK_TITLE,
+)
+from app.ytmusic import (
+    NON_RELEASE_TABS,
+    SINGLE_RELEASE_TYPE,
+    YouTubeMusicUnavailable,
+    canonical_channel_url,
+    channel_url_target,
+    fetch_artist,
+    resolve_channel_id,
+    source_id as ytmusic_source_id,
+    watch_url,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROBE_TIMEOUT_SECONDS = 120
 
-# How many sub-collections one probe may expand.  A YouTube ``/releases`` tab
-# is 50-odd albums and a SoundCloud ``/sets`` page about the same; 200 is far
-# past any real discography and keeps the worst case at 200 flat calls rather
-# than at "however many rows the page had".
-MAX_SUBCOLLECTIONS = 200
-
-# How many probes may hold an executor thread at once.  A probe is a long
-# blocking call on the default executor, and the executor is shared with the
-# rest of the app; two at a time is enough for a user with a second tab open
-# and leaves the pool for everything else.  A third probe waits here rather
-# than queueing invisibly behind a thread, which is also why the slot is taken
-# *before* the deadline is set: a probe that waited 30 s for a slot still gets
-# its whole ``PROBE_TIMEOUT_SECONDS`` to do the work.
-MAX_CONCURRENT_PROBES = 2
+# :data:`~app.models.MAX_CONCURRENT_PROBES` slots.  Taken *before* the deadline
+# is set: a probe that waited 30 s for a slot still gets its whole
+# ``PROBE_TIMEOUT_SECONDS`` to do the work.
 _probe_slots = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
 # The enumeration cache.  Per URL, for the session: re-opening a preview after
@@ -102,6 +112,15 @@ Source = Literal["youtube", "soundcloud", "bandcamp", "other"]
 BANDCAMP_NOTICE = (
     "Bandcamp streams are 128 kbps MP3; downloads are converted to FLAC but "
     "are not lossless"
+)
+
+# Said when a channel URL was offered to YouTube Music and the request never
+# got an answer.  The preview that follows is the flat yt-dlp listing, which
+# for a music artist is the wrong shape -- clips and live sets rather than
+# releases -- and the user can act on knowing why.
+YTMUSIC_UNREACHABLE_NOTICE = (
+    "YouTube Music could not be reached, so this channel's uploads were "
+    "listed instead of its releases."
 )
 
 TOO_LARGE_MESSAGE = (
@@ -188,6 +207,13 @@ class EnumeratedTrack:
     ``unavailable_reason`` is the whole of the availability answer: ``None``
     means the row can be downloaded, and anything else is yt-dlp's own words
     for why it cannot, shown to the user as-is.
+
+    ``album_final`` says the source read the *release* this track is on, so
+    ``album`` is the whole answer and ``None`` means deliberately no album --
+    a loose Single.  Only the YouTube Music pass can say that; the flat pass
+    reads a listing that often carries no album at all, and its ``None`` means
+    "not known", which is what leaves yt-dlp's own album in play when the
+    child job runs.
     """
 
     id: str
@@ -198,6 +224,7 @@ class EnumeratedTrack:
     duration: float | None = None
     thumbnail_url: str | None = None
     unavailable_reason: str | None = None
+    album_final: bool = False
 
 
 @dataclass(frozen=True)
@@ -785,6 +812,216 @@ def _walk(info: dict, url: str, album: str | None, walk: _Walk, depth: int) -> N
         walk.add(row)
 
 
+def _unreadable_notice(count: int, noun: str) -> str | None:
+    """"3 tracks could not be read and were left out", or None for zero."""
+    if not count:
+        return None
+    plural = noun if count == 1 else f"{noun}s"
+    verb = "could not be read and was" if count == 1 else "could not be read and were"
+    return f"{count} {plural} {verb} left out"
+
+def _tab_notice(tab: str | None) -> str | None:
+    """"…the Videos tab was not enumerated", when a tab was asked for.
+
+    A user who pasted ``/@artist/videos`` asked for that tab and is looking at
+    a discography instead.  For a music artist that is the better answer --
+    the Videos tab is where the clips and visualisers are -- but it is not the
+    answer they asked for, so it is said out loud.  ``/releases`` and the bare
+    channel root get nothing: those *are* the discography.
+    """
+    if tab is None or tab not in NON_RELEASE_TABS:
+        return None
+    return (
+        f"Showing this artist's releases from YouTube Music; the "
+        f"{tab.capitalize()} tab was not enumerated."
+    )
+
+
+def _unplayable_notice(count: int) -> str | None:
+    """"2 tracks are listed on YouTube Music but are not available to download".
+
+    Not the same thing as :func:`_unreadable_notice`: nothing failed.  YouTube
+    Music lists an unreleased or withdrawn track by name with no video behind
+    it at all, so there is nothing to tick and nothing to download.
+    """
+    if not count:
+        return None
+    if count == 1:
+        return "1 track is listed on YouTube Music but is not available to download"
+    return f"{count} tracks are listed on YouTube Music but are not available to download"
+
+
+def _with_notices(enumeration: Enumeration, *notices: str | None) -> Enumeration:
+    """*enumeration* with *notices* appended, skipping the Nones."""
+    extra = tuple(notice for notice in notices if notice)
+    if not extra:
+        return enumeration
+    return replace(enumeration, notices=enumeration.notices + extra)
+
+
+def _ytmusic_enumeration(
+    url: str, deadline: float
+) -> tuple[Enumeration | None, tuple[str, ...]]:
+    """*url*'s discography from YouTube Music, and notices for the flat pass.
+
+    The first half is None for every URL that is not a channel, for a channel
+    whose handle could not be resolved, and -- the case that matters -- for a
+    channel YouTube Music does not know as an artist: a podcast, a label's
+    talking-head uploads, anything with no releases behind it.  The probe then
+    carries on exactly as it did before this existed, so the fallback is the
+    old behaviour rather than an error.
+
+    The second half is what the flat pass should say about having been used.
+    It is empty for all of the above -- uploads are the right answer for a
+    channel that is not an artist -- and carries a notice when YouTube Music
+    could not be *reached*, because then the listing is uploads for a reason
+    the user can act on (try again) rather than because that is what the
+    channel holds.
+
+    The enumeration is cached a second time, under the *canonical* channel
+    URL, because ``/@artist``, ``/@artist/videos`` and ``/channel/UC…`` are one
+    discography with three spellings and only the first of them should pay for
+    it.  ``Enumeration.url`` stays the URL the user pasted: it is what the bulk
+    submit sends back and what the parent job shows.  For the same reason the
+    tab notice is added *after* the cache, never into it: the cached
+    enumeration is shared by all three spellings and only one of them asked
+    for a tab.
+    """
+    target = channel_url_target(url)
+    if target is None:
+        return None, ()
+    tab_notice = _tab_notice(target.tab)
+    # Its own walk: the flat pass gets a clean one if this returns None, so a
+    # track skipped here can never be counted twice in the fallback's notice.
+    walk = _Walk(deadline=deadline)
+    channel_id = resolve_channel_id(target)
+    if channel_id is None:
+        return None, ()
+
+    walk.check_deadline()
+    canonical = canonical_channel_url(channel_id)
+    cached = _cache_get(canonical)
+    if cached is not None:
+        logger.info("Probe cache hit for %s via %s", url, canonical)
+        return _with_notices(replace(cached, url=url), tab_notice), ()
+
+    try:
+        artist = fetch_artist(channel_id, check_deadline=walk.check_deadline)
+    except YouTubeMusicUnavailable as exc:
+        logger.warning(
+            "YouTube Music is unreachable (%s); falling back to the flat "
+            "listing for %s",
+            exc,
+            url,
+        )
+        return None, (YTMUSIC_UNREACHABLE_NOTICE,)
+    except (ProbeTimeout, ProbeError):
+        # The deadline (and the row cap, which ``fetch_artist`` cannot raise
+        # but ``walk.check_deadline`` shares a path with) are this probe's own
+        # answers, not YouTube Music's: they must reach the route.
+        raise
+    except Exception:
+        # Last resort, around this call only.  ``ytmusicapi`` parses YouTube's
+        # internal JSON, and the shapes it does not expect surface as whatever
+        # the library happens to raise; the flat listing is a worse preview
+        # than the discography but an infinitely better answer than a 500.
+        logger.exception(
+            "Reading %s's discography from YouTube Music failed unexpectedly; "
+            "falling back to the flat listing for %s",
+            channel_id,
+            url,
+        )
+        return None, ()
+    if artist is None:
+        return None, ()
+
+    # Tracks YouTube Music lists with no video behind them.  Counted apart
+    # from ``walk.unreadable`` -- which is a failure -- because this one is
+    # the catalogue being honest about an unreleased track.
+    unplayable = 0
+    for release in artist.releases:
+        walk.check_deadline()
+        # A Single gets no album: its tracks become loose Singles under the
+        # artist rather than a folder each (see SINGLE_RELEASE_TYPE).
+        album = (
+            None
+            if release.release_type == SINGLE_RELEASE_TYPE
+            else _cap(release.title, MAX_FOLDER_NAME)
+        )
+        for track in release.tracks:
+            if track.video_id is None:
+                unplayable += 1
+                continue
+            track_url = watch_url(track.video_id)
+            row_source_id = _drop_if_over(ytmusic_source_id(track.video_id), MAX_SOURCE_ID)
+            walk.add(
+                EnumeratedTrack(
+                    id=row_source_id or track_url,
+                    url=track_url,
+                    source_id=row_source_id,
+                    title=_cap(track.title, MAX_TRACK_TITLE),
+                    album=album,
+                    duration=track.duration,
+                    thumbnail_url=_drop_if_over(release.thumbnail_url, MAX_PATH_LENGTH),
+                    unavailable_reason=(
+                        None if track.available else _cap("not available", MAX_REASON)
+                    ),
+                    # The release was read: a null album here is a Single with
+                    # no album, not an album nobody knew.
+                    album_final=True,
+                )
+            )
+
+    if not walk.rows or all(row.unavailable_reason for row in walk.rows):
+        # A parsed artist page with nothing playable behind it.  yt-dlp may
+        # still find uploads on the channel, so this is a fallback rather than
+        # an empty preview -- and a discography whose every row is unavailable
+        # is the same thing: :func:`probe` would raise ``EmptyCollection`` on
+        # it, when the channel's uploads may well be downloadable.
+        logger.info("YouTube Music had no playable tracks for %s; using yt-dlp", url)
+        return None, ()
+
+    notices = [
+        notice
+        for notice in (
+            _unreadable_notice(artist.unreadable_releases, "release"),
+            _unplayable_notice(unplayable),
+            (
+                f"Only the first {MAX_SUBCOLLECTIONS} releases were read; use "
+                "a narrower URL."
+                if artist.over_cap
+                else None
+            ),
+        )
+        if notice
+    ]
+    enumeration = Enumeration(
+        url=url,
+        title=_cap(artist.name, MAX_TRACK_TITLE),
+        artist=_cap(artist.name, MAX_FOLDER_NAME),
+        source="youtube",
+        rows=tuple(walk.rows),
+        notices=tuple(notices),
+    )
+    _cache_put(canonical, enumeration)
+    if artist.channel_id and artist.channel_id != channel_id:
+        # ``get_artist`` takes either id -- the one in the pasted URL or the
+        # one on the page's subscribe button -- and the page answers with the
+        # latter, which is also the id yt-dlp resolves a ``/@handle`` to.
+        # Remembering both spellings is what makes a later handle probe free.
+        _cache_put(canonical_channel_url(artist.channel_id), enumeration)
+    logger.info(
+        "Probed %s through YouTube Music: %d row(s) over %d release(s), "
+        "%d unreadable release(s), %d unplayable track(s)",
+        url,
+        len(enumeration.rows),
+        len(artist.releases),
+        artist.unreadable_releases,
+        unplayable,
+    )
+    return _with_notices(enumeration, tab_notice), ()
+
+
 def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
     """The whole blocking probe: one extraction, then the walk.
 
@@ -796,6 +1033,15 @@ def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
     """
     walk = _Walk(deadline=deadline)
     walk.check_deadline()
+
+    # YouTube Music first for a channel URL: it knows the same artist as a
+    # discography rather than as a pile of uploads.  Anything else -- and any
+    # channel it does not hold -- falls through to the flat pass unchanged,
+    # carrying whatever the attempt has to say for itself.
+    from_ytmusic, ytmusic_notices = _ytmusic_enumeration(url, deadline)
+    if from_ytmusic is not None:
+        return from_ytmusic
+
     info = _extract(url)
 
     if not is_collection(info):
@@ -810,15 +1056,12 @@ def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
     source = _source_of(info, url)
     _walk(info, url, _album_for(info, url), walk, 0)
 
-    notices: list[str] = []
+    notices: list[str] = list(ytmusic_notices)
     if source == "bandcamp":
         notices.append(BANDCAMP_NOTICE)
-    if walk.unreadable == 1:
-        notices.append("1 track could not be read and was left out")
-    elif walk.unreadable:
-        notices.append(
-            f"{walk.unreadable} tracks could not be read and were left out"
-        )
+    unreadable = _unreadable_notice(walk.unreadable, "track")
+    if unreadable:
+        notices.append(unreadable)
 
     enumeration = Enumeration(
         url=url,
@@ -884,7 +1127,11 @@ async def probe(url: str, timeout: int | None = None) -> SingleTrack | Enumerati
     cached = _cache_get(url)
     if cached is not None:
         logger.info("Probe cache hit for %s (%d rows)", url, len(cached.rows))
-        return cached
+        # The entry may have been stored under a channel's canonical URL by a
+        # probe of a different spelling of it, so the URL is re-stamped: it is
+        # what the bulk submit sends back, and it has to be the one the user
+        # is looking at.
+        return replace(cached, url=url)
 
     seconds = timeout if timeout is not None else probe_timeout_seconds()
     loop = asyncio.get_running_loop()

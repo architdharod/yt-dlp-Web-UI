@@ -16,6 +16,20 @@ This is a project for educational purpose, to learn the usage of the library yt-
    artist that re-checks the library as you change it. Above 500 rows nothing is preselected, and 2000 rows is a
    hard stop asking for a narrower URL. The ticked rows go to `POST /download/bulk`, which queues one parent job
    with a child per track.
+   A **YouTube channel or YouTube Music artist** URL is a special case: `youtube.com/channel/UC…`,
+   `youtube.com/@handle`, `youtube.com/c/Name`, `youtube.com/user/name` (each with or without a tab such as
+   `/videos`, `/releases` or `/featured`), and `music.youtube.com/channel/…` or `/browse/…` are looked up on
+   YouTube Music with keyless [`ytmusicapi`](https://github.com/sigma67/ytmusicapi) rather than crawled with
+   yt-dlp. The preview is then the artist's **discography** — every album, EP and single with its real track
+   titles and durations — instead of the channel's uploads, which is what keeps the Shorts, the live sets and the
+   visualiser re-uploads out of it. The lever is that the Videos tab is never enumerated, not a filter over the
+   uploads: a release whose track is an official-video upload is still that upload. A `/videos` URL is read the
+   same way, and the preview says so, since the tab you pasted is not the tab you got. Album and EP tracks land in
+   `DOWNLOAD_PATH/Artist/Album/track.flac`; a single's tracks have no album and land as Singles at
+   `DOWNLOAD_PATH/Artist/track.flac`, and a track on both an EP and its own single is filed under the EP. Every
+   spelling of one channel shares a cached enumeration; a channel YouTube Music does not hold as an artist (a
+   podcast, a talking-head channel) falls back to the flat yt-dlp listing with no error, and so does a channel it
+   could not be reached about — with a notice saying which happened.
 3. The job enters an async queue and runs a three-stage pipeline: yt-dlp fetches the best audio stream and the
    thumbnail (no postprocessing), an ffmpeg subprocess of ours converts that stream to FLAC, and Mutagen writes the
    tags, the cover art, and the `SOURCEID`/`SOURCEURL` fields that record where the track came from.
@@ -357,7 +371,7 @@ worth knowing:
 ## Limitations
 
 - **The collection preview is a flat extraction** — it is cheap, and it is thin: a row can only be marked unavailable when the flat pass says so. SoundCloud DRM is invisible to it (yt-dlp only meets the DRM in a full extraction), so such a track previews as available and then fails in its own child job with yt-dlp's DRM message. `POST /download` itself still takes a single track and rejects playlist and channel URLs; collections go through `POST /download/probe` and `POST /download/bulk`.
-- **YouTube, SoundCloud and Bandcamp only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com`, `bandcamp.com` and their subdomains, and rejects everything else with a validation error. No Spotify or other sources.
+- **YouTube, SoundCloud and Bandcamp only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com`, `bandcamp.com` and their subdomains, and rejects everything else with a validation error. `music.youtube.com` is a subdomain of `youtube.com`, so YouTube Music URLs are already allowed and needed no widening. No Spotify or other sources.
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
 - **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced. A move onto an occupied path is refused the same way.
 - **No authentication** — designed for private/internal networks.

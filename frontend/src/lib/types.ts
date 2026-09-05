@@ -138,6 +138,13 @@ export interface PreviewRow {
   source_id: string | null;
   title: string | null;
   album: string | null;
+  /**
+   * Whether `album` is the whole answer because the source read the release
+   * this track is on — a null album is then deliberately none, a loose
+   * Single. False for the flat pass, whose listings often carry no album at
+   * all. Sent straight back in the bulk submission.
+   */
+  album_final: boolean;
   duration: number | null;
   thumbnail_url: string | null;
   status: PreviewRowStatus;
@@ -196,6 +203,8 @@ export interface BulkTrack {
   url: string;
   title: string | null;
   album: string | null;
+  /** The row's `album_final`, forwarded unchanged. */
+  album_final: boolean;
   duration: number | null;
   thumbnail_url: string | null;
   source_id: string | null;

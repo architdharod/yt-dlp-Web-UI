@@ -16,3 +16,10 @@ httpx==0.28.1
 # is the current and only maintained release; the project is in maintenance
 # mode, so app/tagger.py wraps it thinly enough to be swapped.
 musicbrainzngs==0.7.1
+
+# Keyless YouTube Music access for the artist enumeration in app/ytmusic.py: a
+# channel URL becomes a discography (albums, EPs, singles) instead of the pile
+# of uploads a flat yt-dlp pass sees.  Pinned: it parses YouTube's internal
+# JSON, so a release can change what a call returns, and app/ytmusic.py treats
+# every parse failure as "not a music artist" and falls back to yt-dlp.
+ytmusicapi==1.12.2

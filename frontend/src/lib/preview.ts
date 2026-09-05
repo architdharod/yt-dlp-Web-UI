@@ -112,6 +112,7 @@ function toBulkTrack(row: PreviewRow): BulkTrack {
     url: row.url,
     title: row.title,
     album: row.album,
+    album_final: row.album_final,
     duration: row.duration,
     thumbnail_url: row.thumbnail_url,
     source_id: row.source_id,

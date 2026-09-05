@@ -684,6 +684,7 @@ async def _build_preview(
                 source_id=row.source_id,
                 title=row.title,
                 album=row.album,
+                album_final=row.album_final,
                 duration=row.duration,
                 thumbnail_url=row.thumbnail_url,
                 status=status,
@@ -754,6 +755,9 @@ async def submit_bulk_download(request: BulkDownloadRequest) -> Job:
                 thumbnail_url=track.thumbnail_url,
                 artist=artist,
                 album=track.album or None,
+                # The preview said whether the source read the release; a
+                # child whose album is final keeps it, empty included.
+                album_final=track.album_final,
                 target_dir=(
                     f"{target_artist}/{target_album}" if target_album else target_artist
                 ),

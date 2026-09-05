@@ -101,6 +101,7 @@ class TestSchema:
             "duration",
             "artist",
             "album",
+            "album_final",
             "path",
             "target_dir",
             "target_guessed",
@@ -134,6 +135,7 @@ class TestSchema:
         path = tmp_path / "queue.db"
         first = JobStore(path)
         first.upsert(_make_job(id="from-before"))
+        first._conn.execute("ALTER TABLE jobs DROP COLUMN album_final")
         first._conn.execute("ALTER TABLE jobs DROP COLUMN detail")
         first._conn.execute("PRAGMA user_version = 1")
         first._conn.close()
@@ -146,6 +148,27 @@ class TestSchema:
             row.detail = "tags not fixed: no match"
             second.upsert(row)
             assert second.get("from-before").detail == "tags not fixed: no match"
+        finally:
+            second.close()
+
+    def test_a_version_2_database_gains_the_album_final_column(self, tmp_path):
+        """Phase 12's migration over a phase 8 queue.db: the rows stay, the
+        column arrives defaulted to false, and the flag round-trips."""
+        path = tmp_path / "queue.db"
+        first = JobStore(path)
+        first.upsert(_make_job(id="from-before"))
+        first._conn.execute("ALTER TABLE jobs DROP COLUMN album_final")
+        first._conn.execute("PRAGMA user_version = 2")
+        first._conn.close()
+
+        second = JobStore(path)
+        try:
+            assert second.schema_version == SCHEMA_VERSION
+            row = second.get("from-before")
+            assert row is not None and row.album_final is False
+            row.album_final = True
+            second.upsert(row)
+            assert second.get("from-before").album_final is True
         finally:
             second.close()
 

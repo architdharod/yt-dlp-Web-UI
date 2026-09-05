@@ -1022,6 +1022,104 @@ class TestProbeRoute:
         assert resp.status_code == 200
 
 
+class TestAlbumIsFinalRoundTrip:
+    """The "the source read the release" flag, end to end.
+
+    The enumeration sets it, the preview sends it, the client sends it back,
+    the child job carries it and the database keeps it -- because the
+    downloader reads it on a child that a restart re-ran, long after the
+    preview is gone.
+    """
+
+    ROW = EnumeratedTrack(
+        id="youtube:mahal",
+        url="https://music.youtube.com/watch?v=mahal",
+        source_id="youtube:mahal",
+        title="Mahal",
+        # A Single: no album, and that is the answer rather than a gap.
+        album=None,
+        album_final=True,
+    )
+
+    def test_it_survives_probe_preview_bulk_and_a_restore(
+        self, client_and_qm, tmp_path
+    ):
+        client, qm = client_and_qm
+        with patch("app.main.probe", return_value=_enumeration(rows=[self.ROW])):
+            preview = client.post(
+                "/download/probe", json={"url": COLLECTION_URL}
+            ).json()["preview"]
+
+        assert [row["album"] for row in preview["rows"]] == [None]
+        assert [row["album_final"] for row in preview["rows"]] == [True]
+
+        # Exactly what the frontend posts back: the preview row's own fields.
+        body = {
+            "url": COLLECTION_URL,
+            "artist": "Glass Beams",
+            "title": "Mahal",
+            "tracks": [
+                {
+                    key: row[key]
+                    for key in (
+                        "url",
+                        "title",
+                        "album",
+                        "album_final",
+                        "duration",
+                        "thumbnail_url",
+                        "source_id",
+                    )
+                }
+                for row in preview["rows"]
+            ],
+        }
+        release = threading.Event()
+        with patch(
+            "app.queue_manager.download_audio", side_effect=_blocking_download(release)
+        ):
+            parent = client.post("/download/bulk", json=body).json()
+            child = parent["children"][0]
+            assert child["album"] is None
+            assert child["album_final"] is True
+            release.set()
+
+        store = JobStore(tmp_path / "queue.db")
+        try:
+            # The parent first: the child's ``parent_id`` is a foreign key.
+            store.upsert(qm.get_job(parent["id"]))
+            store.upsert(qm.get_job(child["id"]))
+            assert store.get(child["id"]).album_final is True
+        finally:
+            store.close()
+
+    def test_a_row_the_flat_pass_produced_arrives_false(self, client_and_qm):
+        client, _ = client_and_qm
+        with patch("app.main.probe", return_value=_enumeration()):
+            preview = client.post(
+                "/download/probe", json={"url": COLLECTION_URL}
+            ).json()["preview"]
+
+        assert [row["album_final"] for row in preview["rows"]] == [False, False]
+
+    def test_a_client_that_omits_it_gets_the_old_behaviour(self, client_and_qm):
+        """The field is optional, and its default is "not final"."""
+        client, _ = client_and_qm
+        body = {
+            "url": COLLECTION_URL,
+            "artist": "Bonobo",
+            "tracks": [{"url": "https://www.youtube.com/watch?v=vid1"}],
+        }
+        release = threading.Event()
+        with patch(
+            "app.queue_manager.download_audio", side_effect=_blocking_download(release)
+        ):
+            resp = client.post("/download/bulk", json=body)
+            assert resp.status_code == 200
+            assert resp.json()["children"][0]["album_final"] is False
+            release.set()
+
+
 class TestBulkRoute:
     def _body(self, **overrides) -> dict:
         body = {

@@ -1,0 +1,46 @@
+{
+ "name": "Glass Beams",
+ "channelId": "UCz2BbywXgCxZcpAiXPlKT4Q",
+ "albums": null,
+ "singles": {
+  "browseId": null,
+  "results": [
+   {
+    "title": "Mahal",
+    "browseId": "MPREb_gnhoBS7WsdO",
+    "thumbnails": [
+     {
+      "url": "https://yt3.googleusercontent.com/wYlWFKXohrbzhq8omvwFubk01_SoEsh_DnRFAefWWvwXBgEXS7wOVIOEvJuyBoMq4kPV1RKrH3_DiBwG9g=w226-h226-l90-rj",
+      "width": 226,
+      "height": 226
+     },
+     {
+      "url": "https://yt3.googleusercontent.com/wYlWFKXohrbzhq8omvwFubk01_SoEsh_DnRFAefWWvwXBgEXS7wOVIOEvJuyBoMq4kPV1RKrH3_DiBwG9g=w544-h544-l90-rj",
+      "width": 544,
+      "height": 544
+     }
+    ],
+    "type": "EP",
+    "year": "2024"
+   },
+   {
+    "title": "Mahal",
+    "browseId": "MPREb_E21rLjE4lEj",
+    "thumbnails": [
+     {
+      "url": "https://yt3.googleusercontent.com/L0rpWP_i5CY_IGBQPOX1xwFBWYr-WD0aFFUSuZhETlDcV5vmQtQ0dQYy1uGxasKVPWfs4fKbxth0WnpdMA=w226-h226-l90-rj",
+      "width": 226,
+      "height": 226
+     },
+     {
+      "url": "https://yt3.googleusercontent.com/L0rpWP_i5CY_IGBQPOX1xwFBWYr-WD0aFFUSuZhETlDcV5vmQtQ0dQYy1uGxasKVPWfs4fKbxth0WnpdMA=w544-h544-l90-rj",
+      "width": 544,
+      "height": 544
+     }
+    ],
+    "type": "Single",
+    "year": "2024"
+   }
+  ]
+ }
+}

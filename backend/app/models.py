@@ -190,6 +190,16 @@ class Job(BaseModel):
     )
     artist: str | None = Field(None, description="Artist name (user-provided or from metadata)")
     album: str | None = Field(None, description="Album name (user-provided or from metadata)")
+    album_final: bool = Field(
+        default=False,
+        description=(
+            "Whether ``album`` is the whole answer, because the enumeration "
+            "that created this child read the release it is on.  A null album "
+            "is then deliberately none -- a loose Single -- and yt-dlp's own "
+            "album is not allowed to refile it.  Only ever true on a bulk "
+            "child enumerated through YouTube Music"
+        ),
+    )
     kind: JobKind = Field(default=JobKind.DOWNLOAD, description="What this queue entry does")
     parent_id: str | None = Field(None, description="Id of the bulk parent this job belongs to")
     path: str | None = Field(None, description="Library path a tagging job targets (track or album)")
@@ -658,6 +668,23 @@ LARGE_COLLECTION_TRACKS = 500
 # hold the result for hours; the user is asked for a narrower URL instead.
 MAX_COLLECTION_TRACKS = 2000
 
+# How many sub-collections one probe may expand.  A YouTube ``/releases`` tab
+# is 50-odd albums, a SoundCloud ``/sets`` page about the same, and a YouTube
+# Music discography is the same shape again -- one extra call per release; 200
+# is far past any real discography and keeps the worst case at 200 calls rather
+# than at "however many rows the page had".  Lives here rather than in
+# ``app.probe`` because ``app.probe`` and ``app.ytmusic`` both bound themselves
+# by it and the probe imports the other way round.
+MAX_SUBCOLLECTIONS = 200
+
+# How many probes may hold an executor thread at once.  A probe is a long
+# blocking call on the default executor, and the executor is shared with the
+# rest of the app; two at a time is enough for a user with a second tab open
+# and leaves the pool for everything else.  A third probe waits for a slot
+# rather than queueing invisibly behind a thread.  Here for the same reason as
+# above: ``app.ytmusic`` sizes its HTTPS connection pool for this many probes.
+MAX_CONCURRENT_PROBES = 2
+
 # Bounds on the free text a preview row carries back in a bulk submit.  A title
 # is a display string, so a kilobyte is already absurd; a source id is
 # ``<extractor>:<id>``, which is short by construction.  The preview truncates
@@ -751,6 +778,15 @@ class PreviewRow(BaseModel):
         None,
         description="Album from the source; null means the track becomes a loose Single",
     )
+    album_final: bool = Field(
+        default=False,
+        description=(
+            "Whether ``album`` is the whole answer because the source read the "
+            "release this track is on: a null album is then deliberately none "
+            "-- a loose Single -- rather than an album nobody knew.  False for "
+            "the flat pass, whose listings routinely carry no album at all"
+        ),
+    )
     duration: float | None = Field(None, description="Length in seconds, when known")
     thumbnail_url: str | None = Field(None, description="Thumbnail URL, when known")
     status: Literal["available", "in_library", "unavailable"] = Field(
@@ -828,6 +864,13 @@ class BulkTrack(BaseModel):
     url: str = Field(..., min_length=1, description="The track URL to download")
     title: str | None = Field(None, max_length=MAX_TRACK_TITLE)
     album: str | None = Field(None, max_length=MAX_FOLDER_NAME)
+    album_final: bool = Field(
+        default=False,
+        description=(
+            "The preview row's ``album_final``, sent back as it came: the "
+            "source read the release, so a null album means deliberately none"
+        ),
+    )
     duration: float | None = Field(None, ge=0)
     thumbnail_url: str | None = Field(None, max_length=MAX_PATH_LENGTH)
     source_id: str | None = Field(None, max_length=MAX_SOURCE_ID)

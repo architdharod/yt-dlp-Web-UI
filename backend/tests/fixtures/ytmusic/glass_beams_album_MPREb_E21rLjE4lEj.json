@@ -1,0 +1,97 @@
+{
+ "title": "Mahal",
+ "type": "Single",
+ "thumbnails": [
+  {
+   "url": "https://yt3.googleusercontent.com/L0rpWP_i5CY_IGBQPOX1xwFBWYr-WD0aFFUSuZhETlDcV5vmQtQ0dQYy1uGxasKVPWfs4fKbxth0WnpdMA=w60-h60-l90-rj",
+   "width": 60,
+   "height": 60
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/L0rpWP_i5CY_IGBQPOX1xwFBWYr-WD0aFFUSuZhETlDcV5vmQtQ0dQYy1uGxasKVPWfs4fKbxth0WnpdMA=w120-h120-l90-rj",
+   "width": 120,
+   "height": 120
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/L0rpWP_i5CY_IGBQPOX1xwFBWYr-WD0aFFUSuZhETlDcV5vmQtQ0dQYy1uGxasKVPWfs4fKbxth0WnpdMA=w226-h226-l90-rj",
+   "width": 226,
+   "height": 226
+  },
+  {
+   "url": "https://yt3.googleusercontent.com/L0rpWP_i5CY_IGBQPOX1xwFBWYr-WD0aFFUSuZhETlDcV5vmQtQ0dQYy1uGxasKVPWfs4fKbxth0WnpdMA=w544-h544-l90-rj",
+   "width": 544,
+   "height": 544
+  }
+ ],
+ "isExplicit": false,
+ "year": "2024",
+ "artists": [
+  {
+   "name": "Glass Beams",
+   "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+  }
+ ],
+ "trackCount": 2,
+ "duration": "5 minutes, 39 seconds",
+ "audioPlaylistId": "OLAK5uy_lEEjvCZq9rizQ1GKj7zIFsClfXlzlSKlk",
+ "likeStatus": "INDIFFERENT",
+ "tracks": [
+  {
+   "videoId": "zJh2wkikFlI",
+   "title": "Mahal",
+   "artists": [
+    {
+     "name": "Glass Beams",
+     "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+    }
+   ],
+   "album": "Mahal",
+   "likeStatus": "INDIFFERENT",
+   "inLibrary": false,
+   "pinnedToListenAgain": false,
+   "feedbackTokens": {
+    "add": null,
+    "remove": "AB9zfpISSuHXSjErz0Cy2viAl6SFwl6oWh5MBO9_Mus6JTcRm0fyIWMTAwU4YVuJQGyOHVgeZ8ZncnRgx_d57eEi73jkLtWZhw"
+   },
+   "thumbnails": null,
+   "isAvailable": true,
+   "isExplicit": false,
+   "videoType": "MUSIC_VIDEO_TYPE_OMV",
+   "views": "5.3M plays",
+   "communityVoteStatus": null,
+   "trackNumber": 1,
+   "duration": "3:22",
+   "duration_seconds": 202,
+   "creditsBrowseId": "MPTCByzhrg7oW58"
+  },
+  {
+   "videoId": "zJh2wkikFlI",
+   "title": "Mahal (Edit)",
+   "artists": [
+    {
+     "name": "Glass Beams",
+     "id": "UCcT6dA3rQ_EhHlG5Wu8mitg"
+    }
+   ],
+   "album": "Mahal",
+   "likeStatus": "INDIFFERENT",
+   "inLibrary": false,
+   "pinnedToListenAgain": false,
+   "feedbackTokens": {
+    "add": null,
+    "remove": "AB9zfpKTItrlm-KhqZjZme6trdcZMokQcYWUpxXI9t-18l92srMu_Sin-EEBUg27H5v09cHlxjSsKpl439APoIz6K6nv7TRfCg"
+   },
+   "thumbnails": null,
+   "isAvailable": true,
+   "isExplicit": false,
+   "videoType": "MUSIC_VIDEO_TYPE_OMV",
+   "views": "5.3M plays",
+   "communityVoteStatus": null,
+   "trackNumber": 2,
+   "duration": "2:17",
+   "duration_seconds": 137,
+   "creditsBrowseId": "MPTCYjBrFYdz-aw"
+  }
+ ],
+ "duration_seconds": 339
+}

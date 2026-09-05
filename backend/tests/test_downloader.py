@@ -1388,6 +1388,98 @@ class TestAlbumLessDownloadsAreLooseSingles:
         assert result == tmp_path / "A" / "My Cool Track.flac"
 
 
+class TestABulkChildTrustsItsEnumeration:
+    """A child job's title and album come from the preview, not from yt-dlp.
+
+    The collection probe read the *release*; the child's own metadata pass
+    reads one video, which is titled for YouTube ("Artist - 'Track' (Official
+    Audio)") and can name an album the preview deliberately did not.  Where
+    the two disagree the enumeration wins, so the row the user ticked is the
+    file that lands.
+    """
+
+    # What yt-dlp says about the video behind a track on Glass Beams' EP.
+    VIDEO_INFO = {
+        **SAMPLE_INFO,
+        "title": "Glass Beams - 'Horizon' (Official Audio)",
+        "artist": "Glass Beams",
+        "album": "Mahal",
+    }
+
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_the_enumerated_title_names_the_file_and_the_tag(
+        self, mock_ydl_cls, tmp_path
+    ):
+        _install_ydl_mocks(mock_ydl_cls, info=self.VIDEO_INFO)
+        job = _make_job(
+            parent_id="parent-1", title="Horizon", artist="Glass Beams", album="Mahal"
+        )
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            result = download_audio(job)
+
+        assert result == tmp_path / "Glass Beams" / "Mahal" / "Horizon.flac"
+        assert FLAC(result)["TITLE"] == ["Horizon"]
+
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_a_single_stays_album_less_however_yt_dlp_tags_the_video(
+        self, mock_ydl_cls, tmp_path
+    ):
+        """A YouTube Music row's empty album is an answer, not a gap to fill."""
+        _install_ydl_mocks(mock_ydl_cls, info=self.VIDEO_INFO)
+        job = _make_job(
+            parent_id="parent-1",
+            title="Horizon",
+            artist="Glass Beams",
+            album_final=True,
+        )
+        targets: list[str] = []
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            result = download_audio(job, on_target=targets.append)
+
+        assert result == tmp_path / "Glass Beams" / "Horizon.flac"
+        assert "ALBUM" not in FLAC(result)
+        assert targets == ["Glass Beams"]
+
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_a_flat_enumerated_child_still_takes_yt_dlps_album(
+        self, mock_ydl_cls, tmp_path
+    ):
+        """The flat pass never read a release, so its empty album is a gap.
+
+        Only ``album_final`` promises "no album, deliberately"; a child of a
+        plain playlist whose listing carried no album keeps the old chain,
+        where yt-dlp fills the blank in.
+        """
+        _install_ydl_mocks(mock_ydl_cls, info=self.VIDEO_INFO)
+        job = _make_job(parent_id="parent-1", title="Horizon", artist="Glass Beams")
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            result = download_audio(job)
+
+        assert result == tmp_path / "Glass Beams" / "Mahal" / "Horizon.flac"
+        assert FLAC(result)["ALBUM"] == ["Mahal"]
+
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_a_plain_download_job_still_takes_both_from_yt_dlp(
+        self, mock_ydl_cls, tmp_path
+    ):
+        """No parent means no enumeration, so the old chain is unchanged."""
+        _install_ydl_mocks(mock_ydl_cls, info=self.VIDEO_INFO)
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            result = download_audio(_make_job(artist="Glass Beams"))
+
+        assert result == (
+            tmp_path
+            / "Glass Beams"
+            / "Mahal"
+            / "Glass Beams - 'Horizon' (Official Audio).flac"
+        )
+        assert FLAC(result)["ALBUM"] == ["Mahal"]
+
+
 class TestTagging:
     """What ends up in the finished FLAC's Vorbis comments and PICTURE block."""
 
