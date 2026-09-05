@@ -32,6 +32,13 @@ export interface Job {
   duration: number | null;
   progress: number;
   error: string | null;
+  /**
+   * A note about a job that finished anyway — today only "tags not fixed: ..."
+   * on a `done` row, when the automatic MusicBrainz fix did not apply. It is
+   * not an error: the track is in the library. Optional here because `done`
+   * jobs leave the in-flight view, so most rows the UI holds never carry one.
+   */
+  detail?: string | null;
   artist: string | null;
   album: string | null;
   created_at: string;

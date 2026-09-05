@@ -7,3 +7,8 @@ pydantic==2.13.5
 sse-starlette==3.4.10
 # Async HTTP client for the Navidrome and Lidarr rescan calls.
 httpx==0.28.1
+
+# MusicBrainz text search for the automatic tag fix.  Pinned: 0.7.1 (Jan 2020)
+# is the current and only maintained release; the project is in maintenance
+# mode, so app/tagger.py wraps it thinly enough to be swapped.
+musicbrainzngs==0.7.1

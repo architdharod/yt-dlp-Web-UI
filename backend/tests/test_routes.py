@@ -1101,6 +1101,45 @@ class TestLifespanShutdown:
         # events posted into a dead loop on the next boot.
         assert main_module._loop is None
 
+    def test_teardown_releases_the_tagging_thread(self, monkeypatch):
+        """Otherwise a lookup nobody is waiting for any more keeps a thread
+        alive past the point where the app has stopped serving."""
+        import app.main as main_module
+
+        closes = []
+        original = QueueManager.close
+        monkeypatch.setattr(
+            QueueManager,
+            "close",
+            lambda self: (closes.append(self), original(self))[1],
+        )
+
+        with TestClient(main_module.app) as client:
+            assert client.get("/health").status_code == 200
+
+        assert closes == [main_module.queue_manager]
+
+    def test_a_failing_tagging_release_does_not_strand_the_store(
+        self, monkeypatch, caplog
+    ):
+        """The queue is released before the store, because it is the last
+        thing still writing to it -- so a failure there must not be what stops
+        the database from being closed."""
+        import app.main as main_module
+
+        def boom(self):
+            raise RuntimeError("the tagging thread would not go")
+
+        monkeypatch.setattr(QueueManager, "close", boom)
+        closes = self._spy_on_store_close(monkeypatch)
+
+        with caplog.at_level(logging.ERROR):
+            with TestClient(main_module.app) as client:
+                assert client.get("/health").status_code == 200
+
+        assert "Could not release the tagging thread" in caplog.text
+        assert closes, "teardown never reached store.close()"
+
     def test_a_malformed_lidarr_url_boots_and_shuts_down_without_a_traceback(
         self, monkeypatch, isolated_paths
     ):
@@ -1120,6 +1159,28 @@ class TestLifespanShutdown:
             assert client.get("/health").status_code == 200
 
         assert main_module.rescan_hook is None
+
+
+class TestStartupBanner:
+    """The boot log is where a homelab finds out what the container thinks it
+    was configured with."""
+
+    def test_it_reports_the_tag_fix_configuration(self, monkeypatch, caplog):
+        import app.main as main_module
+
+        monkeypatch.setenv("TAG_FIX_ENABLED", "false")
+        monkeypatch.setenv("MUSICBRAINZ_CONTACT", "someone@example.com")
+
+        with caplog.at_level(logging.INFO, logger="app.main"):
+            with TestClient(main_module.app) as client:
+                assert client.get("/health").status_code == 200
+
+        assert "TAG_FIX_ENABLED          = False" in caplog.text
+        assert "MUSICBRAINZ_CONTACT      = someone@example.com" in caplog.text
+        assert (
+            f"TAG_FIX_TIMEOUT_SECONDS  = {main_module.queue_manager.tag_fix_timeout}"
+            in caplog.text
+        )
 
 
 class TestDataPathStartupChecks:
@@ -1480,3 +1541,80 @@ def test_a_queue_event_whose_handling_raises_is_logged(client, caplog):
 
     assert "Handling a queue event failed" in caplog.text
     assert "boom" in caplog.text
+
+
+# ===========================================================================
+# The tagging state over the API
+# ===========================================================================
+
+
+class TestTaggingOverTheApi:
+    """A job being tagged is in flight, and its note travels with it."""
+
+    def test_a_tagging_job_is_listed(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["tagging"] = _make_job(
+            id="tagging",
+            status=JobStatus.TAGGING,
+            result_path="Bonobo/Migration/Kerala.flac",
+        )
+
+        [row] = client.get("/queue").json()
+
+        assert row["id"] == "tagging"
+        assert row["status"] == "tagging"
+        assert row["detail"] is None
+
+    def test_a_done_job_leaves_the_view_even_with_a_note(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["done"] = _make_job(
+            id="done", status=JobStatus.DONE, detail="tags not fixed: no match"
+        )
+
+        assert client.get("/queue").json() == []
+
+    def test_a_tagging_job_can_be_cancelled(self, client_and_qm):
+        client, qm = client_and_qm
+        qm._jobs["tagging"] = _make_job(id="tagging", status=JobStatus.TAGGING)
+
+        resp = client.post("/queue/tagging/cancel")
+
+        assert resp.status_code == 200
+        # It stays in `tagging` until the fix reaches its next checkpoint; the
+        # cancel is the persisted request, not the verdict.
+        assert resp.json()["status"] == "tagging"
+        assert qm.get_job("tagging").cancel_requested is True
+
+    async def test_the_status_change_carries_tagging_and_its_note(self):
+        """The SSE payload a client applies without re-reading the queue."""
+        import app.main as main_module
+
+        q: asyncio.Queue[SSEEvent] = asyncio.Queue(maxsize=256)
+        async with main_module._sse_clients_lock:
+            main_module._sse_clients.append(q)
+        original_loop = main_module._loop
+        main_module._loop = asyncio.get_running_loop()
+
+        qm = QueueManager(
+            max_concurrent=1, timeout=10, on_event=main_module._on_queue_event
+        )
+        job = _make_job(id="tag-sse", status=JobStatus.QUEUED)
+        qm._jobs[job.id] = job
+
+        try:
+            qm._update_status("tag-sse", JobStatus.TAGGING)
+            qm._finish_tagged("tag-sse", "tags not fixed: no match")
+            await asyncio.sleep(0.05)
+
+            events = []
+            while not q.empty():
+                events.append(q.get_nowait())
+
+            statuses = [event.data["status"] for event in events]
+            assert statuses == ["tagging", "done"]
+            assert "detail" not in events[0].data
+            assert events[1].data["detail"] == "tags not fixed: no match"
+        finally:
+            main_module._loop = original_loop
+            async with main_module._sse_clients_lock:
+                main_module._sse_clients.remove(q)

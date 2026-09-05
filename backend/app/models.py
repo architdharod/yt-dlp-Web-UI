@@ -57,11 +57,12 @@ class JobStatus(str, Enum):
     ``cancelled`` are terminal and reachable from every non-terminal state.
 
     ``CANCELLED`` is live: ``POST /queue/{id}/cancel`` (phase 2) ends a queued
-    or running job there.  ``TAGGING`` is still only vocabulary -- the tagging
-    worker arrives in phase 8 -- but it has been a legal value of the persisted
-    ``status`` column since the first schema version, so a database written by
-    a later build is readable by this one and the restore logic does not have
-    to grow a special case then.
+    or running job there.  ``TAGGING`` is live too (phase 8): a download enters
+    it once its FLAC is in the library, having *released its download slot*,
+    and waits there for the single tagging worker.  A job in ``tagging``
+    therefore always has a finished file behind it, which is why a cancel from
+    there ends in ``done`` (with a "tags not fixed" detail) rather than in
+    ``cancelled`` -- the track exists and the user should be told so.
     """
 
     QUEUED = "queued"
@@ -116,6 +117,14 @@ class Job(BaseModel):
     duration: float | None = Field(None, description="Track duration in seconds")
     progress: float = Field(default=0.0, ge=0.0, le=100.0, description="Download progress percentage")
     error: str | None = Field(None, description="Error message if job failed")
+    detail: str | None = Field(
+        None,
+        description=(
+            "A note about a job that finished anyway, e.g. 'tags not fixed: no "
+            "match'.  Separate from ``error`` because it is not a failure: the "
+            "job is ``done`` and its file is in the library."
+        ),
+    )
     artist: str | None = Field(None, description="Artist name (user-provided or from metadata)")
     album: str | None = Field(None, description="Album name (user-provided or from metadata)")
     kind: JobKind = Field(default=JobKind.DOWNLOAD, description="What this queue entry does")

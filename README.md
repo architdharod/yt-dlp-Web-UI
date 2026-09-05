@@ -15,14 +15,23 @@ This is a project for educational purpose, to learn the usage of the library yt-
    tags, the cover art, and the `SOURCEID`/`SOURCEURL` fields that record where the track came from.
 4. Files are saved to `DOWNLOAD_PATH/Artist/Album/track.flac`, falling back to "Unknown Artist" when no artist is
    known. A track with no album is a Single and lands at `DOWNLOAD_PATH/Artist/track.flac` with no `ALBUM` tag.
+5. With the track filed the download slot is freed and the job moves to **tagging**, queueing for the one tagging
+   worker, which asks MusicBrainz about the cleaned title, the artist folder, and the duration. On a confident
+   match (duration within 5 s, same title, same artist) it rewrites `TITLE` and `ARTIST` and strips yt-dlp's
+   leftovers; below that bar it changes nothing. `ALBUMARTIST`, `ALBUM`, `SOURCEID`, `SOURCEURL` and the cover art
+   are never touched, and no MusicBrainz ids are written. Either way the job then reaches **done** — a lookup that
+   failed says "tags not fixed" in the job's detail and never fails the download.
+
 Real-time progress is streamed to the browser via Server-Sent Events — no polling. The UI is split into tabs:
 **Download** (the form and the in-flight queue, with a badge counting the jobs still working) and **Library**, with a
 **Trash** tab that appears once something is in it.
 
 Queue rows carry two actions. **Cancel** stops a job that is queued, downloading or converting: running ffmpeg is our
 own process, so it is killed rather than waited out, and every partial and temporary file is removed. Cancelled jobs
-leave the queue and are not retried — resubmit the URL instead. **Dismiss** removes a failed job, which is otherwise
-kept until you have seen it.
+leave the queue and are not retried — resubmit the URL instead. Cancelling a job that is already **tagging** stops
+only the tag fix: the track is in the library, so the job finishes as done with "tags not fixed: cancelled". A
+MusicBrainz request that is already open cannot be interrupted, so the cancel lands when that request returns.
+**Dismiss** removes a failed job, which is otherwise kept until you have seen it.
 
 ### Move and rename
 
@@ -165,6 +174,9 @@ All configuration is via environment variables in `.env`:
 | `LIDARR_URL`               | empty (disabled)        | Lidarr base URL, e.g. `http://lidarr:8686`                              |
 | `LIDARR_API_KEY`           | empty (disabled)        | Lidarr API key, from Settings > General                                 |
 | `LIDARR_ROOT_FOLDER`       | Lidarr's first          | The root folder to rescan, as Lidarr sees it                            |
+| `TAG_FIX_ENABLED`          | `true`                  | Look every finished download up on MusicBrainz and correct its `TITLE`/`ARTIST`. `false` skips the lookup, and no request leaves the container |
+| `MUSICBRAINZ_CONTACT`      | this repository's URL   | Contact (email or URL) in the User-Agent MusicBrainz requires           |
+| `TAG_FIX_TIMEOUT_SECONDS`  | `60`                    | How long one tag lookup may take before the job finishes without it     |
 
 These are the effective defaults: `docker-compose.yml` substitutes them when a
 variable is unset or empty, so an incomplete `.env` no longer breaks the stack.
@@ -228,4 +240,7 @@ worth knowing:
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
 - **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced. A move onto an occupied path is refused the same way.
 - **No authentication** — designed for private/internal networks.
-- **FLAC only** — lossy sources are losslessly wrapped in FLAC for consistent output.
+- **FLAC only** — lossy sources are losslessly wrapped in FLAC for consistent output. Only FLAC files are tagged.
+- **Text-search tagging only** — the automatic fix asks MusicBrainz by title, artist and duration; there is no
+  audio fingerprinting, so a live version, a cover, or a sped-up upload is left with the tags it came with. Album
+  track numbers and cover art are not part of the automatic pass.

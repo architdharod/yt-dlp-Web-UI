@@ -62,6 +62,7 @@ _COLUMNS: tuple[str, ...] = (
     "target_guessed",
     "result_path",
     "error",
+    "detail",
     "attempts",
     "restart_attempts",
     "cancel_requested",
@@ -114,6 +115,16 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         "CREATE INDEX idx_jobs_status ON jobs(status)",
         "CREATE INDEX idx_jobs_parent_id ON jobs(parent_id)",
         "CREATE INDEX idx_jobs_created_at ON jobs(created_at)",
+    ),
+    # Version 2 (phase 8): the tag fix that runs after every download needs
+    # somewhere to say "tags not fixed: no match" on a job that is otherwise
+    # `done`.  Reusing `error` was the alternative -- no new column -- but an
+    # error string on a successful row is exactly the thing every reader of
+    # this table (the queue view, the frontend's "Skipped" rendering, a later
+    # report) would have to learn an exception for.  A nullable column of its
+    # own costs one ALTER and keeps "error means the job failed" true.
+    (
+        "ALTER TABLE jobs ADD COLUMN detail TEXT",
     ),
 )
 
@@ -291,6 +302,7 @@ class JobStore:
             int(job.target_guessed),
             job.result_path,
             job.error,
+            job.detail,
             job.attempts,
             job.restart_attempts,
             int(job.cancel_requested),
@@ -322,6 +334,7 @@ class JobStore:
             target_guessed=bool(row["target_guessed"]),
             result_path=row["result_path"],
             error=row["error"],
+            detail=row["detail"],
             attempts=row["attempts"],
             restart_attempts=row["restart_attempts"],
             cancel_requested=bool(row["cancel_requested"]),

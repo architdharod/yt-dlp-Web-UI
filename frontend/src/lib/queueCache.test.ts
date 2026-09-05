@@ -86,6 +86,27 @@ describe("applyQueueEvent", () => {
     expect(invalidated).toEqual([]);
   });
 
+  it("carries the tagging status and its note", () => {
+    queryClient.setQueryData(queryKeys.queue, [job("a", "converting")]);
+
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", { status: "tagging" }),
+    );
+    expect(queue()![0].status).toBe("tagging");
+
+    // A `done` job leaves the view, note and all — the detail is for the API
+    // and the log, not for a row nobody can see.
+    applyQueueEvent(
+      queryClient,
+      event("status_change", "a", {
+        status: "done",
+        detail: "tags not fixed: no match",
+      }),
+    );
+    expect(queue()).toEqual([]);
+  });
+
   it("keeps progress events off the invalidation path", () => {
     queryClient.setQueryData(queryKeys.queue, [job("a")]);
 

@@ -688,6 +688,35 @@ def test_a_tagging_job_is_not_an_unresolved_download():
     assert in_flight.unresolved == 0
 
 
+def test_a_download_being_tagged_still_guards_its_folder():
+    """The tag fix writes into the file the download filed, so the folder is
+    still off limits until the job is done -- moving it out from under the
+    tagger would have it writing to a path that no longer exists."""
+    manager = QueueManager(max_concurrent=1, timeout=10)
+    manager._jobs["job-1"] = _in_flight_job(
+        status=JobStatus.TAGGING, result_path="Bonobo/Fragments/Otomo.flac"
+    )
+
+    in_flight = manager.in_flight_library_targets()
+
+    assert in_flight.targets == ["Bonobo", "Bonobo/Fragments"]
+    assert in_flight.unresolved == 0
+
+
+def test_renaming_an_artist_a_job_is_tagging_in_is_refused(client_and_queue, root):
+    client, manager, _events = client_and_queue
+    manager._jobs["job-1"] = _in_flight_job(status=JobStatus.TAGGING)
+    before = rel_paths(root)
+
+    response = client.post(
+        "/library/move", json={"path": "Bonobo", "artist": "Bonobo (UK)"}
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["conflicts"] == ["Bonobo"]
+    assert rel_paths(root) == before
+
+
 def test_renaming_an_artist_a_job_is_downloading_into_is_refused(client_and_queue, root):
     client, manager, _events = client_and_queue
     manager._jobs["job-1"] = _in_flight_job()

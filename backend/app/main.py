@@ -84,6 +84,7 @@ from app.queue_manager import (
     QueueError,
     QueueManager,
 )
+from app.tagger import musicbrainz_contact, tag_fix_enabled
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -95,6 +96,11 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+
+# musicbrainzngs logs an INFO line for every XML element it does not have a
+# parser for, which is twenty to forty lines per lookup and says nothing about
+# our request.  Its warnings and errors are still worth having.
+logging.getLogger("musicbrainzngs").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +330,9 @@ async def lifespan(app: FastAPI):
     logger.info("DATA_PATH                = %s", data_path)
     logger.info("MAX_CONCURRENT_DOWNLOADS = %s", max_concurrent)
     logger.info("DOWNLOAD_TIMEOUT_SECONDS = %s", timeout)
+    logger.info("TAG_FIX_ENABLED          = %s", tag_fix_enabled())
+    logger.info("MUSICBRAINZ_CONTACT      = %s", musicbrainz_contact())
+    logger.info("TAG_FIX_TIMEOUT_SECONDS  = %s", queue_manager.tag_fix_timeout)
     for line in describe_config(rescan_config):
         logger.info("%s", line)
     for warning in rescan_config.warnings:
@@ -383,13 +392,22 @@ async def lifespan(app: FastAPI):
         except Exception:
             logger.exception("Could not close the HTTP client")
         finally:
+            # The queue goes first: it is the last thing still producing
+            # writes for the store, so releasing the producer before closing
+            # the sink is the order that cannot have a tag fix looking for a
+            # database that is already shut.
             try:
-                store.close()
+                queue_manager.close()
             except Exception:
-                logger.exception("Could not close the job store")
+                logger.exception("Could not release the tagging thread")
             finally:
-                _loop = None
-                logger.info("=== yt-dlp Web UI backend shutting down ===")
+                try:
+                    store.close()
+                except Exception:
+                    logger.exception("Could not close the job store")
+                finally:
+                    _loop = None
+                    logger.info("=== yt-dlp Web UI backend shutting down ===")
 
 
 app = FastAPI(title="yt-dlp Web UI", version="0.1.0", lifespan=lifespan)

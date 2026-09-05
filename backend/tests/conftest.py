@@ -77,8 +77,13 @@ def stub_download_audio(isolated_paths):
 # was handed, so the tests can still assert on how ffmpeg is invoked.
 
 
-def minimal_flac_bytes() -> bytes:
+def minimal_flac_bytes(total_samples: int = 0) -> bytes:
     """Return the bytes of a valid, empty FLAC file.
+
+    *total_samples* is written into STREAMINFO, so a caller that needs the file
+    to *claim* a duration (the tagger's match bar compares one) can ask for
+    ``44100 * seconds``.  The default 0 means "unknown", which is what every
+    test that only needs a parseable file wants.
 
     The pipeline's last stage is mutagen, which parses whatever ffmpeg produced,
     so the fake ffmpeg cannot just write ``b"FLAC"`` -- a tag write against that
@@ -104,7 +109,7 @@ def minimal_flac_bytes() -> bytes:
     push(44100, 20)  # sample rate
     push(2 - 1, 3)  # channels, stored as channels - 1
     push(16 - 1, 5)  # bits per sample, stored as bits - 1
-    push(0, 36)  # total samples, 0 = unknown
+    push(total_samples, 36)  # total samples, 0 = unknown
     assert bit_count == 144
 
     streaminfo = value.to_bytes(bit_count // 8, "big") + bytes(16)  # + MD5 of nothing

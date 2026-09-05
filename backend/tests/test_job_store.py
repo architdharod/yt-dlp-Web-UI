@@ -86,7 +86,7 @@ class TestSchema:
         assert store.schema_version == SCHEMA_VERSION
         assert SCHEMA_VERSION >= 1
 
-    def test_all_columns_exist_from_day_one(self, store):
+    def test_every_column_the_store_writes_exists(self, store):
         columns = {
             row["name"] for row in store._conn.execute("PRAGMA table_info(jobs)")
         }
@@ -106,6 +106,7 @@ class TestSchema:
             "target_guessed",
             "result_path",
             "error",
+            "detail",
             "attempts",
             "restart_attempts",
             "cancel_requested",
@@ -126,6 +127,27 @@ class TestSchema:
             "idx_jobs_parent_id",
             "idx_jobs_created_at",
         } <= names
+
+    def test_a_version_1_database_gains_the_detail_column(self, tmp_path):
+        """The migration, not a fresh CREATE TABLE: an existing queue.db from
+        before phase 8 has to keep its rows and gain the column."""
+        path = tmp_path / "queue.db"
+        first = JobStore(path)
+        first.upsert(_make_job(id="from-before"))
+        first._conn.execute("ALTER TABLE jobs DROP COLUMN detail")
+        first._conn.execute("PRAGMA user_version = 1")
+        first._conn.close()
+
+        second = JobStore(path)
+        try:
+            assert second.schema_version == SCHEMA_VERSION
+            row = second.get("from-before")
+            assert row is not None and row.detail is None
+            row.detail = "tags not fixed: no match"
+            second.upsert(row)
+            assert second.get("from-before").detail == "tags not fixed: no match"
+        finally:
+            second.close()
 
     def test_wal_mode_is_enabled(self, store):
         mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
@@ -277,6 +299,7 @@ class TestRoundTrip:
             "path",
             "result_path",
             "error",
+            "detail",
             "attempts",
             "restart_attempts",
             "cancel_requested",

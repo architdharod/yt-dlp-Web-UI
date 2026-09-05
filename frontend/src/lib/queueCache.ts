@@ -156,6 +156,12 @@ export function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
   if (typeof data.error === "string") {
     merged.error = data.error;
   }
+  // Only `done` jobs carry one, and they leave the view — merged anyway so a
+  // row that is still on screen when the event arrives is not left with a
+  // stale note from an earlier state.
+  if (typeof data.detail === "string") {
+    merged.detail = data.detail;
+  }
 
   return merged;
 }
