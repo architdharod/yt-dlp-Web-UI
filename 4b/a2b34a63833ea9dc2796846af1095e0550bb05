@@ -1,0 +1,113 @@
+backend/app/downloader.py
+  s_769fe319c6baee::t_c989ba213ec6a3 28
+  s_769fe319c6baee::t_3f0dea70042da7 323-326,332-334,345-347,529-531,1483-1485
+  s_769fe319c6baee::t_5f123a2021bfc6 51-55,319-322
+  s_769fe319c6baee::t_2ad8312f6f43f7 327-331,335-344,348-353
+backend/tests/test_downloader.py
+  s_769fe319c6baee::t_51b6892d9dfb9f 188-192,203,206
+  s_769fe319c6baee::t_0ba5ed71a23e78 25,141-187,193-199,201-202,204-205,207-245
+  s_769fe319c6baee::t_10a731999c3308 200
+  s_769fe319c6baee::t_0650927fa16102 246
+frontend/src/lib/types.ts
+  s_769fe319c6baee::t_9b176518295a47 19-23,25,66-69,74-75
+  s_769fe319c6baee::t_91f98f795dc77f 24,70-73
+backend/tests/test_models.py
+  s_769fe319c6baee::t_1f1812d8a9e340 6-14
+  s_769fe319c6baee::t_78cc17aa75e2e9 246-283
+backend/app/spotify.py
+  s_769fe319c6baee::t_25892588e2eb80 28-31,367-374,377-378,380-385
+  s_769fe319c6baee::t_f2e33e9c4ced7f 53,293
+  s_769fe319c6baee::t_efe3bef3d1460b 52
+frontend/src/lib/queueCache.ts
+  s_769fe319c6baee::t_9aad9dcff6f7e6 296-297
+  s_769fe319c6baee::t_97ed6c2dc74411 294-295,337-343
+  s_769fe319c6baee::t_5a544dbfd6cc86 298
+  s_769fe319c6baee::t_ac830f9cea46ff 344
+backend/app/main.py
+  s_769fe319c6baee::t_dca67e4be86f84 597-600
+  s_769fe319c6baee::t_316451a30df883 95
+  s_769fe319c6baee::t_231c0d46ff1748 610-615
+backend/tests/test_spotify.py
+  s_769fe319c6baee::t_a953c8e274e763 55
+  s_769fe319c6baee::t_f2e33e9c4ced7f 41
+README.md
+  s_769fe319c6baee::t_aee26ffd7bad5b 114-116,547-551
+  s_769fe319c6baee::t_c93477a329af19 91-98,545-546
+frontend/src/components/QueueDisplay.tsx
+  s_769fe319c6baee::t_91f98f795dc77f 147-151
+  s_769fe319c6baee::t_9b176518295a47 328-329
+  s_769fe319c6baee::t_001977dfdb5717 424-427,432
+frontend/src/components/QueueDisplay.test.tsx
+  s_769fe319c6baee::t_001977dfdb5717 351-380,400,420
+frontend/src/lib/queue.ts
+  s_769fe319c6baee::t_9b176518295a47 54,57-64,67,76,88
+backend/app/fetch.py
+  s_769fe319c6baee::t_9c326cd2bed246 1-121,124-155
+  s_769fe319c6baee::t_ec95c1656a012c 122-123
+frontend/src/components/download/CollectionPreview.test.tsx
+  s_769fe319c6baee::t_4fea7bc765d9a2 319-327,329,332-334
+backend/tests/conftest.py
+  s_769fe319c6baee::t_a953c8e274e763 320-321,340-398,403-407,412-420
+  s_769fe319c6baee::t_a3a79bed845720 322-339,399-402,408-411
+backend/tests/fixtures/bandcamp/artist-page.html
+  s_769fe319c6baee::t_3848701e95f94c 1-129
+backend/app/bandcamp.py
+  s_769fe319c6baee::t_87cb40bb5758d7 1-126,139-146,153-186,198-206,208-216,220,222-229,233,235-238
+  s_769fe319c6baee::t_241dba0bc53964 127-138,147-152
+  s_769fe319c6baee::t_e5799f37dd51f7 187-197,207,217-219,221,230-232,234,239-247
+backend/app/models.py
+  s_769fe319c6baee::t_5f123a2021bfc6 17,198-214,324-342
+  s_769fe319c6baee::t_91f98f795dc77f 192-197
+  s_769fe319c6baee::t_c10e72049262ab 343
+frontend/src/lib/queue.test.ts
+  s_769fe319c6baee::t_a4394705d5437c 145-153,177-202,238-248,250
+  s_769fe319c6baee::t_870768ff2ab645 249,251
+backend/tests/test_probe.py
+  s_769fe319c6baee::t_7e6203a1ae467b 39,236-242,244,246-274,276-287
+  s_769fe319c6baee::t_a3a79bed845720 513-514,612-613
+  s_769fe319c6baee::t_8cc0c0eb754ae3 544-611,614-675
+  s_769fe319c6baee::t_56d1ba15c1b61b 22,145-155,243,245,275
+  s_769fe319c6baee::t_48b0c5d2ac7f95 38
+  s_769fe319c6baee::t_bb53f7dd537ca4 288
+backend/app/probe.py
+  s_769fe319c6baee::t_f1ff01408d704e 1303-1334,1374-1378,1384,1394-1397,1399
+  s_769fe319c6baee::t_ba5a5ec161d0c2 67,254-264,444,448,452-463,756-757
+  s_769fe319c6baee::t_f3f9427c963ffb 705,722-727,738-743
+  s_769fe319c6baee::t_8a2ff1203c580c 65-66,133-147
+  s_769fe319c6baee::t_4735191733be96 148,464-465
+frontend/src/lib/queueCache.test.ts
+  s_769fe319c6baee::t_e3da9c7c5c2004 14,16-22,359-409,872-901,903
+  s_769fe319c6baee::t_9847f20eb94a8b 902,904
+backend/app/queue_manager.py
+  s_769fe319c6baee::t_7eff5c0d43837d 588
+  s_769fe319c6baee::t_0841121e88780a 738-746,748,2616-2619
+  s_769fe319c6baee::t_012e03cdfbb619 106-111
+  s_769fe319c6baee::t_80b4963a6f6841 112
+backend/tests/test_bulk.py
+  s_769fe319c6baee::t_eb8724920d3ffe 18-22,27,1064-1085
+  s_769fe319c6baee::t_cc5858b4336359 332-387,1322-1354
+  s_769fe319c6baee::t_790f14bf30efec 1086,1355
+backend/tests/test_bandcamp.py
+  s_769fe319c6baee::t_c0a80b971852d8 11,186-212,214-217,229
+  s_769fe319c6baee::t_9337d1dd74b152 213,218-228
+  s_769fe319c6baee::t_efa291b3baf1c0 13,286-296
+  s_769fe319c6baee::t_07d976cf0c4427 1-10,12,14-185,230-285
+backend/requirements.txt
+  s_769fe319c6baee::t_9e86bfb755c72a 20-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "4ba2b34a63833ea9dc2796846af1095e0550bb05",
+  "prompts": {},
+  "sessions": {
+    "s_769fe319c6baee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08b1fec4-aed2-4225-b202-444a08ee2f56",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "archit dharod <archi.parchi7@gmail.com>"
+    }
+  }
+}
