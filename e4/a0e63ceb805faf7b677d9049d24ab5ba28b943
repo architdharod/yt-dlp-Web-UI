@@ -1,0 +1,47 @@
+frontend/src/components/QueueDisplay.tsx
+  s_769fe319c6baee::t_4bf12ea23da9dd 392,435
+frontend/src/components/QueueDisplay.test.tsx
+  s_769fe319c6baee::t_4bf12ea23da9dd 330,348
+.env.example
+  s_769fe319c6baee::t_6c85a20f41de9d 9-12
+backend/app/probe.py
+  s_769fe319c6baee::t_4bf12ea23da9dd 179,184
+  s_769fe319c6baee::t_292e7f62aa113a 180-181
+README.md
+  s_769fe319c6baee::t_5add8223b93971 80-81
+  s_769fe319c6baee::t_f27ce7728c1122 130-131,152-153,181-182,538-539
+  s_769fe319c6baee::t_f7cf97d536dffb 1,3-6,20-31,35-54,57-79,82-104,108-128,132-139,145-147,155-172,174-179,183-192,197-205,228-249,251-264,291-293,298-301,327-336,344,358-362,366,376,378-380,454,457,466-467,476,478,484,521-536,540-547
+  s_769fe319c6baee::t_83b291d0c052f5 180
+  s_769fe319c6baee::t_1dc7cc4936ecb8 250
+  s_769fe319c6baee::t_51327e90b43b1a 302
+  s_769fe319c6baee::t_aa9c14177a45c6 105-107,173,194-196,268-271,273-275,377
+  s_769fe319c6baee::t_8441aa9ae785c8 8,10-16
+  s_769fe319c6baee::t_5c0235b80fa4e6 210-225
+  s_769fe319c6baee::t_e84315120f3ce0 140-144
+  s_769fe319c6baee::t_9fe9d74d5ce9ed 32-34,55-56,129,193,272,367-369,381,537
+  s_769fe319c6baee::t_71d34152ea5d5e 154
+backend/tests/test_bulk.py
+  s_769fe319c6baee::t_4bf12ea23da9dd 991
+docker-compose.yml
+  s_769fe319c6baee::t_6c85a20f41de9d 46
+backend/tests/test_probe.py
+  s_769fe319c6baee::t_4bf12ea23da9dd 542
+backend/app/models.py
+  s_769fe319c6baee::t_d230c55f7b9097 322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.16",
+  "base_commit_sha": "e4a0e63ceb805faf7b677d9049d24ab5ba28b943",
+  "prompts": {},
+  "sessions": {
+    "s_769fe319c6baee": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "08b1fec4-aed2-4225-b202-444a08ee2f56",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "archit dharod <archi.parchi7@gmail.com>"
+    }
+  }
+}
