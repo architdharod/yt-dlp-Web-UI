@@ -16,7 +16,7 @@ dataclasses (:class:`YTMusicArtist` and friends) and ``app.probe`` turns them
 into preview rows, so the two can be tested apart and neither imports the
 other.
 
-Three things happen here:
+Four things happen here:
 
 * :func:`channel_url_target` recognises the URL shapes, by parsing alone.  A
   ``/channel/UC…`` (on ``youtube.com`` or ``music.youtube.com``) and a
@@ -33,6 +33,11 @@ Three things happen here:
   trips and a well-catalogued artist has fifty of them.  Releases come back
   albums first and EPs ahead of Singles, because one recording is often on two
   of them and the probe keeps whichever it saw first.
+
+* :func:`search_artist` goes the other way, from a *name* to a channel id,
+  for the Spotify hand-off: a Spotify artist page gives up its display name and
+  nothing else, and the artist-filtered search answers with the ``UC…`` id
+  :func:`fetch_artist` then reads.
 
 Everything here is blocking and is called from the probe's worker thread.
 """
@@ -70,6 +75,12 @@ MAX_ALBUM_WORKERS = 6
 # caller-supplied session unmodified), so :func:`shared_client` has to apply it
 # again or every call would block forever on a hung socket.
 REQUEST_TIMEOUT_SECONDS = 30
+
+# How many rows :func:`search_artist` asks for.  Only the first is ever read
+# -- there is no picker -- and ``ytmusicapi`` pages the search with
+# continuation requests until it has ``limit`` results, so asking for one is
+# both all we need and the cheapest thing to ask for.
+ARTIST_SEARCH_LIMIT = 1
 
 # A channel id: ``UC`` and 22 more characters of base64url.  Matched rather
 # than assumed so a ``/channel/`` path that is not one -- or a crafted URL
@@ -164,7 +175,7 @@ class YouTubeMusicUnavailable(Exception):
 
 
 class YouTubeMusicClient(Protocol):
-    """The three ``ytmusicapi`` calls this module makes.
+    """The four ``ytmusicapi`` calls this module makes.
 
     Declared so tests can pass a stand-in and never touch the network; the
     real implementation is :class:`ytmusicapi.YTMusic`.
@@ -177,6 +188,10 @@ class YouTubeMusicClient(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def get_album(self, browseId: str) -> dict[str, Any]: ...
+
+    def search(
+        self, query: str, filter: str | None = None, limit: int = 20
+    ) -> list[dict[str, Any]]: ...
 
 
 _client: YouTubeMusicClient | None = None
@@ -633,9 +648,11 @@ def _fetch_releases(
 
     The deadline is honest about the pending calls only.  ``cancel_futures``
     stops the ones that have not started; a ``get_album`` already in flight
-    runs to its own end, bounded by the :data:`REQUEST_TIMEOUT_SECONDS`
-    request timeout, so a probe that gives up here can still overrun
-    ``PROBE_TIMEOUT_SECONDS`` by up to that much before its thread is free.
+    runs to its own end, and :data:`REQUEST_TIMEOUT_SECONDS` bounds each
+    *socket read* rather than the whole response, so a server that dribbles
+    can overrun it.  That is accepted here: the pool is small, the answers are
+    YouTube's own, and the cost is a worker thread staying busy after the
+    probe has already answered.
     """
     _check(check_deadline)
     releases: list[YTMusicRelease] = []
@@ -732,3 +749,68 @@ def _text(value: object) -> str | None:
 def _check(check_deadline: Callable[[], None] | None) -> None:
     if check_deadline is not None:
         check_deadline()
+
+
+# ---------------------------------------------------------------------------
+# Finding an artist by name
+# ---------------------------------------------------------------------------
+
+
+def search_artist(
+    name: str,
+    *,
+    client: YouTubeMusicClient | None = None,
+    check_deadline: Callable[[], None] | None = None,
+) -> tuple[str, str] | None:
+    """The channel id and name of the artist YouTube Music puts first for *name*.
+
+    For the Spotify hand-off (:func:`app.probe._spotify_enumeration`): the name
+    read off a Spotify artist page is all there is to go on, and
+    ``search(filter="artists")`` answers with artist rows whose ``browseId`` is
+    the ``UC…`` channel id :func:`fetch_artist` takes.
+
+    The *top* row is taken and no picker is offered, which is the phase's
+    decision: an artist search for a full display name is right nearly always,
+    the preview says out loud which artist it matched, and the user can edit
+    the artist field or paste the YouTube Music URL instead when it is wrong.
+    A first row whose ``browseId`` is not a channel id is "no confident match"
+    (None) rather than a reason to go looking down the list -- picking the
+    second row *is* a picker, and a silent one.
+
+    Returns None when nothing matched.  Raises:
+        YouTubeMusicUnavailable: If the search never got an answer.
+    """
+    query = name.strip()
+    if not query:
+        return None
+    _check(check_deadline)
+    try:
+        # Inside the try for the same reason ``fetch_artist``'s call is:
+        # building the client fetches the visitor id, which is a network act.
+        ytmusic = client if client is not None else shared_client()
+        results = ytmusic.search(query, filter="artists", limit=ARTIST_SEARCH_LIMIT)
+    except _UNREACHABLE as exc:
+        raise YouTubeMusicUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    except _NOT_AN_ARTIST as exc:
+        logger.info(
+            "Searching YouTube Music for %r failed to parse: %s: %s",
+            query,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    if not isinstance(results, list) or not results:
+        logger.info("YouTube Music has no artist matching %r", query)
+        return None
+
+    top = results[0]
+    if not isinstance(top, dict):
+        return None
+    channel_id = _channel_id(str(top.get("browseId") or ""))
+    if channel_id is None:
+        logger.info("YouTube Music's top artist for %r carries no channel id", query)
+        return None
+    # ``artist`` is where the filtered search parser puts the display name;
+    # the other two are what the unfiltered and top-result shapes use.
+    matched = _text(top.get("artist")) or _text(top.get("title")) or _text(top.get("name"))
+    return channel_id, matched or query

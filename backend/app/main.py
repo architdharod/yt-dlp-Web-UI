@@ -94,6 +94,7 @@ from app.models import (
 from app.probe import (
     CollectionTooLarge,
     EmptyCollection,
+    SpotifyProbeError,
     Enumeration,
     ProbeError,
     ProbeTimeout,
@@ -588,6 +589,10 @@ async def probe_download(request: ProbeRequest):
     * **400** with the "more than 2000 tracks" sentence -- the enumeration
       stopped; the request was for a narrower URL, not a failure of ours;
     * **400** "Failed to probe: ..." -- yt-dlp could not read the URL at all;
+    * **400** with a Spotify sentence -- the URL was Spotify's and was not an
+      artist page, or was one whose artist could not be matched to a YouTube
+      Music discography.  yt-dlp was never asked, so the message is ours and
+      goes out unprefixed;
     * **400** for a collection with nothing downloadable in it -- an empty
       Bandcamp subdomain answers with an empty playlist rather than an error
       (enumeration research), and "0 tracks" is not a preview;
@@ -597,7 +602,7 @@ async def probe_download(request: ProbeRequest):
     """
     try:
         result = await probe(request.url)
-    except (CollectionTooLarge, EmptyCollection) as exc:
+    except (CollectionTooLarge, EmptyCollection, SpotifyProbeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ProbeError as exc:
         raise HTTPException(status_code=400, detail=f"Failed to probe: {exc}") from exc

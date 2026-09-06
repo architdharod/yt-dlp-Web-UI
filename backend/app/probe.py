@@ -9,7 +9,12 @@ enumeration research).  The consequence is that a row's metadata is thin, and
 deliberately so: a child job resolves its own title, duration and thumbnail
 when it runs, and the preview only has to be good enough to tick boxes in.
 
-One URL shape does not go through yt-dlp at all: a YouTube channel
+Two URL shapes do not go through yt-dlp at all.  A Spotify artist URL
+(``open.spotify.com/artist/…``) is not a *source* -- yt-dlp cannot download
+from Spotify and this app holds no Spotify credentials -- so it is read for the
+artist's name alone (:mod:`app.spotify`), searched for on YouTube Music, and
+enumerated from there, with a notice saying which artist it matched.  And a
+YouTube channel
 (``/channel/UC…``, ``/@handle``, ``music.youtube.com/browse/…``) is asked of
 YouTube Music first, through :mod:`app.ytmusic`, because YouTube Music holds
 the same artist as a *discography* -- albums, EPs and singles with track lists
@@ -68,14 +73,23 @@ from app.models import (
     MAX_SUBCOLLECTIONS,
     MAX_TRACK_TITLE,
 )
+from app.spotify import (
+    UNSUPPORTED_KIND_MESSAGE,
+    SpotifyUnavailable,
+    is_spotify_url,
+    resolve_artist_name,
+    spotify_url_target,
+)
 from app.ytmusic import (
     NON_RELEASE_TABS,
     SINGLE_RELEASE_TYPE,
+    YTMusicArtist,
     YouTubeMusicUnavailable,
     canonical_channel_url,
     channel_url_target,
     fetch_artist,
     resolve_channel_id,
+    search_artist,
     source_id as ytmusic_source_id,
     watch_url,
 )
@@ -121,6 +135,44 @@ BANDCAMP_NOTICE = (
 YTMUSIC_UNREACHABLE_NOTICE = (
     "YouTube Music could not be reached, so this channel's uploads were "
     "listed instead of its releases."
+)
+
+# Said when a Spotify artist URL was matched to a YouTube Music artist.  The
+# match is the top search hit for the name Spotify gave, taken without a picker
+# (Spotify URLs ticket), so the preview has to name what it matched and say
+# that the two catalogues are not the same catalogue.
+SPOTIFY_MATCH_NOTICE = (
+    'Matched to the YouTube Music artist "{name}"; its discography may differ '
+    "from the Spotify one. Edit the artist above if it is wrong."
+)
+
+# The three ways a Spotify artist URL fails, as sentences.  Each is the whole
+# 400 body: there is no fallback to yt-dlp for a Spotify URL -- it has no
+# extractor for one -- so an error here is the end of the probe, and it has to
+# say what to do next.
+SPOTIFY_NAME_MESSAGE = (
+    "Could not read the artist name from Spotify. Check the link, or paste "
+    "the artist's YouTube Music page instead."
+)
+
+SPOTIFY_NO_MATCH_MESSAGE = (
+    "No YouTube Music artist matches '{name}'. Paste the artist's YouTube "
+    "Music page instead."
+)
+
+SPOTIFY_YTMUSIC_UNAVAILABLE_MESSAGE = (
+    "YouTube Music could not be reached, so '{name}' could not be looked up. "
+    "Try again in a moment."
+)
+
+SPOTIFY_NOTHING_PLAYABLE_MESSAGE = (
+    "The YouTube Music artist matching '{name}' has no tracks available to "
+    "download."
+)
+
+SPOTIFY_UNREADABLE_MESSAGE = (
+    "The YouTube Music discography for '{name}' could not be read. Try again "
+    "in a moment, or paste the artist's YouTube Music page instead."
 )
 
 TOO_LARGE_MESSAGE = (
@@ -169,6 +221,16 @@ def probe_timeout_seconds() -> int:
 
 class ProbeError(Exception):
     """The URL could not be enumerated.  Routes map this to 400."""
+
+
+class SpotifyProbeError(ProbeError):
+    """A Spotify URL could not become a preview, with a sentence saying why.
+
+    Its own class because its message is written for the user and reaches them
+    unchanged: the route prefixes a plain :class:`ProbeError` with "Failed to
+    probe", which is yt-dlp's voice and wrong for a URL yt-dlp was never asked
+    about.
+    """
 
 
 class CollectionTooLarge(ProbeError):
@@ -859,6 +921,91 @@ def _with_notices(enumeration: Enumeration, *notices: str | None) -> Enumeration
     return replace(enumeration, notices=enumeration.notices + extra)
 
 
+def _enumeration_from_artist(
+    artist: YTMusicArtist, url: str, walk: "_Walk"
+) -> Enumeration | None:
+    """*artist*'s discography as preview rows, or None if none can be played.
+
+    The one conversion from :class:`~app.ytmusic.YTMusicArtist` to
+    :class:`Enumeration`, shared by the two ways an artist is reached: a
+    channel URL (:func:`_ytmusic_enumeration`) and a Spotify artist URL matched
+    to one (:func:`_spotify_enumeration`).  It caches nothing and logs nothing
+    -- the callers differ on both, because a channel that comes back empty
+    falls through to yt-dlp while a Spotify URL has nowhere to fall.
+
+    None means "there is nothing here to tick": no rows at all, or rows that
+    are every one of them unavailable.  The second is the same answer as the
+    first -- :func:`probe` would raise ``EmptyCollection`` on such a preview --
+    and it is better said here, where the caller can still do something else.
+
+    *walk* carries the deadline and the row cap; it is the caller's, and is
+    expected to be a fresh one, so that rows added here are never counted
+    against a fallback listing.
+    """
+    # Tracks YouTube Music lists with no video behind them.  Counted apart
+    # from ``walk.unreadable`` -- which is a failure -- because this one is
+    # the catalogue being honest about an unreleased track.
+    unplayable = 0
+    for release in artist.releases:
+        walk.check_deadline()
+        # A Single gets no album: its tracks become loose Singles under the
+        # artist rather than a folder each (see SINGLE_RELEASE_TYPE).
+        album = (
+            None
+            if release.release_type == SINGLE_RELEASE_TYPE
+            else _cap(release.title, MAX_FOLDER_NAME)
+        )
+        for track in release.tracks:
+            if track.video_id is None:
+                unplayable += 1
+                continue
+            track_url = watch_url(track.video_id)
+            row_source_id = _drop_if_over(ytmusic_source_id(track.video_id), MAX_SOURCE_ID)
+            walk.add(
+                EnumeratedTrack(
+                    id=row_source_id or track_url,
+                    url=track_url,
+                    source_id=row_source_id,
+                    title=_cap(track.title, MAX_TRACK_TITLE),
+                    album=album,
+                    duration=track.duration,
+                    thumbnail_url=_drop_if_over(release.thumbnail_url, MAX_PATH_LENGTH),
+                    unavailable_reason=(
+                        None if track.available else _cap("not available", MAX_REASON)
+                    ),
+                    # The release was read: a null album here is a Single with
+                    # no album, not an album nobody knew.
+                    album_final=True,
+                )
+            )
+
+    if not walk.rows or all(row.unavailable_reason for row in walk.rows):
+        return None
+
+    notices = [
+        notice
+        for notice in (
+            _unreadable_notice(artist.unreadable_releases, "release"),
+            _unplayable_notice(unplayable),
+            (
+                f"Only the first {MAX_SUBCOLLECTIONS} releases were read; use "
+                "a narrower URL."
+                if artist.over_cap
+                else None
+            ),
+        )
+        if notice
+    ]
+    return Enumeration(
+        url=url,
+        title=_cap(artist.name, MAX_TRACK_TITLE),
+        artist=_cap(artist.name, MAX_FOLDER_NAME),
+        source="youtube",
+        rows=tuple(walk.rows),
+        notices=tuple(notices),
+    )
+
+
 def _ytmusic_enumeration(
     url: str, deadline: float
 ) -> tuple[Enumeration | None, tuple[str, ...]]:
@@ -935,74 +1082,13 @@ def _ytmusic_enumeration(
     if artist is None:
         return None, ()
 
-    # Tracks YouTube Music lists with no video behind them.  Counted apart
-    # from ``walk.unreadable`` -- which is a failure -- because this one is
-    # the catalogue being honest about an unreleased track.
-    unplayable = 0
-    for release in artist.releases:
-        walk.check_deadline()
-        # A Single gets no album: its tracks become loose Singles under the
-        # artist rather than a folder each (see SINGLE_RELEASE_TYPE).
-        album = (
-            None
-            if release.release_type == SINGLE_RELEASE_TYPE
-            else _cap(release.title, MAX_FOLDER_NAME)
-        )
-        for track in release.tracks:
-            if track.video_id is None:
-                unplayable += 1
-                continue
-            track_url = watch_url(track.video_id)
-            row_source_id = _drop_if_over(ytmusic_source_id(track.video_id), MAX_SOURCE_ID)
-            walk.add(
-                EnumeratedTrack(
-                    id=row_source_id or track_url,
-                    url=track_url,
-                    source_id=row_source_id,
-                    title=_cap(track.title, MAX_TRACK_TITLE),
-                    album=album,
-                    duration=track.duration,
-                    thumbnail_url=_drop_if_over(release.thumbnail_url, MAX_PATH_LENGTH),
-                    unavailable_reason=(
-                        None if track.available else _cap("not available", MAX_REASON)
-                    ),
-                    # The release was read: a null album here is a Single with
-                    # no album, not an album nobody knew.
-                    album_final=True,
-                )
-            )
-
-    if not walk.rows or all(row.unavailable_reason for row in walk.rows):
+    enumeration = _enumeration_from_artist(artist, url, walk)
+    if enumeration is None:
         # A parsed artist page with nothing playable behind it.  yt-dlp may
         # still find uploads on the channel, so this is a fallback rather than
-        # an empty preview -- and a discography whose every row is unavailable
-        # is the same thing: :func:`probe` would raise ``EmptyCollection`` on
-        # it, when the channel's uploads may well be downloadable.
+        # an empty preview.
         logger.info("YouTube Music had no playable tracks for %s; using yt-dlp", url)
         return None, ()
-
-    notices = [
-        notice
-        for notice in (
-            _unreadable_notice(artist.unreadable_releases, "release"),
-            _unplayable_notice(unplayable),
-            (
-                f"Only the first {MAX_SUBCOLLECTIONS} releases were read; use "
-                "a narrower URL."
-                if artist.over_cap
-                else None
-            ),
-        )
-        if notice
-    ]
-    enumeration = Enumeration(
-        url=url,
-        title=_cap(artist.name, MAX_TRACK_TITLE),
-        artist=_cap(artist.name, MAX_FOLDER_NAME),
-        source="youtube",
-        rows=tuple(walk.rows),
-        notices=tuple(notices),
-    )
     _cache_put(canonical, enumeration)
     if artist.channel_id and artist.channel_id != channel_id:
         # ``get_artist`` takes either id -- the one in the pasted URL or the
@@ -1012,14 +1098,150 @@ def _ytmusic_enumeration(
         _cache_put(canonical_channel_url(artist.channel_id), enumeration)
     logger.info(
         "Probed %s through YouTube Music: %d row(s) over %d release(s), "
-        "%d unreadable release(s), %d unplayable track(s)",
+        "%d unreadable release(s)",
         url,
         len(enumeration.rows),
         len(artist.releases),
         artist.unreadable_releases,
-        unplayable,
     )
     return _with_notices(enumeration, tab_notice), ()
+
+
+def _spotify_enumeration(url: str, deadline: float) -> Enumeration:
+    """*url*'s artist, matched to a YouTube Music discography.
+
+    Spotify is not a source -- yt-dlp has no extractor for it and this app
+    holds no Spotify credentials -- so a Spotify URL is a *name lookup*: the
+    public page gives up the artist's display name (:mod:`app.spotify`), the
+    artist-filtered YouTube Music search turns that into a channel id, and the
+    discography behind it is the preview.  ``Enumeration.artist`` is the name
+    Spotify gave, because that is the artist folder the user came here to fill
+    and the field they are about to edit; the notice names the YouTube Music
+    artist that was actually enumerated, since the two catalogues are not the
+    same catalogue.
+
+    Every failure raises: there is nothing to fall back *to*.  A flat pass over
+    a Spotify URL would be refused by the extractor allowlist and, if it were
+    not, would say something in yt-dlp's voice about a site it cannot read.
+
+    The enumeration is cached twice, exactly as the channel branch caches:
+    under the canonical channel URL(s) -- *without* the Spotify name or notice,
+    so a later probe of the YouTube Music page gets the plain discography and
+    not somebody else's Spotify framing -- and under the *canonical* Spotify
+    URL with both, so the same artist pasted with another ``?si=`` or a locale
+    prefix is served without a second lookup.  As in the channel branch, the
+    entry stored under the channel keys carries whatever ``url`` was pasted,
+    and every reader re-stamps it -- :func:`probe`, :func:`_ytmusic_enumeration`
+    and this function -- so the URL a preview comes back with is always the one
+    the user is looking at.
+
+    Raises:
+        SpotifyProbeError: The URL is not a Spotify artist page, its name could
+            not be read, no YouTube Music artist matched it, or the artist that
+            did has nothing playable.
+        ProbeTimeout: The probe ran past its deadline.
+    """
+    target = spotify_url_target(url)
+    if target is None or not target.is_artist:
+        # Includes the URL shapes this module cannot parse at all: they are
+        # still Spotify URLs, and "here is what is supported" is the only
+        # useful thing to say about any of them.
+        raise SpotifyProbeError(UNSUPPORTED_KIND_MESSAGE)
+
+    # Under the *canonical* Spotify URL, because the same artist pasted with
+    # another ``?si=`` or a locale prefix is the same artist and should not pay
+    # for the lookup twice.  This entry carries the Spotify framing -- the
+    # Spotify name and the match notice -- while the plain discography stays on
+    # the canonical channel keys, so a later probe of the YouTube Music page
+    # still gets it unframed.
+    cached_view = _cache_get(target.canonical_url)
+    if cached_view is not None:
+        logger.info("Probe cache hit for %s via %s", url, target.canonical_url)
+        return replace(cached_view, url=url)
+
+    walk = _Walk(deadline=deadline)
+    walk.check_deadline()
+    try:
+        name = resolve_artist_name(target, check_deadline=walk.check_deadline)
+    except SpotifyUnavailable as exc:
+        logger.warning("Could not reach Spotify for %s: %s", url, exc)
+        raise SpotifyProbeError(SPOTIFY_NAME_MESSAGE) from exc
+    if name is None:
+        logger.info("Spotify gave no artist name for %s", url)
+        raise SpotifyProbeError(SPOTIFY_NAME_MESSAGE)
+    # Capped once, here, rather than only on the folder it ends up as: a page
+    # title is bounded by nothing but the response byte cap, and the
+    # folder-name cap is the bound every other artist string in this module
+    # honours.  It has to apply to the search query and to the error sentences
+    # below as much as to the folder.
+    name = _cap(name, MAX_FOLDER_NAME)
+
+    walk.check_deadline()
+    try:
+        match = search_artist(name, check_deadline=walk.check_deadline)
+        if match is None:
+            raise SpotifyProbeError(SPOTIFY_NO_MATCH_MESSAGE.format(name=name))
+        channel_id, matched_name = match
+
+        canonical = canonical_channel_url(channel_id)
+        enumeration = _cache_get(canonical)
+        if enumeration is not None:
+            logger.info("Probe cache hit for %s via %s", url, canonical)
+        else:
+            artist = fetch_artist(channel_id, check_deadline=walk.check_deadline)
+            if artist is None:
+                # The search called it an artist and ``get_artist`` disagreed;
+                # from here that is the same answer as no match at all.
+                raise SpotifyProbeError(SPOTIFY_NO_MATCH_MESSAGE.format(name=name))
+            enumeration = _enumeration_from_artist(artist, url, walk)
+            if enumeration is None:
+                raise SpotifyProbeError(
+                    SPOTIFY_NOTHING_PLAYABLE_MESSAGE.format(name=name)
+                )
+            _cache_put(canonical, enumeration)
+            if artist.channel_id and artist.channel_id != channel_id:
+                _cache_put(canonical_channel_url(artist.channel_id), enumeration)
+    except YouTubeMusicUnavailable as exc:
+        logger.warning("YouTube Music is unreachable (%s); %s cannot be matched", exc, url)
+        raise SpotifyProbeError(
+            SPOTIFY_YTMUSIC_UNAVAILABLE_MESSAGE.format(name=name)
+        ) from exc
+    except (ProbeTimeout, ProbeError):
+        # The deadline, the row cap and this function's own errors are answers
+        # in their own right and must reach the route unchanged.
+        raise
+    except Exception as exc:
+        # Last resort, the same one the channel branch takes: ``ytmusicapi``
+        # parses YouTube's internal JSON and the shapes it does not expect
+        # surface as whatever the library happens to raise.  There is no flat
+        # listing to fall back to here, so it becomes a 400 rather than a 500.
+        logger.exception("Matching %s to a YouTube Music artist failed unexpectedly", url)
+        # Its own sentence, not the no-match one: an artist *was* found and the
+        # library then fell over, so telling the user nothing matched their
+        # name would be a lie they cannot act on.
+        raise SpotifyProbeError(SPOTIFY_UNREADABLE_MESSAGE.format(name=name)) from exc
+
+    view = _with_notices(
+        replace(
+            enumeration,
+            url=url,
+            artist=name,
+        ),
+        SPOTIFY_MATCH_NOTICE.format(name=enumeration.artist or matched_name),
+    )
+    # Under the canonical Spotify URL as well as the canonical channel one:
+    # ``probe`` caches what it returns under the raw paste, and this is the
+    # entry that carries the Spotify framing for every spelling of the paste.
+    _cache_put(target.canonical_url, view)
+    logger.info(
+        "Probed %s through Spotify: %r matched %r (%s), %d row(s)",
+        url,
+        name,
+        matched_name,
+        channel_id,
+        len(view.rows),
+    )
+    return view
 
 
 def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
@@ -1033,6 +1255,13 @@ def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
     """
     walk = _Walk(deadline=deadline)
     walk.check_deadline()
+
+    # A Spotify URL never reaches yt-dlp: there is no extractor for one, and
+    # what a Spotify artist page is good for is its *name*, which YouTube Music
+    # is then searched for.  Raises rather than falling through, because a flat
+    # pass over the same URL has nothing to offer.
+    if is_spotify_url(url):
+        return _spotify_enumeration(url, deadline)
 
     # YouTube Music first for a channel URL: it knows the same artist as a
     # discography rather than as a pile of uploads.  Anything else -- and any

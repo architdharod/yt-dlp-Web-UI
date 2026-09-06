@@ -110,7 +110,8 @@ export function DownloadForm({
         <CardDescription>
           Paste a YouTube, SoundCloud, or Bandcamp URL. A single track is
           queued straight away; a playlist, album, or artist page opens a
-          checklist to pick from.
+          checklist to pick from. A Spotify artist link works too — it is
+          matched to that artist on YouTube Music.
         </CardDescription>
       </CardHeader>
       <CardContent>

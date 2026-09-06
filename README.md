@@ -8,7 +8,7 @@ This is a project for educational purpose, to learn the usage of the library yt-
 
 ## How It Works
 
-1. Paste a YouTube, SoundCloud or Bandcamp URL into the web UI, optionally specifying artist and album names.
+1. Paste a YouTube, SoundCloud or Bandcamp URL into the web UI (or a Spotify artist page, which is matched to that artist on YouTube Music), optionally specifying artist and album names.
    Submitting first asks `POST /download/probe` what is behind the URL.
 2. A single track queues as before: the backend extracts its metadata (title, thumbnail, duration) via yt-dlp and
    returns it immediately. A playlist, album or artist page opens a checklist instead — **Select all** / **Select
@@ -371,7 +371,8 @@ worth knowing:
 ## Limitations
 
 - **The collection preview is a flat extraction** — it is cheap, and it is thin: a row can only be marked unavailable when the flat pass says so. SoundCloud DRM is invisible to it (yt-dlp only meets the DRM in a full extraction), so such a track previews as available and then fails in its own child job with yt-dlp's DRM message. `POST /download` itself still takes a single track and rejects playlist and channel URLs; collections go through `POST /download/probe` and `POST /download/bulk`.
-- **YouTube, SoundCloud and Bandcamp only** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com`, `bandcamp.com` and their subdomains, and rejects everything else with a validation error. `music.youtube.com` is a subdomain of `youtube.com`, so YouTube Music URLs are already allowed and needed no widening. No Spotify or other sources.
+- **A fixed host allowlist** — enforced: the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`, `soundcloud.com`, `bandcamp.com` and their subdomains (plus `open.spotify.com`, below), and rejects everything else with a validation error. `music.youtube.com` is a subdomain of `youtube.com`, so YouTube Music URLs are already allowed and needed no widening.
+- **Spotify artist pages only, and nothing is downloaded from Spotify** — a pasted `open.spotify.com/artist/...` is read for the artist's *name* (the public oEmbed endpoint, then the page title; no credentials, no API key, no account), that name is searched on YouTube Music, and the top artist match's discography is what the preview shows. So the track list is YouTube Music's and **may differ from the Spotify discography**; the preview says which artist it matched and the artist field is editable. Spotify track, album and playlist URLs are rejected with a message naming what is supported, and `POST /download` refuses any Spotify URL — it is a single-track route.
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job finishes.
 - **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown as "already in library"; nothing in the library is replaced. A move onto an occupied path is refused the same way.
 - **No authentication** — designed for private/internal networks.

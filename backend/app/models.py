@@ -18,6 +18,13 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from app.spotify import (
+    SPOTIFY_HOST,
+    UNSUPPORTED_KIND_MESSAGE,
+    is_spotify_url,
+    spotify_url_target,
+)
+
 # Hosts (and their subdomains) that may be submitted for download.  The
 # backend also restricts yt-dlp's extractors, but rejecting at the API edge
 # gives the user an immediate, readable error and keeps the container from
@@ -30,7 +37,41 @@ ALLOWED_URL_HOSTS: tuple[str, ...] = (
     # which the ``endswith("." + allowed)`` test below covers; the bare domain
     # is listed so a label page pasted without a subdomain is accepted too.
     "bandcamp.com",
+    # Spotify is not a download source -- nothing is ever fetched from it but
+    # an artist's *name*, which the probe then searches YouTube Music for
+    # (:mod:`app.spotify`).  The bare ``spotify.com`` is deliberately not
+    # listed: the artist pages and the oEmbed endpoint are both on this one
+    # host, and no other Spotify subdomain has any business being fetched.
+    SPOTIFY_HOST,
 )
+
+# What ``POST /download`` says to a Spotify artist URL.  That route is one
+# track, and a Spotify artist page is a whole discography that only exists here
+# as a lookup; the preview is where it turns into something selectable.
+SPOTIFY_ARTIST_MESSAGE = (
+    "A Spotify artist URL is a whole discography, not a single track; it opens "
+    "a checklist to pick from. Paste a YouTube / YouTube Music / SoundCloud / "
+    "Bandcamp link for one track."
+)
+
+
+def reject_spotify_url(url: str) -> str:
+    """Return *url* unless it is a Spotify one, which no download can be.
+
+    Used by every field whose URL is handed to yt-dlp, which has no Spotify
+    extractor at all: ``POST /download``'s single track and ``POST
+    /download/bulk``'s children.  A Spotify URL in either would enqueue a job
+    that could only fail.  ``POST /download/probe`` accepts one (that is the
+    whole point of the phase), and so does the bulk request's own ``url`` --
+    there it is the parent's *display* URL, never extracted, while the
+    children carry the YouTube watch URLs the preview matched.
+    """
+    target = spotify_url_target(url)
+    if target is not None and target.is_artist:
+        raise PydanticCustomError("spotify_artist_url", SPOTIFY_ARTIST_MESSAGE)
+    if is_spotify_url(url):
+        raise PydanticCustomError("spotify_url", UNSUPPORTED_KIND_MESSAGE)
+    return url
 
 
 def validate_download_url(url: str) -> str:
@@ -142,7 +183,9 @@ class DownloadRequest(BaseModel):
     @field_validator("url")
     @classmethod
     def _check_url(cls, value: str) -> str:
-        return validate_download_url(value)
+        # The host allowlist first, then the one host on it that this route
+        # cannot serve: a Spotify URL is a preview, never a download.
+        return reject_spotify_url(validate_download_url(value))
 
 
 class Job(BaseModel):
@@ -878,7 +921,10 @@ class BulkTrack(BaseModel):
     @field_validator("url")
     @classmethod
     def _check_url(cls, value: str) -> str:
-        return validate_download_url(value)
+        # A child is handed to yt-dlp exactly as a single download is, so the
+        # same rejection applies: only the parent's *display* URL, on the bulk
+        # request itself, may be a Spotify one.
+        return reject_spotify_url(validate_download_url(value))
 
 
 class BulkDownloadRequest(BaseModel):

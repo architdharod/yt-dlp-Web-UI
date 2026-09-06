@@ -328,6 +328,30 @@ describe("CollectionPreview selection", () => {
     ).toBeTruthy();
   });
 
+  it("shows the Spotify match notice and the resolved artist", () => {
+    /**
+     * A Spotify artist URL previews the YouTube Music discography it was
+     * matched to: the artist field carries the name Spotify gave (it is the
+     * folder the tracks land in, and the user edits it here), and the notice
+     * names the artist that was actually enumerated.
+     */
+    renderPreview(
+      collectionPreview([previewRow("a")], {
+        url: "https://open.spotify.com/artist/4Z8W4fKeB5YxbusRsdQVPb",
+        artist: "Glass Beams",
+        notices: [
+          'Matched to the YouTube Music artist "Glass Beams"; its discography ' +
+            "may differ from the Spotify one. Edit the artist above if it is wrong.",
+        ],
+      }),
+    );
+
+    expect(screen.getByText(/Matched to the YouTube Music artist/)).toBeTruthy();
+    expect(
+      (screen.getByLabelText(/Artist/) as HTMLInputElement).value,
+    ).toBe("Glass Beams");
+  });
+
   it("names a title-less row by its URL", () => {
     renderPreview(collectionPreview([previewRow("a", { title: null })]));
 
