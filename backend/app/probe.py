@@ -64,7 +64,13 @@ import yt_dlp
 
 from app.bandcamp import artist_page_url as bandcamp_artist_page_url
 from app.bandcamp import resolve_artist_name as resolve_bandcamp_artist_name
+from app import rate_limit
 from app.downloader import _YtDlpLogger, base_opts, readable_ytdlp_message, ytdl
+from app.rate_limit import (
+    rate_limit_in_message,
+    rate_limit_status,
+    retry_after_seconds,
+)
 from app.models import (
     MAX_COLLECTION_TRACKS,
     MAX_CONCURRENT_PROBES,
@@ -262,6 +268,29 @@ class BandcampProbeError(ProbeError):
     """
 
 
+class RateLimitedProbeError(ProbeError):
+    """The source is refusing this server's requests for now.
+
+    Its own class for the same reason :class:`SpotifyProbeError` is one: the
+    route prefixes a plain :class:`ProbeError` with "Failed to probe", and
+    nothing failed -- YouTube is simply not answering this server at the moment
+    and will again in a minute.
+
+    Carries the *host* and any ``Retry-After`` so the caller, which is on the
+    event loop and may therefore touch lane state, can start or extend the hold
+    that :func:`probe` then refuses the next probe with.  The probe itself never
+    backs off and waits: a person is looking at the form, and a page that hangs
+    for eight minutes is worse than one that says "try again in 45 s".
+    """
+
+    def __init__(
+        self, message: str, host: str | None = None, retry_after: float | None = None
+    ) -> None:
+        super().__init__(message)
+        self.host = host
+        self.retry_after = retry_after
+
+
 class CollectionTooLarge(ProbeError):
     """More than :data:`~app.models.MAX_COLLECTION_TRACKS` rows would result."""
 
@@ -441,22 +470,56 @@ def _extract(url: str) -> dict:
         with ytdl({**_flat_opts(), "logger": log}) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.YoutubeDLError as exc:
-        raise _probe_error(str(exc)) from exc
+        raise _probe_error(str(exc), url, exc) from exc
     if info is None:
         # ``ignoreerrors`` turned the failure into a None; the reason only ever
         # reached the logger.
-        raise _probe_error(log.last_error or NOTHING_RETURNED_MESSAGE)
+        raise _probe_error(log.last_error or NOTHING_RETURNED_MESSAGE, url)
     return info
 
 
-def _probe_error(message: str) -> ProbeError:
+def _rate_limited_probe_error(host: str, exc: BaseException) -> RateLimitedProbeError:
+    """The rate-limit error for *host*, for a failure that is not yt-dlp's.
+
+    ``ytmusicapi`` raises ``YTMusicServerError("Server returned HTTP 429: ...")``
+    with no status attribute of its own, so the message is all there is; a 429
+    that YouTube serves as an HTML page arrives as a ``JSONDecodeError`` first
+    and cannot be told from a parse failure at all, which is the one case this
+    still misses.
+
+    The wait is filled in by :func:`probe`, which is on the event loop and is
+    the only place allowed to move lane state.
+    """
+    return RateLimitedProbeError(str(exc), host=host, retry_after=retry_after_seconds(exc))
+
+
+def _probe_error(
+    message: str, url: str, exc: BaseException | None = None
+) -> ProbeError:
     """yt-dlp's failure as the error the route should raise.
 
     Both of :func:`_extract`'s arms come through here, because which one a
     failure takes is yt-dlp's business: ``ignoreerrors`` decides whether a
     top-level error is raised or logged and turned into a ``None``, and the
     user's message must not depend on that.
+
+    That split is also why the rate-limit check is done twice over: on the
+    exception chain when there is one (structural, a real ``HTTPError.status``)
+    and on the message when ``ignoreerrors`` has already eaten it.
     """
+    limited = (
+        rate_limit_status(exc) is not None
+        if exc is not None
+        else rate_limit_in_message(message)
+    )
+    if limited:
+        host = rate_limit.source_for_host(url)
+        if host in rate_limit.LANE_HOSTS:
+            # The wait is filled in by :func:`probe`, which is on the event
+            # loop and is the only place allowed to move lane state.
+            return RateLimitedProbeError(
+                message, host=host, retry_after=retry_after_seconds(exc)
+            )
     readable = readable_ytdlp_message(message)
     if readable is not None:
         return BandcampProbeError(readable)
@@ -636,14 +699,12 @@ def _album_for(info: dict, url: str) -> str | None:
 def _source_of(info: dict, url: str) -> Source:
     """Which of the sources we say per-source things about this is."""
     extractor = str(info.get("extractor_key") or info.get("extractor") or "").casefold()
-    host = (urlsplit(url).hostname or "").casefold()
-    if extractor.startswith("youtube") or "youtube.com" in host or "youtu.be" in host:
-        return "youtube"
-    if extractor.startswith("soundcloud") or "soundcloud.com" in host:
-        return "soundcloud"
-    if extractor.startswith("bandcamp") or "bandcamp.com" in host:
-        return "bandcamp"
-    return "other"
+    for name in ("youtube", "soundcloud", "bandcamp"):
+        if extractor.startswith(name):
+            return name  # type: ignore[return-value]
+    # The host half lives in ``rate_limit`` so that the queue, which has a URL
+    # and no info dict, classifies a URL into exactly the same lane this does.
+    return rate_limit.source_for_host(url)  # type: ignore[return-value]
 
 
 def entry_artist(entry: dict) -> str | None:
@@ -907,6 +968,11 @@ def _walk(info: dict, url: str, album: str | None, walk: _Walk, depth: int) -> N
             walk.check_deadline()
             try:
                 sub = _extract(entry_url)
+            except RateLimitedProbeError:
+                # Not "this album could not be read": the source has stopped
+                # answering this server, so every remaining album would fail
+                # the same way and asking would only dig the hole deeper.
+                raise
             except ProbeError as exc:
                 logger.warning("Probe could not read %s: %s", entry_url, exc)
                 walk.unreadable += 1
@@ -1111,6 +1177,12 @@ def _ytmusic_enumeration(
     try:
         artist = fetch_artist(channel_id, check_deadline=walk.check_deadline)
     except YouTubeMusicUnavailable as exc:
+        # A 429 from YouTube Music is not "unreachable": falling back to the
+        # flat yt-dlp listing would fire a second burst at the same host that
+        # has just asked this server to stop, and the user would be shown a
+        # thinner preview with a notice that blames the library.
+        if rate_limit_status(exc) is not None:
+            raise _rate_limited_probe_error("youtube", exc) from exc
         logger.warning(
             "YouTube Music is unreachable (%s); falling back to the flat "
             "listing for %s",
@@ -1258,6 +1330,11 @@ def _spotify_enumeration(url: str, deadline: float) -> Enumeration:
             if artist.channel_id and artist.channel_id != channel_id:
                 _cache_put(canonical_channel_url(artist.channel_id), enumeration)
     except YouTubeMusicUnavailable as exc:
+        # As in the channel branch: a rate limit is its own answer, and one the
+        # user can act on ("try again in 45 s") rather than "YouTube Music is
+        # unavailable", which reads as a permanent fault.
+        if rate_limit_status(exc) is not None:
+            raise _rate_limited_probe_error("youtube", exc) from exc
         logger.warning("YouTube Music is unreachable (%s); %s cannot be matched", exc, url)
         raise SpotifyProbeError(
             SPOTIFY_YTMUSIC_UNAVAILABLE_MESSAGE.format(name=name)
@@ -1426,6 +1503,19 @@ def _pick_track_artist(info: dict) -> str | None:
     return _text(artist)
 
 
+def _lane_for_probe(url: str) -> str:
+    """The lane this probe will actually make its requests on.
+
+    Not the same as the URL's own host for Spotify: a Spotify artist page is
+    read once for a *name*, and everything after that is YouTube Music.  So a
+    held YouTube lane has to refuse a Spotify paste too, or the one route we
+    added a hold to keep quiet would be the one still hammering it.
+    """
+    if is_spotify_url(url):
+        return "youtube"
+    return rate_limit.source_for_host(url)
+
+
 async def probe(url: str, timeout: int | None = None) -> SingleTrack | Enumeration:
     """Classify *url* and, for a collection, enumerate it.
 
@@ -1459,6 +1549,17 @@ async def probe(url: str, timeout: int | None = None) -> SingleTrack | Enumerati
         # is looking at.
         return replace(cached, url=url)
 
+    # Refused before a single request goes out: the queue is already waiting
+    # this host's limiter out, and a probe is a burst of requests -- one per
+    # album on an artist page -- so letting one through would extend the very
+    # hold the user is waiting on.  Below the cache lookup, because a cached
+    # answer costs the source nothing and should still be served.
+    host = _lane_for_probe(url)
+    held = rate_limit.lanes.hold_message(host)
+    if held is not None:
+        logger.info("Refusing to probe %s: the %s lane is held", url, host)
+        raise RateLimitedProbeError(held, host=host)
+
     seconds = timeout if timeout is not None else probe_timeout_seconds()
     loop = asyncio.get_running_loop()
     async with _probe_slots:
@@ -1473,6 +1574,18 @@ async def probe(url: str, timeout: int | None = None) -> SingleTrack | Enumerati
         except asyncio.TimeoutError as exc:
             raise ProbeTimeout(
                 f"Reading this URL took longer than {seconds} seconds"
+            ) from exc
+        except RateLimitedProbeError as exc:
+            # The extraction ran in a worker thread, which must not touch lane
+            # state (an asyncio.Event set off the loop is not safe), so the
+            # hold is started here -- and the message is rebuilt from it, so
+            # the user is told the wait the queue is actually going to take.
+            if exc.host is None:
+                raise
+            wait = rate_limit.lanes.note_rate_limit(exc.host, exc.retry_after)
+            raise RateLimitedProbeError(
+                rate_limit.probe_message(exc.host, wait, rate_limit.REASON_RATE_LIMIT),
+                host=exc.host,
             ) from exc
 
     if isinstance(result, Enumeration):

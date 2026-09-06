@@ -250,9 +250,19 @@ class Job(BaseModel):
     detail: str | None = Field(
         None,
         description=(
-            "A note about a job that finished anyway, e.g. 'tags not fixed: no "
-            "match'.  Separate from ``error`` because it is not a failure: the "
-            "job is ``done`` and its file is in the library."
+            "A note about a job that is not a failure: 'tags not fixed: no "
+            "match' on a ``done`` row, or 'YouTube rate limit, retry 2 of 5 in "
+            "45 s' on one that is waiting out a rate limit.  Separate from "
+            "``error`` because the job has not failed."
+        ),
+    )
+    retry_at: datetime | None = Field(
+        None,
+        description=(
+            "When a job waiting out a rate limit will try again, so the UI can "
+            "count down without a tick event per second.  Memory-only, like "
+            "``progress``: a restart re-queues the job with a fresh attempt "
+            "budget, and a restored instant would be a lie."
         ),
     )
     artist: str | None = Field(None, description="Artist name (user-provided or from metadata)")
@@ -373,6 +383,30 @@ class SSEEvent(BaseModel):
 
 
 
+class NoticeAction(BaseModel):
+    """The one thing a notice offers the user to do about itself.
+
+    A route, not a symbol the frontend has to learn: the banner renders a
+    button labelled *label* that sends *method* to *path* and does nothing
+    else.  A notice with a new action therefore needs no frontend change --
+    which is the whole point, since the alternative was a switch on
+    ``source`` in the banner component.
+    """
+
+    label: str = Field(..., description="Button text, e.g. 'Resume now'")
+    method: Literal["POST"] = Field("POST", description="HTTP method to send")
+    # An absolute path on this API and nothing else.  The frontend turns this
+    # straight into a request, so the pattern is what stops a notice ever
+    # naming another origin -- "//evil.example/x" is a protocol-relative URL,
+    # not a path, and the character class refuses the ":" and "@" that would be
+    # needed to build one anyway.
+    path: str = Field(
+        ...,
+        pattern=r"^/[A-Za-z0-9/_.-]*$",
+        description="Backend path, relative to the API root",
+    )
+
+
 class Notice(BaseModel):
     """A standing complaint about one of the external services.
 
@@ -389,11 +423,57 @@ class Notice(BaseModel):
 
     id: str = Field(..., description="Unique id of this raising of the notice")
     level: Literal["error", "warning"] = Field(..., description="How loudly to show it")
-    source: Literal["navidrome", "lidarr"] = Field(
-        ..., description="The service the notice is about"
+    source: Literal["navidrome", "lidarr", "youtube", "soundcloud", "bandcamp"] = Field(
+        ..., description="The service or source the notice is about"
     )
     message: str = Field(..., description="Human-readable text; never contains a secret")
+    hold_until: str | None = Field(
+        None,
+        description=(
+            "For a rate-limit notice, when the hold lapses, ISO 8601 UTC. The "
+            "banner counts down from this rather than from the message, so the "
+            "notice does not have to be re-raised (and un-dismissed) every "
+            "second to stay current."
+        ),
+    )
+    reason: str | None = Field(
+        None,
+        description="'rate_limit' or 'bot_check' for a rate-limit notice",
+    )
+    held_since: str | None = Field(
+        None,
+        description="When this source first went into trouble, ISO 8601 UTC",
+    )
+    action: NoticeAction | None = Field(
+        None,
+        description=(
+            "A button the banner offers, if this notice has one thing the user "
+            "can do about it.  Absent on notices that are only information."
+        ),
+    )
     created_at: str = Field(..., description="When it was raised, ISO 8601 UTC")
+
+
+class LaneStatus(BaseModel):
+    """One source host's rate-limit lane, as ``POST /queue/lanes/{host}/resume``
+    answers.
+
+    The route's job is to clear a hold, so what it returns is the state it
+    left behind: ``held`` false and ``hold_until`` null on success, which is
+    also what an already-open lane answers with, so the button is idempotent.
+    """
+
+    host: str = Field(..., description="The source host, e.g. 'youtube'")
+    held: bool = Field(..., description="Whether the lane is still holding jobs back")
+    hold_until: str | None = Field(
+        None, description="When the hold lapses, ISO 8601 UTC; null when open"
+    )
+    reason: str | None = Field(
+        None, description="'rate_limit' or 'bot_check' while held; null when open"
+    )
+    consecutive: int = Field(
+        0, description="Consecutive rate limits on this lane; 0 when open"
+    )
 
 
 class HealthResponse(BaseModel):

@@ -135,6 +135,7 @@ class TestSchema:
         path = tmp_path / "queue.db"
         first = JobStore(path)
         first.upsert(_make_job(id="from-before"))
+        first._conn.execute("DROP TABLE lanes")
         first._conn.execute("ALTER TABLE jobs DROP COLUMN album_final")
         first._conn.execute("ALTER TABLE jobs DROP COLUMN detail")
         first._conn.execute("PRAGMA user_version = 1")
@@ -157,6 +158,7 @@ class TestSchema:
         path = tmp_path / "queue.db"
         first = JobStore(path)
         first.upsert(_make_job(id="from-before"))
+        first._conn.execute("DROP TABLE lanes")
         first._conn.execute("ALTER TABLE jobs DROP COLUMN album_final")
         first._conn.execute("PRAGMA user_version = 2")
         first._conn.close()

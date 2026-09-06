@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatDuration,
   formatRelativeTime,
+  withCountdown,
   formatSize,
   plural,
 } from "@/lib/format";
@@ -66,5 +67,53 @@ describe("formatRelativeTime", () => {
 
   it("treats a clock a little behind the backend as just now", () => {
     expect(ago("2026-09-04T12:00:05Z")).toBe("just now");
+  });
+});
+
+describe("withCountdown", () => {
+  const start = Date.parse("2026-09-06T12:00:00Z");
+
+  it("replaces the backend's seconds with what is left", () => {
+    expect(
+      withCountdown(
+        "YouTube rate limit, retry 2 of 5 in 45 s",
+        "2026-09-06T12:00:30Z",
+        start,
+      ),
+    ).toBe("YouTube rate limit, retry 2 of 5 in 30 s");
+  });
+
+  it("stops at zero rather than counting into the negative", () => {
+    expect(
+      withCountdown(
+        "YouTube rate limit, retry 2 of 5 in 45 s",
+        "2026-09-06T11:59:00Z",
+        start,
+      ),
+    ).toBe("YouTube rate limit, retry 2 of 5 in 0 s");
+  });
+
+  it("appends the countdown to a sentence that does not end in one", () => {
+    expect(withCountdown("Waiting", "2026-09-06T12:00:10Z", start)).toBe(
+      "Waiting in 10 s",
+    );
+  });
+
+  it("rewrites a sentence whose seconds are not introduced by 'in'", () => {
+    // The note a job waiting behind someone else's rate limit carries: it has
+    // spent no attempts of its own, so it says "waiting", not "retry N of M".
+    expect(
+      withCountdown(
+        "YouTube rate limit, waiting 45 s",
+        "2026-09-06T12:00:20Z",
+        start,
+      ),
+    ).toBe("YouTube rate limit, waiting 20 s");
+  });
+
+  it("leaves the sentence alone when the instant is unreadable", () => {
+    expect(withCountdown("Waiting in 45 s", "not a date", start)).toBe(
+      "Waiting in 45 s",
+    );
   });
 });

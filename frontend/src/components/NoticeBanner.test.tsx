@@ -4,14 +4,18 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { act } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { NoticeBanner } from "@/components/NoticeBanner";
-import { fetchNotices } from "@/lib/api";
+import { fetchNotices, runNoticeAction } from "@/lib/api";
 import { applyQueueEvent } from "@/lib/queueCache";
 import { queryKeys } from "@/lib/queryKeys";
 import type { Notice, SSEEvent } from "@/lib/types";
 
-vi.mock("@/lib/api", () => ({ fetchNotices: vi.fn() }));
+vi.mock("@/lib/api", () => ({
+  fetchNotices: vi.fn(),
+  runNoticeAction: vi.fn(),
+}));
 
 const fetchNoticesMock = vi.mocked(fetchNotices);
+const runNoticeActionMock = vi.mocked(runNoticeAction);
 
 function notice(overrides: Partial<Notice> = {}): Notice {
   return {
@@ -216,5 +220,157 @@ describe("NoticeBanner", () => {
     expect((await screen.findByRole("alert")).textContent).toMatch(
       /rejected the credentials/,
     );
+  });
+});
+
+
+describe("a notice that offers an action", () => {
+  const resume: Notice = {
+    id: "rl1",
+    level: "warning",
+    source: "youtube",
+    message: "YouTube is rate limiting this server. Downloads resume in 45 s.",
+    action: {
+      label: "Resume now",
+      method: "POST",
+      path: "/queue/lanes/youtube/resume",
+    },
+    created_at: "2026-09-06T12:00:00+00:00",
+  };
+
+  beforeEach(() => {
+    runNoticeActionMock.mockReset();
+    runNoticeActionMock.mockResolvedValue(undefined);
+  });
+
+  it("renders the button the notice names", async () => {
+    const client = renderBanner([resume]);
+    await settled(client);
+
+    expect(await screen.findByRole("button", { name: "Resume now" })).not.toBeNull();
+    expect(screen.queryByText(/YouTube:/)).not.toBeNull();
+  });
+
+  it("sends the route the notice carries, not one it knows", async () => {
+    const client = renderBanner([resume]);
+    await settled(client);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Resume now" }));
+
+    expect(runNoticeActionMock).toHaveBeenCalledWith(resume.action);
+  });
+
+  it("renders no button for a notice without an action", async () => {
+    const client = renderBanner([notice()]);
+    await settled(client);
+
+    await screen.findByText(/Navidrome:/);
+    expect(screen.queryByRole("button", { name: "Resume now" })).toBeNull();
+  });
+
+  it("keeps the banner up when the action fails", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    runNoticeActionMock.mockRejectedValue(new Error("nope"));
+    const client = renderBanner([resume]);
+    await settled(client);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Resume now" }));
+
+    await vi.waitFor(() => expect(errors).toHaveBeenCalled());
+    expect(screen.queryByText(/YouTube:/)).not.toBeNull();
+    errors.mockRestore();
+  });
+
+  it("comes back after a dismiss when the hold changes", async () => {
+    const client = renderBanner([resume]);
+    await settled(client);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Dismiss the YouTube message/ }),
+    );
+    expect(screen.queryByText(/YouTube:/)).toBeNull();
+
+    // The backend re-raises with a fresh id every time the hold moves.
+    deliver(client, noticesEvent({ ...resume, id: "rl2" }));
+    expect(await screen.findByText(/YouTube:/)).not.toBeNull();
+  });
+});
+
+describe("a rate-limit notice counts itself down", () => {
+  function limitNotice(overrides: Partial<Notice> = {}): Notice {
+    return {
+      id: "rl1",
+      level: "warning",
+      source: "youtube",
+      message:
+        "YouTube is rate limiting this server. Downloads from YouTube are paused.",
+      hold_until: "2026-09-06T12:01:00Z",
+      reason: "rate_limit",
+      held_since: "2026-09-06T12:00:00Z",
+      action: {
+        label: "Resume now",
+        method: "POST",
+        path: "/queue/lanes/youtube/resume",
+      },
+      created_at: "2026-09-06T12:00:00Z",
+      ...overrides,
+    };
+  }
+
+  it("renders the seconds left and ticks them down", async () => {
+    // Fake timers from before the render, so the banner's interval is one of
+    // them; `shouldAdvanceTime` keeps the clock running so the notices query
+    // can still settle.
+    const start = Date.parse("2026-09-06T12:00:00Z");
+    vi.useFakeTimers({ now: start, shouldAdvanceTime: true });
+    try {
+      const client = renderBanner([
+        limitNotice({ hold_until: new Date(start + 60_000).toISOString() }),
+      ]);
+      await settled(client);
+      expect((await screen.findByRole("status")).textContent).toMatch(
+        /Resuming in (59|60) s\./,
+      );
+
+      act(() => {
+        vi.setSystemTime(start + 30_000);
+        vi.advanceTimersByTime(1000);
+      });
+      expect(screen.getByRole("status").textContent).toMatch(
+        /Resuming in (29|30) s\./,
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not count down a bot check", async () => {
+    const client = renderBanner([
+      limitNotice({
+        id: "bc1",
+        level: "error",
+        reason: "bot_check",
+        message: "YouTube asked this server to sign in.",
+      }),
+    ]);
+    await settled(client);
+
+    const row = await screen.findByRole("alert");
+    expect(row.textContent).toMatch(/asked this server to sign in/);
+    expect(row.textContent).not.toMatch(/Resuming in/);
+  });
+
+  it("keeps the same id, and stays dismissed, across a redelivery", async () => {
+    const client = renderBanner([limitNotice()]);
+    await settled(client);
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Dismiss the YouTube message/ }),
+    );
+    expect(screen.queryByRole("status")).toBeNull();
+
+    // The backend re-sends the open set without re-raising: same id.
+    deliver(client, noticesEvent(limitNotice()));
+
+    expect(screen.queryByRole("status")).toBeNull();
   });
 });

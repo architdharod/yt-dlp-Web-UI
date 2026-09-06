@@ -85,6 +85,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from app.downloader import (
+    CANCELLED_MESSAGE,
     FFMPEG_TERMINATE_GRACE_SECONDS,
     CancelToken,
     DownloadError,
@@ -110,6 +111,20 @@ from app.models import (
     JobStatus,
     SSEEvent,
 )
+from app import rate_limit
+from app.rate_limit import (
+    LaneManager,
+    LaneRecord,
+    bot_check_message,
+    ceiling_message,
+    gave_up_message,
+    is_bot_check,
+    lane_for_url,
+    rate_limit_attempts,
+    rate_limit_status,
+    retry_after_seconds,
+    wait_detail,
+)
 from app.tagger import (
     NOTE_CANCELLED,
     NOTE_FAILED,
@@ -126,6 +141,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_CONCURRENT_DOWNLOADS = 2
 DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 900  # 15 minutes
+
+# How many downloads from one lane host may run at once, whatever
+# MAX_CONCURRENT_DOWNLOADS says.  Only YouTube has one: it is the source that
+# actually rate limits this app, and five simultaneous children of one playlist
+# is what earns the 429.  Two is enough to keep a fast line busy and low enough
+# that a large playlist looks like a person with two tabs open.
+#
+# Hosts without an entry are uncapped and fill whatever download slots are left.
+LANE_CONCURRENCY: dict[str, int] = {"youtube": 2}
 
 # How long one automatic tag fix may take before it is abandoned.  Its own
 # bound, deliberately not covered by DOWNLOAD_TIMEOUT_SECONDS: that timeout is
@@ -357,10 +381,45 @@ class _ActiveRun:
     """
 
     cancel: CancelToken = field(default_factory=CancelToken)
+    # The loop-side twin of ``cancel``.  ``CancelToken`` is a threading
+    # primitive, which is right for the download thread and useless to a
+    # coroutine parked on a rate-limit wait: awaiting a threading.Event would
+    # need a thread of its own.  Both are set together by :meth:`_cancel_run`,
+    # which always runs on the event-loop thread, so setting an asyncio.Event
+    # from there is safe.  The ceiling sets this one too, with
+    # ``lane_failure`` naming the reason, which is how a lane that has given up
+    # ends the jobs waiting on it without pretending they were cancelled.
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    lane_failure: str | None = None
     finished: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     filed: FiledTrack | None = None
     disowned: bool = False
+
+
+class _DownloadSlot:
+    """One job's hold on a global download slot, releasable mid-run.
+
+    ``async with semaphore`` cannot express "give this back for a while and
+    take it again later", which is exactly what a job waiting out a rate limit
+    has to do: it is not downloading, and a SoundCloud job should be able to
+    use the slot in the meantime.  Idempotent both ways, so the owner's
+    ``finally`` can release unconditionally however the run ended.
+    """
+
+    def __init__(self, semaphore: asyncio.Semaphore) -> None:
+        self._semaphore = semaphore
+        self._held = False
+
+    async def acquire(self) -> None:
+        if not self._held:
+            await self._semaphore.acquire()
+            self._held = True
+
+    def release(self) -> None:
+        if self._held:
+            self._held = False
+            self._semaphore.release()
 
 
 class QueueManager:
@@ -385,6 +444,7 @@ class QueueManager:
         on_event: Callable[[SSEEvent], None] | None = None,
         store: JobStore | None = None,
         tag_fix_timeout: int | None = None,
+        lanes: LaneManager | None = None,
     ) -> None:
         if max_concurrent is None:
             max_concurrent = _env_int("MAX_CONCURRENT_DOWNLOADS", DEFAULT_MAX_CONCURRENT_DOWNLOADS)
@@ -400,6 +460,31 @@ class QueueManager:
         self._timeout = timeout
         self._tag_fix_timeout = tag_fix_timeout
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        # The per-host caps, and the lane state they belong to.
+        #
+        # Order of acquisition is lane slot *first*, then the global slot, and
+        # that way round for two reasons.  It cannot deadlock: a job only ever
+        # waits for the global semaphore while holding a lane slot, and every
+        # holder of a global slot already has its lane slot, so there is no
+        # cycle.  And it does not starve: five queued YouTube jobs take two
+        # lane slots and two global slots, leaving three global slots for
+        # SoundCloud and Bandcamp.  The other order would have all five sitting
+        # on global slots with three of them unable to proceed, which turns a
+        # per-host cap into a queue-wide stall.
+        #
+        # The two are also given up differently while a job waits out a rate
+        # limit.  The *lane* slot is kept -- it is the cap that stops the next
+        # job of that host walking into the same limiter, which is the whole
+        # point of the lane.  The *download* slot is released: a parked job is
+        # not downloading, and holding it would let two waiting YouTube jobs
+        # stop a Bandcamp job from starting for eight minutes.  See
+        # :class:`_DownloadSlot`.
+        self._lane_semaphores = {
+            host: asyncio.Semaphore(limit) for host, limit in LANE_CONCURRENCY.items()
+        }
+        self._lanes = lanes if lanes is not None else rate_limit.lanes
+        self._lanes.set_callbacks(on_ceiling=self._on_lane_ceiling)
+        self._rate_limit_attempts = rate_limit_attempts()
         # The single tagging slot.  A lock rather than a Semaphore(1) because
         # asyncio's lock hands ownership to waiters in the order they arrived,
         # which is the FIFO the ticket asks for: two downloads that finish
@@ -456,8 +541,12 @@ class QueueManager:
         holding up shutdown for.  A fix submitted from here on is answered with
         the cancelled note instead of being started, and the flag is never
         cleared: a closed queue stays closed.
+
+        The lane watchdog goes with it: it is a task of ours, and a held lane
+        has nothing left to hold back.
         """
         self._closed = True
+        self._lanes.close()
 
     # ------------------------------------------------------------------
     # Public API
@@ -1382,6 +1471,31 @@ class QueueManager:
             job.progress = 0.0
             self._persist(job)
             return
+        if job.status is JobStatus.DOWNLOADING and self._was_only_waiting(job):
+            # It was parked on a rate-limit hold, not downloading.  Charging it
+            # a restart attempt would mean three restarts during one long hold
+            # could fail a job that had never been given a chance to run, so it
+            # is re-queued the way a cancel is: no attempt, no restart attempt.
+            #
+            # The lane is read as it is *now*, which can be generous in one
+            # direction: a job that really was downloading when the process
+            # stopped is exempted too, if the lane happens to be held at boot.
+            # That is the safe way round -- the cost is one uncounted restart
+            # for a job that will be retried anyway, against failing a job that
+            # did nothing wrong.
+            logger.info(
+                "Job %s was waiting out a %s rate limit when the process "
+                "stopped, re-queuing it without spending an attempt",
+                job.id,
+                lane_for_url(job.url or ""),
+            )
+            job.status = JobStatus.QUEUED
+            job.error = None
+            job.detail = None
+            job.progress = 0.0
+            job.finished_at = None
+            self._persist(job)
+            return
         job.attempts += 1
         job.restart_attempts += 1
         if job.restart_attempts >= MAX_RESTART_ATTEMPTS:
@@ -1409,6 +1523,18 @@ class QueueManager:
             # unresolved and block every move until it ran.
         job.finished_at = None
         self._persist(job)
+
+    def _was_only_waiting(self, job: Job) -> bool:
+        """Whether *job* was parked on its source's rate-limit hold.
+
+        Read off the lane rather than off the row, because the row cannot say
+        it: ``retry_at`` is memory-only by design and a ``detail`` is a string
+        anyone could have written.  ``LaneManager.attach_store`` runs before
+        the restore (see the app lifespan), so a hold that survived the restart
+        is already loaded by the time this is asked.
+        """
+        host = lane_for_url(job.url or "")
+        return host is not None and self._lanes.is_held(host)
 
     def _recover_tagging(self, job: Job) -> None:
         """Decide what a row interrupted mid-tag-fix does now.
@@ -1643,14 +1769,40 @@ class QueueManager:
             await self._run_tagging_stage(job_id)
 
     async def _run_download_stage(self, job_id: str) -> bool:
-        """Download the track inside a concurrency slot.
+        """Download the track inside a lane slot and a concurrency slot.
 
         Returns ``True`` when the job is now in ``tagging`` with a file waiting
         for the fix, and ``False`` when it has already reached a terminal
         status here.
+
+        The lane slot comes first; see ``self._lane_semaphores`` for why that
+        order is the one that neither deadlocks nor starves.
         """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return False
+        host = lane_for_url(job.url or "")
+        lane_slot = self._lane_semaphores.get(host) if host is not None else None
+        if lane_slot is None:
+            return await self._download_in_slot(job_id, host)
+        async with lane_slot:
+            return await self._download_in_slot(job_id, host)
+
+    async def _download_in_slot(self, job_id: str, host: str | None) -> bool:
+        """The download stage proper, once this job's lane slot is held.
+
+        The download slot is taken here and given back in the ``finally``, but
+        it is not held continuously: :meth:`_download_with_backoff` hands it
+        back for the duration of a rate-limit wait and takes it again before
+        the next attempt.  Every path that reads or writes the job's verdict
+        below still runs with the slot held, including the timeout drain --
+        which is what keeps the number of live download threads at
+        ``max_concurrent``.
+        """
+        slot = _DownloadSlot(self._semaphore)
         # Wait for a concurrency slot (job stays QUEUED while waiting)
-        async with self._semaphore:
+        await slot.acquire()
+        try:
             # Re-fetch: the job may have been pruned or changed while waiting
             job = self._jobs.get(job_id)
             if job is None or job.status != JobStatus.QUEUED:
@@ -1668,10 +1820,7 @@ class QueueManager:
             self._update_status(job_id, JobStatus.DOWNLOADING)
 
             try:
-                await asyncio.wait_for(
-                    self._run_download(job_id, run),
-                    timeout=self._timeout,
-                )
+                await self._download_with_backoff(job_id, run, host, slot)
 
                 # The thread has exited without the loop disowning it, so the
                 # track it filed is the job's result.  Recorded before the DONE
@@ -1763,11 +1912,242 @@ class QueueManager:
                 self._fail(job_id, f"Unexpected error: {exc}")
                 await self._disown_run(job_id, run)
                 return False
+        finally:
+            # Unconditional, and idempotent: the backoff loop may already have
+            # given the slot back on its way out of a wait.
+            slot.release()
 
         # The success path fell through without reaching either status: the job
         # was cancelled or failed from under it, and whoever did that already
         # wrote its verdict.
         return False
+
+    # ------------------------------------------------------------------
+    # Rate limits
+    # ------------------------------------------------------------------
+
+    async def _download_with_backoff(
+        self,
+        job_id: str,
+        run: _ActiveRun,
+        host: str | None,
+        slot: "_DownloadSlot",
+    ) -> None:
+        """Attempt the download, waiting out this host's rate limit as needed.
+
+        One ``asyncio.wait_for`` per *attempt*, which is the whole reason this
+        is a loop rather than a sleep inside :meth:`_run_download`: time spent
+        waiting for a rate limit is not time spent downloading, and must not
+        come out of ``DOWNLOAD_TIMEOUT_SECONDS``.  A job that waits eight
+        minutes and then downloads for ten has not timed out.
+
+        The wait is *lane*-global: the hold and its schedule live on the lane
+        (a 429 is about this server and that host, not about this track), while
+        the attempt budget is per job.  A job that burns its budget ends
+        ``error`` and leaves the lane held, so the jobs behind it stay queued
+        and spend nothing.
+
+        A waiting job keeps its *lane* slot and gives back its *download* slot.
+        Keeping the lane slot is what stops the next job of the same host
+        taking its place and walking into the same limiter; keeping the
+        download slot as well would mean two parked YouTube jobs could stop a
+        Bandcamp job from starting for eight minutes, which the lane was never
+        meant to do.  The slot is re-taken *outside* ``wait_for``, so queueing
+        for it does not come out of the download timeout either.
+
+        Raises:
+            DownloadError: The download failed, was cancelled, the lane gave up
+                on it (the ceiling), or its rate-limit attempts ran out.
+            asyncio.TimeoutError: One attempt outlived the download timeout.
+        """
+        if host is None:
+            # No lane: nothing to wait for, and nothing to learn from a 429 we
+            # would have nowhere to record.  One attempt, as before.
+            await asyncio.wait_for(
+                self._run_download(job_id, run), timeout=self._timeout
+            )
+            return
+
+        budget = self._rate_limit_attempts
+        spent = 0
+        started = time.monotonic()
+
+        def announce(seconds: float | None) -> None:
+            # The attempt number is this job's own budget, so it is only
+            # offered once the job has actually spent some of it: a job that is
+            # merely waiting behind someone else's 429 has made no attempts and
+            # must not be told it is on "retry 1 of 5".
+            self._announce_wait(
+                job_id,
+                host,
+                seconds,
+                attempt=(spent + 1) if spent else None,
+                budget=budget,
+            )
+
+        try:
+            while True:
+                # The gate.  Returns at once on an open lane; on a held one it
+                # parks until the hold elapses and this job is the canary the
+                # lane elected -- the oldest waiter, and the only one that
+                # spends an attempt finding out whether the limiter has let go.
+                #
+                # The download slot goes back for the duration of the wait and
+                # is re-taken before this returns; see the docstring.
+                await self._lanes.wait_turn(
+                    host,
+                    job_id,
+                    run.cancel_event,
+                    on_wait=announce,
+                    on_block=slot.release,
+                    on_unblock=slot.acquire,
+                )
+                if run.lane_failure is not None:
+                    # The ceiling fired while this job was waiting.
+                    raise DownloadError(run.lane_failure)
+                if run.cancel_event.is_set():
+                    raise DownloadError(CANCELLED_MESSAGE)
+                self._clear_wait(job_id)
+
+                try:
+                    await asyncio.wait_for(
+                        self._run_download(job_id, run), timeout=self._timeout
+                    )
+                except DownloadError as exc:
+                    if is_bot_check(exc):
+                        # No attempt is spent and nothing is retried: every
+                        # automatic try against the sign-in wall is one more
+                        # strike, and the wall does not lapse on its own.
+                        self._lanes.note_bot_check(host)
+                        raise DownloadError(bot_check_message(host)) from exc
+                    status = rate_limit_status(exc)
+                    if status is None:
+                        raise
+                    spent += 1
+                    wait = self._lanes.note_rate_limit(
+                        host, retry_after_seconds(exc)
+                    )
+                    logger.info(
+                        "Job %s was rate limited by %s (attempt %d of %d); "
+                        "its lane is held for %.0f s",
+                        job_id,
+                        host,
+                        spent,
+                        budget,
+                        wait,
+                    )
+                    if spent >= budget:
+                        # The lane stays held on the way out: this job is done
+                        # trying, the limiter is not done limiting.
+                        raise DownloadError(
+                            gave_up_message(
+                                host, budget, time.monotonic() - started
+                            )
+                        ) from exc
+                    continue
+                return
+        finally:
+            self._lanes.leave(host, job_id)
+            self._clear_wait(job_id)
+
+    def _announce_wait(
+        self,
+        job_id: str,
+        host: str,
+        seconds: float | None,
+        attempt: int | None,
+        budget: int,
+    ) -> None:
+        """Show the countdown on a job that is waiting out a rate limit.
+
+        One event per *state* of the wait, not one per second: ``retry_at`` is
+        an absolute instant, so the frontend renders the countdown itself and
+        the backend says nothing more until the wait changes shape -- extended
+        by another 429, or elapsed into a canary probe.  The alternative -- a
+        tick every five seconds per waiting job -- is the same information at N
+        times the SSE traffic.
+
+        *seconds* is ``None`` while the lane is probing: the hold has gone and
+        one job is finding out whether the limiter has, so there is nothing to
+        count down to and the row says what it is waiting for instead.
+
+        ``detail`` is a stored column and is written through, so a client that
+        refetches mid-wait sees the same sentence.  ``retry_at`` is
+        memory-only, like ``progress``: after a restart the job re-queues and
+        starts a fresh budget, so a stale instant would be a lie.
+        """
+        job = self._jobs.get(job_id)
+        if job is None or job.status in _TERMINAL:
+            return
+        job.detail = wait_detail(host, seconds, attempt, budget)
+        job.retry_at = (
+            None if seconds is None else self._lanes.now() + timedelta(seconds=seconds)
+        )
+        self._persist(job)
+        self._emit_event("progress", job)
+
+    def _clear_wait(self, job_id: str) -> None:
+        """Take the wait note off a job whose wait is over.
+
+        The invariant this relies on: ``retry_at`` and a wait ``detail`` are
+        only ever written together, by :meth:`_announce_wait`, and no other
+        writer of ``detail`` sets ``retry_at``.  So a job that has one has the
+        other, and clearing both here cannot take away a note that came from
+        somewhere else -- except in the probing state, which has the detail and
+        no instant, hence the second half of the guard.
+        """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        if job.retry_at is None and not self._is_wait_detail(job):
+            return
+        job.retry_at = None
+        job.detail = None
+        self._persist(job)
+        self._emit_event("progress", job)
+
+    @staticmethod
+    def _is_wait_detail(job: Job) -> bool:
+        """Whether *job*'s note is one :meth:`_announce_wait` wrote."""
+        return bool(job.detail) and " rate limit, " in job.detail
+
+    def _on_lane_ceiling(self, host: str, reason: str | None) -> None:
+        """Fail everything on a lane that has been in trouble for over an hour.
+
+        Called by :class:`~app.rate_limit.LaneManager`'s watchdog after it has
+        already reset the lane, so the jobs failed here are the last of it:
+        *parked* jobs are told through their run (``lane_failure`` names the
+        reason, so the stage fails them rather than treating it as a cancel),
+        and jobs still queued behind the lane's concurrency cap are failed
+        outright -- they never started, and there is nothing to unwind.
+
+        Queued and parked, and nothing else.  A canary that is mid-attempt when
+        the ceiling fires is left alone: it is a request that is in the air, it
+        may well be the one that gets through, and killing it would be the one
+        thing guaranteed to waste the hour that has just been spent waiting.
+        It keeps its own attempt budget, and if it comes back with another 429
+        that 429 starts a fresh episode on the now-reset lane -- a new
+        ``held_since``, a 30 s hold, and another hour before this can fire
+        again.  That is deliberate: the ceiling is about a queue that has
+        stopped moving, and a lane with a live request on it has not.
+        """
+        message = ceiling_message(host, reason)
+        for waiting_id in self._lanes.waiting(host):
+            run = self._active_runs.get(waiting_id)
+            if run is None:
+                continue
+            run.lane_failure = message
+            run.cancel_event.set()
+        for job in list(self._jobs.values()):
+            if job.kind is not JobKind.DOWNLOAD or job.status is not JobStatus.QUEUED:
+                continue
+            if lane_for_url(job.url or "") != host:
+                continue
+            self._fail(job.id, message)
+
+    def resume_lane(self, host: str) -> LaneRecord:
+        """Clear *host*'s hold and let one waiting job through.  The button."""
+        return self._lanes.resume(host)
 
     async def _run_download(self, job_id: str, run: _ActiveRun) -> None:
         """Run the synchronous ``download_audio`` call in a thread executor
@@ -1779,6 +2159,27 @@ class QueueManager:
         """
         job = self._jobs[job_id]
         last_whole_percent = -1
+        host = lane_for_url(job.url or "")
+        loop = asyncio.get_running_loop()
+        lane_reported = False
+
+        def lane_ok() -> None:
+            """Tell the lane this host is answering again.
+
+            Called from the download thread the first time yt-dlp reports
+            anything at all -- the info dict arriving (``metadata``) or the
+            first byte (``progress``).  That, not the end of the download, is
+            the moment the limiter has demonstrably let go, and waiting until
+            the end would keep every other job of this host parked behind a
+            canary that is merely slow.
+
+            Hops onto the event loop, because lane state belongs to it.
+            """
+            nonlocal lane_reported
+            if lane_reported or host is None:
+                return
+            lane_reported = True
+            loop.call_soon_threadsafe(self._lanes.note_success, host)
 
         # Both callbacks run on the download thread, which the timeout path does
         # not wait for before writing the job's verdict, so each starts by
@@ -1791,6 +2192,7 @@ class QueueManager:
                 return  # the job is over; nothing it reports now is news
             if run.cancel.is_set():
                 return  # job is stopping; don't resurrect its progress
+            lane_ok()
             job.progress = percentage
             # yt-dlp calls this per chunk; only emit when the visible
             # percentage changes to keep SSE traffic sane.
@@ -1812,6 +2214,9 @@ class QueueManager:
             if phase == "converting":
                 self._update_status(job_id, JobStatus.CONVERTING)
             elif phase == "metadata":
+                # The info dict arrived, which means the extraction got
+                # through: whatever was holding this host back has let go.
+                lane_ok()
                 # The downloader has just backfilled title/duration/thumbnail
                 # on the job; those are stored columns, so write before emit.
                 self._persist(job)
@@ -2382,6 +2787,10 @@ class QueueManager:
         # checkpoints.
         if run is not None:
             run.cancel.cancel()
+            # The loop-side twin, which is what a job parked on a rate-limit
+            # wait is actually watching.  Set from the event-loop thread, which
+            # every caller of this method is on.
+            run.cancel_event.set()
 
     async def _disown_run(self, job_id: str, run: _ActiveRun) -> None:
         """Give up ownership of *run* now that its job has a final status.
@@ -2620,10 +3029,18 @@ class QueueManager:
         }
         if job.error:
             data["error"] = job.error
-        if job.detail:
-            # Only on `done` rows today ("tags not fixed: ..."), and absent
-            # rather than null when there is nothing to say, like `error`.
-            data["detail"] = job.detail
+        # Always present, and null when there is nothing to say -- not absent,
+        # the way `error` is.  A note is now something that is taken *back* as
+        # well as given: a job waiting out a rate limit carries one for the
+        # length of the wait and then stops, so a client has to be able to tell
+        # "there is no longer a note" from "this event does not mention the
+        # note", and only an explicit null says the first.
+        data["detail"] = job.detail or None
+        # Always present for the same reason, and null for every job that is
+        # not waiting out a rate limit.
+        data["retry_at"] = (
+            job.retry_at.isoformat() if job.retry_at is not None else None
+        )
 
         event = SSEEvent(event=event_type, job_id=job.id, data=data)
         self._on_event(event)

@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { QueueDisplay } from "@/components/QueueDisplay";
 import { cancelJob, dismissJob, retryJob } from "@/lib/api";
@@ -426,5 +426,63 @@ describe("a bulk collection in the queue", () => {
     ]);
 
     expect(screen.getByText("Job already finished")).toBeTruthy();
+  });
+});
+
+describe("a job waiting out a rate limit", () => {
+  function limitedJob(overrides: Partial<Job> = {}): Job {
+    return {
+      id: "dl-1",
+      kind: "download",
+      parent_id: null,
+      url: "https://www.youtube.com/watch?v=x",
+      status: "downloading",
+      title: "Horizon",
+      thumbnail_url: null,
+      duration: 210,
+      progress: 0,
+      error: null,
+      artist: "Glass Beams",
+      album: null,
+      created_at: "2026-09-06T12:00:00Z",
+      ...overrides,
+    };
+  }
+
+  it("counts down from retry_at rather than from the sentence", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-06T12:00:00Z"));
+    try {
+      renderQueue([
+        limitedJob({
+          detail: "YouTube rate limit, retry 2 of 5 in 45 s",
+          retry_at: "2026-09-06T12:00:45Z",
+        }),
+      ]);
+
+      expect(
+        screen.getByText("YouTube rate limit, retry 2 of 5 in 45 s"),
+      ).toBeTruthy();
+
+      act(() => {
+        // advanceTimersByTime moves the clock too, so this lands on 12:00:15.
+        vi.setSystemTime(new Date("2026-09-06T12:00:14Z"));
+        vi.advanceTimersByTime(1000);
+      });
+
+      expect(
+        screen.getByText("YouTube rate limit, retry 2 of 5 in 30 s"),
+      ).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a note without a countdown unchanged", () => {
+    renderQueue([
+      limitedJob({ status: "error", detail: "tags not fixed: no match" }),
+    ]);
+
+    expect(screen.getByText("tags not fixed: no match")).toBeTruthy();
   });
 });

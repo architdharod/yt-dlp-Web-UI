@@ -409,31 +409,34 @@ def _install_ydl_mocks(
     thumbnail_bytes=None,
     thumbnail_suffix=".webp",
 ):
-    """Wire a mocked ``YoutubeDL`` class for the two contexts download_audio opens.
+    """Wire a mocked ``YoutubeDL`` for the one context download_audio opens.
 
-    The first context answers the metadata-only ``extract_info``; the second
-    answers ``extract_info(url, download=True)``.  Unless *create_file* is False
-    the second one also creates what yt-dlp would have left in the scratch
-    directory: the *raw* best-audio stream, in whatever container the site
-    served (hence *audio_suffix* -- yt-dlp runs no postprocessors any more, so
-    this is never a FLAC unless the site itself served one), reported back in
-    ``requested_downloads[0]["filepath"]``, plus the ``writethumbnail`` sidecar
-    when *thumbnail_bytes* is given.
+    One, not two: since phase 15 the page is read once
+    (``extract_info(url, download=False)``) and the resulting info dict is
+    handed back to yt-dlp to download from (``process_ie_result(info,
+    download=True)``), because two extractions per child is what earns a 429
+    on a large playlist.
 
-    Returns ``(extract_ydl, download_ydl)``.
+    Unless *create_file* is False the download call also creates what yt-dlp
+    would have left in the scratch directory: the *raw* best-audio stream, in
+    whatever container the site served (hence *audio_suffix* -- yt-dlp runs no
+    postprocessors any more, so this is never a FLAC unless the site itself
+    served one), reported back in ``requested_downloads[0]["filepath"]``, plus
+    the ``writethumbnail`` sidecar when *thumbnail_bytes* is given.
+
+    Returns ``(ydl, ydl)`` -- the same mock twice, so that callers written when
+    there were two of them still read naturally.
     """
-    extract_ydl = MagicMock()
+    ydl = MagicMock()
     if extract_error is not None:
-        extract_ydl.extract_info.side_effect = extract_error
+        ydl.extract_info.side_effect = extract_error
     else:
-        extract_ydl.extract_info.return_value = info
+        ydl.extract_info.return_value = info
 
-    download_ydl = MagicMock()
-
-    def fake_download(url, download=False):
+    def fake_download(result_info, download=False):
         if download_error is not None:
             raise download_error
-        result = dict(info or {})
+        result = dict(result_info or {})
         if not create_file:
             return result
         opts = mock_ydl_cls.call_args_list[-1][0][0]
@@ -449,19 +452,13 @@ def _install_ydl_mocks(
         result["requested_downloads"] = [{"filepath": str(target)}]
         return result
 
-    download_ydl.extract_info.side_effect = fake_download
+    ydl.process_ie_result.side_effect = fake_download
 
-    mock_ydl_cls.side_effect = [
-        MagicMock(
-            __enter__=MagicMock(return_value=extract_ydl),
-            __exit__=MagicMock(return_value=False),
-        ),
-        MagicMock(
-            __enter__=MagicMock(return_value=download_ydl),
-            __exit__=MagicMock(return_value=False),
-        ),
-    ]
-    return extract_ydl, download_ydl
+    mock_ydl_cls.side_effect = lambda *a, **k: MagicMock(
+        __enter__=MagicMock(return_value=ydl),
+        __exit__=MagicMock(return_value=False),
+    )
+    return ydl, ydl
 
 
 class TestDownloadAudio:
@@ -570,7 +567,7 @@ class TestDownloadAudio:
             download_audio(job)
 
         # The second YoutubeDL call is for downloading
-        download_opts = mock_ydl_cls.call_args_list[1][0][0]
+        download_opts = mock_ydl_cls.call_args_list[0][0][0]
         assert "postprocessors" not in download_opts
         assert "postprocessor_hooks" not in download_opts
 
@@ -585,7 +582,7 @@ class TestDownloadAudio:
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             download_audio(job)
 
-        download_opts = mock_ydl_cls.call_args_list[1][0][0]
+        download_opts = mock_ydl_cls.call_args_list[0][0][0]
         assert download_opts["writethumbnail"] is True
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
@@ -598,7 +595,7 @@ class TestDownloadAudio:
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             download_audio(job)
 
-        download_opts = mock_ydl_cls.call_args_list[1][0][0]
+        download_opts = mock_ydl_cls.call_args_list[0][0][0]
         assert download_opts["format"] == "bestaudio/best"
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
@@ -630,7 +627,7 @@ class TestDownloadAudio:
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             download_audio(job, on_progress=progress_cb)
 
-        download_opts = mock_ydl_cls.call_args_list[1][0][0]
+        download_opts = mock_ydl_cls.call_args_list[0][0][0]
         assert len(download_opts["progress_hooks"]) == 1
         assert callable(download_opts["progress_hooks"][0])
 
@@ -658,9 +655,13 @@ class TestDownloadAudio:
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
     @patch("app.downloader.yt_dlp.YoutubeDL")
-    def test_extract_failure_falls_back_and_still_downloads(self, mock_ydl_cls, mock_sanitize, tmp_path):
-        """When the pre-download extract_info fails, download_audio should
-        fall back to the job's title and still attempt the download."""
+    def test_a_failed_extraction_is_the_end_of_the_job(self, mock_ydl_cls, mock_sanitize, tmp_path):
+        """One extraction per download: a failed one has nothing to download from.
+
+        There used to be a fallback here -- the probe failed, the download was
+        attempted anyway on the chance that yt-dlp would resolve formats the
+        second time.  Folding the two calls into one removed the second call,
+        and with it the only thing that fallback could have used."""
         _, download_ydl = _install_ydl_mocks(
             mock_ydl_cls, extract_error=yt_dlp.utils.DownloadError("Network error")
         )
@@ -668,44 +669,24 @@ class TestDownloadAudio:
         job = _make_job(title="Fallback Title", artist="A", album="B")
 
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
-            result = download_audio(job)
+            with pytest.raises(DownloadError, match="Network error"):
+                download_audio(job)
 
-        # Download was still attempted
-        download_ydl.extract_info.assert_called_once_with(job.url, download=True)
-        assert result.suffix == ".flac"
+        download_ydl.process_ie_result.assert_not_called()
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
     @patch("app.downloader.yt_dlp.YoutubeDL")
-    def test_none_info_falls_back_and_still_downloads(self, mock_ydl_cls, mock_sanitize, tmp_path):
-        """When extract_info returns None, download_audio should fall back
-        to the job's title and still attempt the download."""
+    def test_a_none_info_dict_is_the_end_of_the_job(self, mock_ydl_cls, mock_sanitize, tmp_path):
+        """Same as a raised failure: there is nothing left to download from."""
         _, download_ydl = _install_ydl_mocks(mock_ydl_cls, info=None)
 
         job = _make_job(artist="A", album="B")
 
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
-            result = download_audio(job)
+            with pytest.raises(DownloadError, match="no metadata"):
+                download_audio(job)
 
-        # Download was still attempted
-        download_ydl.extract_info.assert_called_once_with(job.url, download=True)
-        assert result.suffix == ".flac"
-
-    @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="Unknown Title")
-    @patch("app.downloader.yt_dlp.YoutubeDL")
-    def test_extract_failure_with_no_job_title_uses_unknown(self, mock_ydl_cls, mock_sanitize, tmp_path):
-        """When extract_info fails and the job has no title, falls back to 'Unknown Title'."""
-        _, download_ydl = _install_ydl_mocks(
-            mock_ydl_cls, extract_error=yt_dlp.utils.DownloadError("Network error")
-        )
-
-        job = _make_job(title=None, artist="A", album="B")
-
-        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
-            download_audio(job)
-
-        # sanitize_filename was called with "Unknown Title" (the fallback)
-        mock_sanitize.assert_called_with("Unknown Title")
-        download_ydl.extract_info.assert_called_once_with(job.url, download=True)
+        download_ydl.process_ie_result.assert_not_called()
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="Unknown Title")
     @patch("app.downloader.yt_dlp.YoutubeDL")
@@ -785,7 +766,11 @@ class TestDownloadAudio:
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             download_audio(job)
 
-        download_ydl.extract_info.assert_called_once_with(job.url, download=True)
+        download_ydl.extract_info.assert_called_once_with(job.url, download=False)
+        # And the download itself reuses that info dict rather than asking the
+        # source for the same page a second time.
+        download_ydl.process_ie_result.assert_called_once()
+        assert download_ydl.process_ie_result.call_args.kwargs == {"download": True}
 
     @patch("app.downloader.yt_dlp.YoutubeDL")
     def test_percent_in_title_needs_no_escaping(self, mock_ydl_cls, tmp_path):
@@ -801,7 +786,7 @@ class TestDownloadAudio:
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             result = download_audio(job)
 
-        outtmpl = mock_ydl_cls.call_args_list[1][0][0]["outtmpl"]
+        outtmpl = mock_ydl_cls.call_args_list[0][0][0]["outtmpl"]
         assert "%%" not in outtmpl
         assert result.name == "100% Love.flac"
         assert result.exists()
@@ -823,7 +808,7 @@ class TestDownloadAudio:
 
         assert result == tmp_path / "A" / "B" / "$HOME sweet home.flac"
         assert result.exists()
-        assert "$" not in mock_ydl_cls.call_args_list[1][0][0]["outtmpl"]
+        assert "$" not in mock_ydl_cls.call_args_list[0][0][0]["outtmpl"]
 
     @patch("app.downloader.yt_dlp.YoutubeDL")
     def test_shell_variable_in_artist_stays_inside_the_library(
@@ -839,7 +824,7 @@ class TestDownloadAudio:
 
         assert result == tmp_path / "$HOME" / "$USER" / "My Cool Track.flac"
         assert result.exists()
-        for value in mock_ydl_cls.call_args_list[1][0][0]["paths"].values():
+        for value in mock_ydl_cls.call_args_list[0][0][0]["paths"].values():
             assert "$" not in value
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
@@ -881,8 +866,7 @@ class TestDownloadAudio:
             with pytest.raises(DownloadError, match=ALREADY_IN_LIBRARY_PREFIX):
                 download_audio(job)
 
-        download_ydl.extract_info.assert_not_called()
-        assert not (tmp_path / ".tmp").exists()
+        download_ydl.process_ie_result.assert_not_called()
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
     @patch("app.downloader.yt_dlp.YoutubeDL")
@@ -892,16 +876,16 @@ class TestDownloadAudio:
         """The second check is what protects the file when two jobs collide."""
         _, download_ydl = _install_ydl_mocks(mock_ydl_cls)
         existing = tmp_path / "A" / "B" / "My Cool Track.flac"
-        inner = download_ydl.extract_info.side_effect
+        inner = download_ydl.process_ie_result.side_effect
 
-        def download_then_race(url, download=False):
-            result = inner(url, download=download)
+        def download_then_race(info, download=False):
+            result = inner(info, download=download)
             # Another job filed the same track while this one was downloading.
             existing.parent.mkdir(parents=True, exist_ok=True)
             existing.write_bytes(b"THEIRS")
             return result
 
-        download_ydl.extract_info.side_effect = download_then_race
+        download_ydl.process_ie_result.side_effect = download_then_race
         job = _make_job(artist="A", album="B")
 
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
@@ -1921,7 +1905,7 @@ class TestDownloadWritesNothingUnfinishedIntoTheLibrary:
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             result = download_audio(job)
 
-        opts = mock_ydl_cls.call_args_list[1][0][0]
+        opts = mock_ydl_cls.call_args_list[0][0][0]
         temp_dir = str(tmp_path / ".tmp" / job.id)
         assert opts["paths"] == {
             "home": temp_dir,
@@ -1940,7 +1924,7 @@ class TestDownloadWritesNothingUnfinishedIntoTheLibrary:
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             download_audio(job)
 
-        outtmpl = mock_ydl_cls.call_args_list[1][0][0]["outtmpl"]
+        outtmpl = mock_ydl_cls.call_args_list[0][0][0]["outtmpl"]
         assert outtmpl == f"{job.id}.%(ext)s"
         assert not Path(outtmpl).is_absolute()
         assert os.sep not in outtmpl
@@ -1961,14 +1945,14 @@ class TestDownloadWritesNothingUnfinishedIntoTheLibrary:
     @patch("app.downloader.yt_dlp.YoutubeDL")
     def test_the_temp_dir_exists_before_yt_dlp_runs(self, mock_ydl_cls, tmp_path):
         _, download_ydl = _install_ydl_mocks(mock_ydl_cls)
-        real_download = download_ydl.extract_info.side_effect
+        real_download = download_ydl.process_ie_result.side_effect
         seen: list[bool] = []
 
-        def check(url, download=False):
+        def check(info, download=False):
             seen.append((tmp_path / ".tmp" / "job-1").is_dir())
-            return real_download(url, download=download)
+            return real_download(info, download=download)
 
-        download_ydl.extract_info.side_effect = check
+        download_ydl.process_ie_result.side_effect = check
 
         job = _make_job(id="job-1", artist="A", album="B")
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
@@ -1982,57 +1966,77 @@ class TestDownloadWritesNothingUnfinishedIntoTheLibrary:
 # ===========================================================================
 
 
-class TestPreDownloadProbe:
-    """download_audio's own metadata pass: it decides where the file will go,
-    so it runs before a byte is fetched -- and a cancel during it must count."""
+class TestOneExtractionPerDownload:
+    """download_audio reads the page once and downloads from what it read.
+
+    Two extractions per child is what turns a forty-track playlist into eighty
+    requests, which is what earns the 429 the lanes then have to wait out; the
+    fold is the prevention half of phase 15.  The path is still resolved before
+    a byte is fetched, and a cancel in that window still counts.
+    """
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
     @patch("app.downloader.yt_dlp.YoutubeDL")
-    def test_the_probe_downloads_nothing_and_gives_up_on_a_dead_url_quickly(
+    def test_the_page_is_read_once_and_downloaded_from_that_read(
         self, mock_ydl_cls, mock_sanitize, tmp_path
     ):
+        ydl, _ = _install_ydl_mocks(mock_ydl_cls)
+
+        with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
+            download_audio(_make_job(artist="A", album="B"))
+
+        # One YoutubeDL, one extraction, and the download reuses its result.
+        assert mock_ydl_cls.call_count == 1
+        ydl.extract_info.assert_called_once()
+        assert ydl.extract_info.call_args.kwargs == {"download": False}
+        ydl.process_ie_result.assert_called_once()
+        assert ydl.process_ie_result.call_args.args[0] is SAMPLE_INFO
+
+    @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_the_session_is_the_download_session(
+        self, mock_ydl_cls, mock_sanitize, tmp_path
+    ):
+        """No `skip_download`: the one session has to be able to download."""
         _install_ydl_mocks(mock_ydl_cls)
 
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             download_audio(_make_job(artist="A", album="B"))
 
-        probe_opts = mock_ydl_cls.call_args_list[0][0][0]
-        assert probe_opts["skip_download"] is True
-        assert probe_opts["extractor_retries"] == 1
-        # `retries` is deliberately untouched: it governs the file downloaders,
-        # which only the real download below uses and still wants persistent.
-        assert "retries" not in probe_opts
+        opts = mock_ydl_cls.call_args_list[0][0][0]
+        assert "skip_download" not in opts
+        assert opts["format"] == "bestaudio/best"
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
     @patch("app.downloader.yt_dlp.YoutubeDL")
-    def test_a_cancel_during_the_probe_fetches_nothing(
+    def test_a_cancel_during_the_extraction_fetches_nothing(
         self, mock_ydl_cls, mock_sanitize, tmp_path
     ):
-        """The probe has no progress hook, so nothing else would notice it."""
+        """The extraction has no progress hook, so nothing else would notice it."""
         cancel = CancelToken()
-        extract_ydl, download_ydl = _install_ydl_mocks(mock_ydl_cls)
+        ydl, _ = _install_ydl_mocks(mock_ydl_cls)
 
         def cancel_then_answer(url, download=False):
             cancel.cancel()
             return SAMPLE_INFO
 
-        extract_ydl.extract_info.side_effect = cancel_then_answer
+        ydl.extract_info.side_effect = cancel_then_answer
 
         with patch.dict("os.environ", {"DOWNLOAD_PATH": str(tmp_path)}):
             with pytest.raises(DownloadError, match=CANCELLED_MESSAGE):
                 download_audio(_make_job(artist="A", album="B"), cancel=cancel)
 
-        download_ydl.extract_info.assert_not_called()
+        ydl.process_ie_result.assert_not_called()
 
     @patch("app.downloader.yt_dlp.utils.sanitize_filename", return_value="My Cool Track")
     @patch("app.downloader.yt_dlp.YoutubeDL")
-    def test_a_cancel_between_the_probe_and_the_download_fetches_nothing(
+    def test_a_cancel_between_the_extraction_and_the_download_fetches_nothing(
         self, mock_ydl_cls, mock_sanitize, tmp_path
     ):
-        """Resolving the output path and creating the scratch directory both
-        happen after the probe and before the first hook exists."""
+        """Resolving the output path happens after the extraction and before
+        the first progress hook exists."""
         cancel = CancelToken()
-        _, download_ydl = _install_ydl_mocks(mock_ydl_cls)
+        ydl, _ = _install_ydl_mocks(mock_ydl_cls)
 
         def cancel_then_resolve(**kwargs):
             cancel.cancel()
@@ -2045,7 +2049,7 @@ class TestPreDownloadProbe:
                 with pytest.raises(DownloadError, match=CANCELLED_MESSAGE):
                     download_audio(_make_job(artist="A", album="B"), cancel=cancel)
 
-        download_ydl.extract_info.assert_not_called()
+        ydl.process_ie_result.assert_not_called()
 
 
 # ===========================================================================

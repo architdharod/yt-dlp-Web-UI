@@ -5,6 +5,9 @@ import { queueQueryOptions } from "@/hooks/useQueueQuery";
 import {
   addJobToCache,
   applyQueueEvent,
+  mergeSnapshot,
+  parseNotice,
+  parseNoticeAction,
   parentIdOfCachedJob,
   removeJobFromCache,
   replaceJobInCache,
@@ -1059,5 +1062,143 @@ describe("reconciling a snapshot that nests children", () => {
     const cached = client.getQueryData<Job[]>(queryKeys.queue)!;
     expect(cached.map((j) => j.id)).toEqual(["p1"]);
     expect(cached[0].children!.map((c) => c.id)).toEqual(["c2"]);
+  });
+});
+
+describe("the rate-limit countdown on a job", () => {
+  it("merges retry_at from an event", () => {
+    const merged = mergeSnapshot(job("a"), {
+      detail: "YouTube rate limit, retry 2 of 5 in 45 s",
+      retry_at: "2026-09-06T12:00:45+00:00",
+    });
+
+    expect(merged.retry_at).toBe("2026-09-06T12:00:45+00:00");
+    expect(merged.detail).toBe("YouTube rate limit, retry 2 of 5 in 45 s");
+  });
+
+  it("clears the note when the wait ends", () => {
+    const waiting = {
+      ...job("a"),
+      detail: "YouTube rate limit, retry 2 of 5 in 45 s",
+      retry_at: "2026-09-06T12:00:45+00:00",
+    };
+
+    // The wait is over: the backend sends both fields as an explicit null,
+    // which is the only thing that can take a note back.
+    const merged = mergeSnapshot(waiting, { retry_at: null, detail: null });
+
+    expect(merged.retry_at).toBeNull();
+    expect(merged.detail).toBeNull();
+  });
+
+  it("leaves an ordinary note alone when the event does not mention it", () => {
+    const done = { ...job("a"), detail: "tags not fixed: no match" };
+
+    const merged = mergeSnapshot(done, { retry_at: null });
+
+    expect(merged.detail).toBe("tags not fixed: no match");
+    expect(merged.retry_at).toBeNull();
+  });
+
+  it("leaves the countdown alone when the event does not mention it", () => {
+    const waiting = { ...job("a"), retry_at: "2026-09-06T12:00:45+00:00" };
+
+    expect(mergeSnapshot(waiting, { progress: 3 }).retry_at).toBe(
+      "2026-09-06T12:00:45+00:00",
+    );
+  });
+});
+
+describe("parsing a notice off the wire", () => {
+  const base = {
+    id: "n1",
+    level: "warning",
+    source: "youtube",
+    message: "YouTube is rate limiting this server.",
+    created_at: "2026-09-06T12:00:00Z",
+  };
+
+  it("keeps the fields the banner counts down from", () => {
+    const parsed = parseNotice({
+      ...base,
+      hold_until: "2026-09-06T12:01:00Z",
+      reason: "rate_limit",
+      held_since: "2026-09-06T12:00:00Z",
+    });
+
+    expect(parsed?.hold_until).toBe("2026-09-06T12:01:00Z");
+    expect(parsed?.reason).toBe("rate_limit");
+    expect(parsed?.held_since).toBe("2026-09-06T12:00:00Z");
+  });
+
+  it("nulls them for a notice that has none", () => {
+    const parsed = parseNotice({ ...base, source: "lidarr" });
+    expect(parsed?.hold_until).toBeNull();
+    expect(parsed?.reason).toBeNull();
+  });
+
+  it.each([
+    ["//evil.example/steal", "protocol-relative"],
+    ["/\\evil.example/steal", "backslash protocol-relative"],
+    ["https://evil.example/steal", "absolute"],
+    ["queue/lanes/youtube/resume", "relative"],
+  ])("refuses a %s action path", (path) => {
+    const parsed = parseNotice({
+      ...base,
+      action: { label: "Go", method: "POST", path },
+    });
+    expect(parsed?.action).toBeNull();
+  });
+
+  it("refuses an action with a method it will not send", () => {
+    expect(
+      parseNoticeAction({ label: "Go", method: "DELETE", path: "/x" }),
+    ).toBeNull();
+  });
+
+  it("keeps a well-formed action", () => {
+    expect(
+      parseNoticeAction({
+        label: "Resume now",
+        method: "POST",
+        path: "/queue/lanes/youtube/resume",
+      }),
+    ).toEqual({
+      label: "Resume now",
+      method: "POST",
+      path: "/queue/lanes/youtube/resume",
+    });
+  });
+});
+
+describe("the wait note when the lane starts probing", () => {
+  const probing =
+    "YouTube rate limit, waiting for the first download to get through";
+
+  it("keeps the new note that arrives without an instant", () => {
+    // The hold has lapsed and the canary is in flight, so there is nothing to
+    // count down to — but the row still has something to say.
+    const waiting = {
+      ...job("a"),
+      detail: "YouTube rate limit, waiting 45 s",
+      retry_at: "2026-09-06T12:00:45Z",
+    };
+
+    const merged = mergeSnapshot(waiting, { detail: probing, retry_at: null });
+
+    expect(merged.retry_at).toBeNull();
+    expect(merged.detail).toBe(probing);
+  });
+
+  it("clears the probing note when the canary gets through", () => {
+    // The row that was showing the probing sentence has no instant to lose,
+    // so only an explicit null `detail` can take it off — which is what
+    // `_clear_wait` sends the moment the lane opens.
+    const waiting = { ...job("a"), detail: probing, retry_at: null };
+
+    const merged = mergeSnapshot(waiting, { retry_at: null, detail: null });
+
+    expect(merged.detail).toBeNull();
+    expect(merged.retry_at).toBeNull();
   });
 });

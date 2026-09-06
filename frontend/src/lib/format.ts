@@ -75,3 +75,37 @@ export function formatRelativeTime(iso: string, now: number = Date.now()): strin
   }
   return `${plural(Math.floor(seconds / divisor), noun)} ago`;
 }
+
+
+/** The trailing "45 s" of a sentence that ends in a number of seconds. */
+const TRAILING_SECONDS = / \d+ s$/;
+
+/**
+ * A sentence that ends in a number of seconds, with that number recomputed
+ * from an absolute instant.
+ *
+ * The backend sends each such sentence once — a job's wait note ("YouTube rate
+ * limit, retry 2 of 5 in 45 s"), a rate-limit banner — together with the
+ * instant it is counting down to, instead of a tick every second. One event
+ * per state rather than one per second per waiting job, and for a notice it is
+ * the difference between a banner that stays dismissed and one that comes back
+ * every fifteen seconds. That leaves the number in the sentence to go stale,
+ * so it is replaced here with what is actually left.
+ *
+ * Only the trailing clause is matched, so the words in front of it stay the
+ * backend's to write and a new wording needs no change here; a sentence that
+ * does not end in seconds gets the countdown appended instead. An unreadable
+ * instant returns the sentence untouched.
+ */
+export function withCountdown(
+  text: string,
+  instant: string,
+  now: number = Date.now(),
+): string {
+  const until = Date.parse(instant);
+  if (Number.isNaN(until)) return text;
+  const seconds = Math.max(0, Math.ceil((until - now) / 1000));
+  return TRAILING_SECONDS.test(text)
+    ? text.replace(TRAILING_SECONDS, ` ${seconds} s`)
+    : `${text} in ${seconds} s`;
+}

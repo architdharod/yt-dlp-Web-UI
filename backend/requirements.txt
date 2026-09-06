@@ -32,3 +32,14 @@ urllib3>=2,<3
 # JSON, so a release can change what a call returns, and app/ytmusic.py treats
 # every parse failure as "not a music artist" and falls back to yt-dlp.
 ytmusicapi==1.12.2
+
+# The yt-dlp plugin half of the PO-token sidecar (`pot-provider` in
+# docker-compose.yml).  YouTube expects a proof-of-origin token with every
+# player request; an anonymous client without one loses formats and is asked to
+# "sign in to confirm you're not a bot" within a few dozen downloads.  This
+# package is discovered by yt-dlp's plugin loader on import -- there is nothing
+# to wire up in code beyond the `youtubepot-bgutilhttp:base_url` extractor arg
+# in app/downloader.py, which points it at the sidecar.  Pinned to match the
+# image tag in docker-compose.yml, and it needs yt-dlp >= 2025.05.22, well
+# below our floor above.
+bgutil-ytdlp-pot-provider==1.3.2

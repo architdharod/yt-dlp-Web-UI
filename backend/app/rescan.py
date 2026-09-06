@@ -44,7 +44,7 @@ from pathlib import Path
 import httpx
 
 from app.library import LibraryPathError, get_download_path, validate_library_path
-from app.models import Notice
+from app.models import Notice, NoticeAction
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +260,10 @@ class NoticeBoard:
         *,
         key: str | None = None,
         sticky: bool = False,
+        action: NoticeAction | None = None,
+        hold_until: str | None = None,
+        reason: str | None = None,
+        held_since: str | None = None,
     ) -> Notice | None:
         """Record a failure.  Returns the new notice, or None when it is a repeat.
 
@@ -270,6 +274,14 @@ class NoticeBoard:
         tag-scrub warning is the case: it is a setting in Lidarr, not a symptom
         of the call that found it, so a rescan that succeeds says nothing about
         whether the setting was turned off.
+
+        *action* is the one thing the user can do about it, as a route the
+        banner turns into a button.  The rate-limit lanes are the case: their
+        notice carries "Resume now".
+
+        *hold_until*, *reason* and *held_since* belong to a rate-limit notice
+        and are what lets the banner count down without this notice having to
+        be raised afresh -- which would un-dismiss it -- every second.
         """
         dedup = (source, key or message)
         if dedup in self._open:
@@ -281,6 +293,10 @@ class NoticeBoard:
             level=level,  # type: ignore[arg-type]
             source=source,  # type: ignore[arg-type]
             message=message,
+            hold_until=hold_until,
+            reason=reason,
+            held_since=held_since,
+            action=action,
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         self._open[dedup] = notice

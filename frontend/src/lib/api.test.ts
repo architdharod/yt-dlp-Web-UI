@@ -4,6 +4,7 @@ import {
   coverUrl,
   deleteLibraryPath,
   emptyTrash,
+  fetchNotices,
   getTrash,
   moveLibraryPath,
   probeUrl,
@@ -472,5 +473,57 @@ describe("submitBulkDownload", () => {
     await expect(submitBulkDownload(request)).rejects.toThrow(
       "this collection is already in the queue",
     );
+  });
+});
+
+describe("fetchNotices", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function respond(body: unknown) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      ),
+    );
+  }
+
+  const notice = {
+    id: "n1",
+    level: "warning",
+    source: "youtube",
+    message: "YouTube is rate limiting this server.",
+    hold_until: "2026-09-06T12:01:00Z",
+    reason: "rate_limit",
+    held_since: "2026-09-06T12:00:00Z",
+    created_at: "2026-09-06T12:00:00Z",
+  };
+
+  it("goes through the same parser the SSE event does", async () => {
+    // An action that is not a path must not survive either route in.
+    respond([
+      {
+        ...notice,
+        action: { label: "Go", method: "POST", path: "//evil.example/x" },
+      },
+    ]);
+
+    const [parsed] = await fetchNotices();
+
+    expect(parsed.action).toBeNull();
+    expect(parsed.hold_until).toBe("2026-09-06T12:01:00Z");
+  });
+
+  it("drops an entry that is not a notice at all", async () => {
+    respond([{ id: 7 }, notice]);
+
+    expect(await fetchNotices()).toHaveLength(1);
   });
 });

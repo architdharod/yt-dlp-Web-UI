@@ -463,3 +463,97 @@ screenshot refresh. Remove `MAX_TERMINAL_JOBS` and any dead config from `.env.ex
 - [ ] Every env var the backend reads is in the table with its default.
 - [ ] README setup steps work from a clean homelab host using only the published images.
 - [ ] No remaining "collection" wording in UI or docs.
+
+---
+
+## Phase 15: Rate limits and PO tokens
+
+**Decisions**: Persistent queue (worker slots, write-through, notices); Bulk flow (a playlist is N jobs on one
+host); Domain model (no "collection" in user-visible copy).
+
+### What to build
+
+Stop a large YouTube playlist from failing every child with a 429 and a manual Retry.
+
+**Prevention.** Fold the per-child metadata pre-probe into the download: one `extract_info(download=False)`
+whose info dict feeds the metadata event *and* the already-in-library check, then `process_ie_result(info,
+download=True)`, so each track costs one page read instead of two. Add `YTDLP_SLEEP_REQUESTS` (default `0.75`,
+`0` disables) to `base_opts()`, so it paces every session including the probe's flat enumeration. Cap YouTube
+at two concurrent downloads whatever `MAX_CONCURRENT_DOWNLOADS` says, with a per-lane semaphore taken *before*
+the global one so the cap cannot stall the other sources.
+
+**Detection.** A new `app/rate_limit.py` with `rate_limit_status(exc)`, which walks
+`__cause__`/`__context__`/`.cause`/`.exc_info` for a `yt_dlp.networking.exceptions.HTTPError` with
+`status == 429` (yt-dlp's YouTube extractor never retries one, and ignores `Retry-After`), plus
+`retry_after_seconds` and `is_bot_check`, which matches YouTube's "sign in to confirm you're not a bot" clause
+narrowly.
+
+**Lanes.** One lane per source host (`youtube`, `soundcloud`, `bandcamp`), each open or held until T with a
+consecutive-429 count, persisted in a new `lanes` table (`PRAGMA user_version` 4) so a restart honours a
+remaining hold. A 429 holds the whole lane for 30/60/120/240/480 s with ±20 % jitter, never shorter than a
+`Retry-After`. The waiting job stays `downloading`, keeps its *lane* slot and gives back its
+*download* slot (so other sources keep downloading), shows `job.detail` plus an absolute `retry_at` the
+frontend counts down from — both now always on the wire and null when empty, because a note that can be taken
+back needs "there is none" to be distinguishable from "this event does not mention it" — and does not spend its wait against `DOWNLOAD_TIMEOUT_SECONDS` — one
+`asyncio.wait_for` per attempt, the wait and the slot re-acquisition outside it. The note is re-emitted
+whenever the hold moves, and says "retry N of M" only for a job that has spent attempts of its own. Cancel
+during a wait is immediate. When a hold lapses one job (the oldest waiter) goes first as a canary and the rest
+say so (no `retry_at`, nothing to count down to); its first progress or info dict opens the lane, its 429
+extends the hold and costs only its own attempt. A job that was merely waiting when the process stopped is
+re-queued at boot without spending a restart attempt. `RATE_LIMIT_ATTEMPTS` (default 5) attempts, then that job
+ends `error` with the lane still held. A lane held for over an hour fails everything *parked* on it — a job
+that is downloading is on the lane but not waiting for it, so it is neither elected canary nor failed by the
+ceiling. A hold that lapses with nothing parked clears itself (the watchdog settles every held lane, so the
+banner never outlives the hold) and keeps its consecutive count, since no request went out to say the limiter
+had let go. A bot check fails its job immediately with no attempt spent, pauses the lane, and waits for
+Resume now.
+
+**Surfacing.** A notice per held lane through the existing `GET /notices` + `notices` SSE, carrying a new
+optional `action: {label, method, path}` the banner renders as a button — `POST /queue/lanes/{host}/resume`,
+which clears the hold and releases one canary. The notice also carries `hold_until`/`reason`/`held_since` and
+its *message* carries no countdown, so the banner ticks by itself and the notice is raised afresh only on a
+real transition — a re-raise is what un-dismisses a banner, so a per-second one would make dismissal
+meaningless. `POST /download/probe` never backs off: a 429 there is a 400 with "YouTube is rate limiting this
+server, try again in N s" and starts the hold, and a probe of a held host is refused before any request goes
+out — for a Spotify artist URL that is the *YouTube* lane, since that is who the probe actually talks to.
+A `ytmusicapi` 429 (`"Server returned HTTP 429"`, no status attribute) is recognised in both the channel and
+the Spotify branch instead of being reported as "YouTube Music is unreachable".
+
+**PO tokens.** A `pot-provider` sidecar (`brainicism/bgutil-ytdlp-pot-provider`, port 4416, compose network
+only) plus its `bgutil-ytdlp-pot-provider` PyPI plugin in the backend image, pointed at the sidecar with the
+`youtubepot-bgutilhttp:base_url` extractor arg from `POT_PROVIDER_URL`. The loaded providers are logged at
+boot next to the yt-dlp version. Cookies stay as the documented last resort, untouched.
+
+### Acceptance criteria
+
+- [ ] One yt-dlp extraction per downloaded track; the already-in-library check still refuses a duplicate
+      before anything is fetched.
+- [ ] `YTDLP_SLEEP_REQUESTS`, `RATE_LIMIT_ATTEMPTS` and `POT_PROVIDER_URL` are in `docker-compose.yml`,
+      `.env.example` and the README Configuration table with their defaults.
+- [ ] A 429 leaves the job `downloading` with a countdown, not `error`; it succeeds on a later attempt without
+      touching the persisted `attempts` counter, and the wait does not consume the download timeout.
+- [ ] Cancel during a wait ends the job within a moment; a manual Retry gets a fresh attempt budget.
+- [ ] A held lane shows one banner with a working **Resume now** that counts itself down; dismissing it hides
+      it until the hold actually changes, and a watchdog tick emits no notices event and keeps the id.
+- [ ] A hold that lapses — with a waiter, so a canary is elected, or with none, so the lane clears — is
+      announced exactly once; an idle lapse keeps `consecutive` and drops `held_since`, so two refused probes
+      an hour apart never arm the ceiling.
+- [ ] A job that is downloading is not on the lane's waiting list: it is never elected canary, and the ceiling
+      never fails it.
+- [ ] A job waiting behind someone else's rate limit says "waiting N s", re-announces when the hold moves, and
+      says what it is waiting for while the canary is in flight.
+- [ ] With `MAX_CONCURRENT_DOWNLOADS=2` and two YouTube jobs waiting out a hold, a SoundCloud job still
+      starts.
+- [ ] A job that spends its whole budget fails with "gave up after 5 attempts over N min" and leaves the lane
+      held; queued jobs behind it spend nothing; an hour of holding fails them all.
+- [ ] A bot check fails one job, pauses the lane, and names the README section.
+- [ ] `POST /download/probe` answers 400 with the rate-limit sentence and sends no requests while the lane is
+      held.
+- [ ] At most two YouTube downloads run at once with `MAX_CONCURRENT_DOWNLOADS=5`; other hosts fill the rest.
+- [ ] A notice's action path is validated on both ways in (SSE and `GET /notices`) and on the backend, so it
+      can only ever be an absolute path on this API.
+- [ ] `pot-provider` has a healthcheck and the backend depends on it with `required: false`, so an unhealthy
+      sidecar warns and never blocks startup.
+- [ ] The backend boot log names the PO-token providers it loaded, and a `-v` download shows a token being
+      fetched from the sidecar.
+- [ ] A public playlist of 40+ tracks downloads to completion on the compose stack.

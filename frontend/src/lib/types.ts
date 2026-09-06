@@ -80,6 +80,13 @@ export interface Job {
    * jobs leave the in-flight view, so most rows the UI holds never carry one.
    */
   detail?: string | null;
+  /**
+   * When a job that is waiting out a source's rate limit will try again, as an
+   * ISO-8601 UTC instant — so the row can count down without the backend
+   * sending a tick per second. Null (or absent) on every job that is not
+   * waiting; `detail` carries the sentence that goes with it.
+   */
+  retry_at?: string | null;
   artist: string | null;
   album: string | null;
   /**
@@ -267,9 +274,35 @@ export interface SSEEvent {
 export interface Notice {
   id: string;
   level: "error" | "warning";
-  source: "navidrome" | "lidarr";
+  source: "navidrome" | "lidarr" | "youtube" | "soundcloud" | "bandcamp";
   message: string;
+  /**
+   * For a rate-limit notice, when the hold lapses, as an ISO-8601 UTC instant.
+   * The banner counts down from this rather than from the message, which is
+   * what lets the backend raise the notice only on a real change: a message
+   * that counted down would have to be re-raised every second, and a re-raise
+   * un-dismisses the banner and gives it a new id.
+   */
+  hold_until?: string | null;
+  /** `"rate_limit"` or `"bot_check"` on a rate-limit notice, else null. */
+  reason?: string | null;
+  /** When this source first went into trouble, ISO-8601 UTC. */
+  held_since?: string | null;
+  /**
+   * The one thing the user can do about this notice, as a route rather than a
+   * symbol the banner has to know: it renders a button labelled `label` that
+   * sends `method` to `path`. A notice with a new action therefore needs no
+   * change here. Today only the rate-limit lanes carry one ("Resume now").
+   */
+  action?: NoticeAction | null;
   created_at: string;
+}
+
+/** The button a `Notice` offers. See `Notice.action`. */
+export interface NoticeAction {
+  label: string;
+  method: "POST";
+  path: string;
 }
 
 /**

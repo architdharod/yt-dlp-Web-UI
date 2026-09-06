@@ -1772,7 +1772,9 @@ class TestTaggingOverTheApi:
 
             statuses = [event.data["status"] for event in events]
             assert statuses == ["tagging", "done"]
-            assert "detail" not in events[0].data
+            # Null, not absent: a note can be taken back as well as given (a
+            # rate-limit wait ends), so the event has to be able to say so.
+            assert events[0].data["detail"] is None
             assert events[1].data["detail"] == "tags not fixed: no match"
         finally:
             main_module._loop = original_loop

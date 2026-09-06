@@ -108,6 +108,62 @@ Either way the job reaches **done**. A lookup that failed says "tags not fixed" 
 fails the download. `TAG_FIX_ENABLED=false` skips the lookup entirely, and then no request leaves the
 container.
 
+### Rate limits
+
+A large playlist at full concurrency is a burst of requests, and YouTube answers a burst with HTTP 429. yt-dlp
+does nothing about that on its own: its YouTube extractor never retries a 429, and it ignores `Retry-After`.
+So the app handles it.
+
+**Prevention first.** Each track costs exactly one page read — the metadata and the download are one yt-dlp
+session, not two — and `YTDLP_SLEEP_REQUESTS` (0.75 s by default, yt-dlp's own `-t sleep` value) paces every
+request the app makes, playlist previews included. At most **two YouTube downloads** run at once whatever
+`MAX_CONCURRENT_DOWNLOADS` says; other sources fill the remaining slots.
+
+**Lanes.** Each source — YouTube, SoundCloud, Bandcamp — has a lane that is either open or held. When a
+download is rate limited its job does not fail: it stays `downloading` and the whole lane is held for 30 s,
+then 60, 120, 240 and 480 s if it keeps happening (with jitter, and never shorter than a `Retry-After` the
+server sent). The waiting job shows a countdown — "YouTube rate limit, retry 2 of 5 in 45 s" if it was the one
+that met the limiter, "YouTube rate limit, waiting 45 s" if it is only queued behind someone else's — and the
+wait does not count against `DOWNLOAD_TIMEOUT_SECONDS`. Cancel works immediately during a wait.
+
+A waiting job keeps its YouTube lane slot but **frees its download slot**, so SoundCloud and Bandcamp keep
+downloading while YouTube is being waited out. The lane slot is what stops the next YouTube job taking its
+place and walking into the same limiter; the download slot is not doing anything while the job is parked.
+
+A hold that runs out with **nothing waiting on it** — one started by a refused playlist preview, say — simply
+clears itself and the banner goes. The backoff ladder does not reset, though: no request went out, so nothing
+was learned about whether the limiter let go, and the next 429 waits as long as the one before it would have.
+
+**One canary.** When a hold lapses, exactly one waiting job goes first, and the rows behind it say so
+("waiting for the first download to get through"). If it gets through, the lane opens and the rest follow; if
+it is rate limited again, only that one job spent an attempt and the hold is extended. A
+job that spends all `RATE_LIMIT_ATTEMPTS` (5) attempts fails with "YouTube rate limit: gave up after 5
+attempts over 15 min", and the lane stays held — the jobs behind it keep waiting rather than each burning
+their own budget. If a lane has been in trouble for over an hour *with jobs waiting on it*, everything queued
+on it fails at once rather than sitting there silently; a download that is running at that moment is left
+alone to finish.
+
+While a lane is held, a **banner** says so, counts down, and offers **Resume now**, which clears the hold and
+sends one job straight through. Pasting a URL for that source into the form is refused with the same message
+instead of adding to the pile — including a Spotify artist URL, which is read through YouTube Music and so
+belongs to the YouTube lane. The hold is stored in `queue.db`, so restarting the container does not walk
+straight back into the limiter, and a job that was only waiting when the container stopped is re-queued
+without spending one of its three restart attempts.
+
+**PO tokens.** YouTube expects a proof-of-origin token with every player request; without one an anonymous
+client loses formats and meets the bot check within a few dozen downloads. The stack runs a
+[`pot-provider`](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) sidecar that mints them, and the
+backend uses it through that project's yt-dlp plugin. It is on by default, needs no account, and is reachable
+only from the backend over the compose network. The backend log names the providers it loaded at startup:
+
+```
+PO-token providers       = BgUtilHTTP, BgUtilScriptDeno, BgUtilScriptNode
+```
+
+If YouTube asks you to **sign in to confirm you're not a bot**, that job fails immediately (retrying a wall
+only makes it worse), the lane is paused with a banner, and nothing else from that source is attempted until
+you press Resume now. See [YouTube asks you to sign in](#youtube-asks-you-to-sign-in).
+
 ### The queue
 
 Queue rows carry Cancel and Dismiss; a failed row also offers **Retry**, which re-queues the job from the
@@ -225,7 +281,12 @@ Browser --HTTPS--> reverse proxy --> nginx :3033 --+-- /        React SPA (TanSt
         |                             |                                           |
   queue.db (SQLite)            worker slots                                 DOWNLOAD_PATH
   at DATA_PATH                 MAX_CONCURRENT_DOWNLOADS download slots      the library tree,
-  jobs, states, retention      plus exactly one tagging slot                the only source of truth
+  jobs, states, lanes,         (at most 2 of them YouTube at a time)        the only source of truth
+  retention                    plus exactly one tagging slot
+
+                                      |
+                                      +--> pot-provider :4416, compose network only
+                                           mints YouTube PO tokens for yt-dlp
 
   Outbound, from the workers:
     yt-dlp       ->  YouTube, SoundCloud, Bandcamp     (the audio itself)
@@ -252,7 +313,7 @@ event reaches a client, so a client that reacts to an event and reads back alway
 | Route | Purpose |
 | ----- | ------- |
 | `GET /health` | Liveness, used by the container healthcheck |
-| `GET /notices` | The dismissible banners (rescan failures, Lidarr tag scrubbing) |
+| `GET /notices` | The dismissible banners (rescan failures, Lidarr tag scrubbing, rate-limit holds) |
 | `POST /download` | Queue one track |
 | `POST /download/probe` | Classify a URL: `{type: "track"}` or a preview payload |
 | `POST /download/bulk` | Queue a selection from a preview: one parent, one child per track |
@@ -261,6 +322,7 @@ event reaches a client, so a client that reacts to an event and reads back alway
 | `POST /queue/{id}/retry` | Retry a failed job |
 | `POST /queue/{id}/cancel` | Cancel a job, cascading to children |
 | `POST /queue/{id}/dismiss` | Delete a failed job row |
+| `POST /queue/lanes/{host}/resume` | Clear a source's rate-limit hold and release one job |
 | `GET /library` | The whole tree: artists, albums, tracks, Singles |
 | `GET /library/cover?path=` | Cover art for an album path |
 | `POST /library/move` | Move tracks, move an album, rename an artist |
@@ -315,6 +377,11 @@ The frontend tests are `cd frontend && npx vitest run`, the backend tests
 
 The homelab runs the prebuilt images that CI publishes to GHCR. It never builds
 anything, and it never needs a checkout of this repository.
+
+**Minimum versions: Docker Engine 25 and Compose 2.20.** The stack uses
+`depends_on.required` (Compose 2.20+) so an unhealthy PO-token sidecar never
+blocks the backend from starting, and `healthcheck.start_interval` (Engine 25+)
+so that sidecar is marked healthy in seconds rather than in half a minute.
 
 **Images are private.** They live at `ghcr.io/architdharod/music-for-arr-backend`
 and `ghcr.io/architdharod/music-for-arr-frontend`, so the host must authenticate
@@ -398,6 +465,9 @@ the stack. `.env.example` ships the same values.
 | `TAG_FIX_ENABLED`          | `true`                  | Look every finished download up on MusicBrainz and correct its `TITLE`/`ARTIST`. `false` skips the lookup, and no request leaves the container |
 | `MUSICBRAINZ_CONTACT`      | this repository's URL   | Contact (email or URL) in the User-Agent MusicBrainz requires           |
 | `TAG_FIX_TIMEOUT_SECONDS`  | `60`                    | How long one tag lookup may take before the job finishes without it     |
+| `YTDLP_SLEEP_REQUESTS`     | `0.75`                  | Seconds yt-dlp sleeps between extractor requests, in every session including the playlist preview. `0` turns the pacing off. See [Rate limits](#rate-limits) |
+| `RATE_LIMIT_ATTEMPTS`      | `5`                     | How many times one job waits out a rate limit before it fails. A manual Retry always starts a fresh budget |
+| `POT_PROVIDER_URL`         | `http://pot-provider:4416` | The PO-token sidecar the compose stack runs. Empty disables it, which makes YouTube's bot check much more likely |
 | `YTDLP_COOKIES_FILE`       | empty (disabled)        | Path *inside the container* to a Netscape-format cookies file yt-dlp should use. See [YouTube asks you to sign in](#youtube-asks-you-to-sign-in) |
 | `YTDLP_COOKIES_HOST_PATH`  | `/dev/null`             | Path *on the host* to that same file. Compose bind-mounts it read-only at `/cookies/youtube.txt` |
 
@@ -417,8 +487,26 @@ must exist and be writable by `PUID:PGID` yourself.
 
 Symptom: every YouTube job fails with **"Sign in to confirm you're not a bot"**,
 often after a burst of HTTP 429s in the backend log. This is YouTube rate-limiting
-the datacentre or home IP the container downloads from, not a bug in the app. Two
-things help.
+the datacentre or home IP the container downloads from, not a bug in the app. The
+job that hits the wall fails at once and the whole YouTube lane is paused with a
+banner, so nothing else piles into it; **Resume now** on that banner is what tries
+again once you have changed something. Three things help, in this order.
+
+**Check the PO-token sidecar is running.** This is the first answer and it is on
+by default: the `pot-provider` service mints the proof-of-origin tokens YouTube
+expects, and without them an anonymous client meets this wall within a few dozen
+downloads. The backend says at startup which providers it loaded —
+
+```
+POT_PROVIDER_URL         = http://pot-provider:4416
+PO-token providers       = BgUtilHTTP, BgUtilScriptDeno, BgUtilScriptNode
+```
+
+— and at `-v` level yt-dlp logs `Generating a gvs PO Token for web client via
+bgutil HTTP server` when it actually fetches one. If `PO-token providers` reads
+`(none)`, your image predates the sidecar and needs rebuilding or repulling; if
+it lists the providers but downloads still fail, check that the `pot-provider`
+container is up.
 
 **The image ships a JavaScript runtime.** YouTube's player is protected by a
 challenge that yt-dlp solves by running JavaScript, so the backend image
@@ -427,8 +515,11 @@ them yt-dlp logs `No supported JavaScript runtime could be found`, some formats
 disappear, and the bot check fires much sooner. If you see that line in the log,
 your image predates this and needs rebuilding or repulling.
 
-**Give yt-dlp cookies.** A signed-in session gets waved through where an
-anonymous one does not:
+**Give yt-dlp cookies — the last resort.** Only after the two above: a cookies
+file is a live session for a real Google account, it has to be re-exported by
+hand whenever it goes stale, and yt-dlp warns that an account it downloads with
+can be banned. A signed-in session does get waved through where an anonymous one
+does not:
 
 1. Export the cookies exactly the way yt-dlp's
    [Exporting YouTube cookies](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)
@@ -482,10 +573,13 @@ anonymous one does not:
    **refuses to start** and says which, the same way it does for a bad
    `DOWNLOAD_PATH`.
 
-**Keep `MAX_CONCURRENT_DOWNLOADS` at 2.** Its default. Raising it is the fastest
-way to earn a 429 and, shortly after, the bot check: a bulk job of 40 videos at
-two at a time gets through where six at a time does not. If you are already
-being blocked, wait it out. The block is on the IP and expires.
+**Keep `MAX_CONCURRENT_DOWNLOADS` at 2.** Its default, and raising it is the
+fastest way to earn a 429 and, shortly after, the bot check. The app caps
+YouTube at two concurrent downloads whatever this is set to, so raising it only
+speeds up the other sources; leaving it at 2 keeps everything modest. If you are
+already being blocked, wait it out — the queue does that for you, and the block
+is on the IP and expires. `YTDLP_SLEEP_REQUESTS` is the other dial: raising it
+above 0.75 makes a large playlist or album slower and safer.
 
 ## Navidrome and Lidarr
 
@@ -553,6 +647,19 @@ worth knowing:
   `soundcloud.com`, `bandcamp.com` and `open.spotify.com`, each matched exactly or as a subdomain, and
   rejects everything else with a validation error. `music.youtube.com` is a subdomain of `youtube.com`, so
   YouTube Music URLs needed no widening.
+- **YouTube runs two at a time** — the per-source cap is not configurable. `MAX_CONCURRENT_DOWNLOADS` above 2
+  only speeds up SoundCloud and Bandcamp; a YouTube playlist downloads two tracks at a time whatever you set.
+  It is what keeps a large playlist out of the rate limiter.
+- **A 429 served as an HTML page is invisible** — YouTube Music occasionally answers a rate limit with HTML
+  rather than JSON, which the client can only report as a parse failure. That one shape is treated as "YouTube
+  Music is unreachable" and falls back to a flat yt-dlp listing, as it did before.
+- **A rate limit is waited out, not worked around** — the queue backs off and retries, but nothing changes
+  the IP the requests come from, so a source that is determined to block this server eventually wins: after an
+  hour of holding, everything queued on that source fails. The PO-token sidecar makes YouTube's bot check much
+  less likely; it does not make it impossible, and a cookies file is still the last resort.
+- **The playlist preview does not back off** — `POST /download/probe` answers a rate limit with an error and a
+  wait, rather than making you watch a spinner for eight minutes. Try again when the banner says the source is
+  answering.
 - **No duplicate submissions** — a URL that is already queued or in progress is refused until that job
   finishes.
 - **Never overwrites** — a download whose target `Artist/Album/track.flac` already exists is stopped and shown

@@ -1,6 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { queryKeys } from "@/lib/queryKeys";
-import type { Job, Notice, SSEEvent } from "@/lib/types";
+import type { Job, Notice, NoticeAction, SSEEvent } from "@/lib/types";
 
 /**
  * Statuses `GET /queue` does not return. A job that reaches one of them is
@@ -292,8 +292,8 @@ function numberOrNull(
  *
  * The backend's `_emit_event` sends status, progress, title, thumbnail_url,
  * duration, artist and album on every event type, plus the N-of-M counters and
- * `skipped`, and error/detail when they are set. `kind`, `parent_id` and
- * `path` are *not* merged — they never change over a job's life, so the cached
+ * `skipped`, `detail` and `retry_at`, and `error` when it is set. `kind`,
+ * `parent_id` and `path` are *not* merged — they never change over a job's life, so the cached
  * row keeps whatever `GET /queue` (or the creating response) gave it. Neither
  * are `children`: a parent's synthetic `status_change` carries its own derived
  * fields only, and the children it holds are patched by their own events.
@@ -342,11 +342,17 @@ export function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
   if (typeof data.skipped === "boolean") {
     merged.skipped = data.skipped;
   }
-  // Only `done` jobs carry one, and they leave the view — merged anyway so a
-  // row that is still on screen when the event arrives is not left with a
-  // stale note from an earlier state.
-  if (typeof data.detail === "string") {
-    merged.detail = data.detail;
+  // The note, and the instant a rate-limited job will try again. Both are
+  // always present on the wire and null when there is nothing to say, because
+  // both are things the backend takes *back*: a wait ends, and the row must
+  // stop showing "retry 2 of 5 in 45 s". "There is no note" and "this event
+  // does not mention the note" therefore have to be tellable apart, which is
+  // what an explicit null does and an absent key cannot.
+  if (data.detail !== undefined) {
+    merged.detail = typeof data.detail === "string" ? data.detail : null;
+  }
+  if (data.retry_at !== undefined) {
+    merged.retry_at = typeof data.retry_at === "string" ? data.retry_at : null;
   }
 
   return merged;
@@ -433,14 +439,76 @@ export function setJobActionError(
  * checked rather than cast: a malformed entry should be ignored, not rendered
  * as a banner with `undefined` in it.
  */
-function parseNotice(data: Record<string, unknown>): Notice | null {
-  const { id, level, source, message, created_at: createdAt } = data;
+const NOTICE_SOURCES: ReadonlySet<string> = new Set([
+  "navidrome",
+  "lidarr",
+  "youtube",
+  "soundcloud",
+  "bandcamp",
+]);
+
+/**
+ * A path that is not a path: `//host/x` and `/\host\x` are protocol-relative
+ * URLs that a browser resolves against another origin.
+ */
+const NOT_A_PATH = /^\/[/\\]/;
+
+/** Read a notice's optional action, or null when it has none or is malformed. */
+export function parseNoticeAction(value: unknown): NoticeAction | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { label, method, path } = value as Record<string, unknown>;
+  if (typeof label !== "string" || label.length === 0) return null;
+  if (method !== "POST") return null;
+  // An absolute path on this API and nothing else. The banner turns this
+  // straight into a request against `VITE_API_BASE_URL`, so it is checked for
+  // shape rather than compared against `location.origin` — that base URL is
+  // allowed to be another origin, and often is in development.
+  if (typeof path !== "string" || !path.startsWith("/")) return null;
+  if (NOT_A_PATH.test(path)) return null;
+  return { label, method, path };
+}
+
+/** Read one notice off the wire, or null when it is malformed. */
+export function parseNotice(data: Record<string, unknown>): Notice | null {
+  const {
+    id,
+    level,
+    source,
+    message,
+    hold_until: holdUntil,
+    reason,
+    held_since: heldSince,
+    action,
+    created_at: createdAt,
+  } = data;
   if (typeof id !== "string" || id.length === 0) return null;
   if (level !== "error" && level !== "warning") return null;
-  if (source !== "navidrome" && source !== "lidarr") return null;
+  if (typeof source !== "string" || !NOTICE_SOURCES.has(source)) return null;
   if (typeof message !== "string") return null;
   if (typeof createdAt !== "string") return null;
-  return { id, level, source, message, created_at: createdAt };
+  return {
+    id,
+    level,
+    source: source as Notice["source"],
+    message,
+    hold_until: typeof holdUntil === "string" ? holdUntil : null,
+    reason: typeof reason === "string" ? reason : null,
+    held_since: typeof heldSince === "string" ? heldSince : null,
+    action: parseNoticeAction(action),
+    created_at: createdAt,
+  };
+}
+
+/** Read a whole list of notices off the wire, dropping the malformed ones. */
+export function parseNotices(raw: unknown): Notice[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((entry) =>
+      typeof entry === "object" && entry !== null
+        ? parseNotice(entry as Record<string, unknown>)
+        : null,
+    )
+    .filter((notice): notice is Notice => notice !== null);
 }
 
 /**
@@ -461,13 +529,7 @@ function applyNoticesEvent(
   const raw = data.notices;
   if (!Array.isArray(raw)) return;
 
-  const notices = raw
-    .map((entry) =>
-      typeof entry === "object" && entry !== null
-        ? parseNotice(entry as Record<string, unknown>)
-        : null,
-    )
-    .filter((notice): notice is Notice => notice !== null);
+  const notices = parseNotices(raw);
 
   // `useNotices` sets no `staleTime`, so a mount or refocus refetch may be out
   // right now; it would write its older answer over this push when it lands.

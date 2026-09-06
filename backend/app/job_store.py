@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Sequence
 
 from app.models import Job, JobKind, JobStatus
+from app.rate_limit import LaneRecord
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,28 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
     # "no album" and "album unknown" are both a NULL in this column.
     (
         "ALTER TABLE jobs ADD COLUMN album_final INTEGER NOT NULL DEFAULT 0",
+    ),
+    # Version 4 (phase 15): the rate-limit lanes.  One row per source host
+    # that is currently in trouble; a lane that is open has no row at all, so
+    # the common case is an empty table.  It is written here rather than kept
+    # in memory because a container that restarts twice inside one hold would
+    # otherwise walk straight back into the limiter it was waiting out.
+    #
+    # `hold_until` and `held_since` are ISO-8601 UTC, like every other
+    # timestamp in this file.  They are two columns rather than one because
+    # the ceiling asks "how long has this been going on" while the wait asks
+    # "when may we try again", and five extensions of two minutes are an hour
+    # of trouble and only two minutes of wait.
+    (
+        """
+        CREATE TABLE lanes (
+            host        TEXT PRIMARY KEY,
+            hold_until  TEXT NULL,
+            consecutive INTEGER NOT NULL DEFAULT 0,
+            reason      TEXT NULL,
+            held_since  TEXT NULL
+        )
+        """,
     ),
 )
 
@@ -550,6 +573,59 @@ class JobStore:
         if removed:
             logger.info("Retention sweep removed %d finished job(s)", len(removed))
         return removed
+
+    # ------------------------------------------------------------------
+    # Rate-limit lanes
+    # ------------------------------------------------------------------
+
+    def load_lanes(self) -> list[LaneRecord]:
+        """Every persisted lane hold.  Empty when nothing is in trouble."""
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, returning no lanes")
+                return []
+            rows = self._conn.execute("SELECT * FROM lanes").fetchall()
+        return [
+            LaneRecord(
+                host=row["host"],
+                hold_until=_from_iso(row["hold_until"]),
+                consecutive=row["consecutive"],
+                reason=row["reason"],
+                held_since=_from_iso(row["held_since"]),
+            )
+            for row in rows
+        ]
+
+    def save_lane(self, record: "LaneRecord") -> None:
+        """Write one lane's hold, replacing whatever was there."""
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, dropping lane write for %s", record.host)
+                return
+            self._conn.execute(
+                "INSERT INTO lanes (host, hold_until, consecutive, reason, held_since) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(host) DO UPDATE SET "
+                "hold_until = excluded.hold_until, "
+                "consecutive = excluded.consecutive, "
+                "reason = excluded.reason, "
+                "held_since = excluded.held_since",
+                (
+                    record.host,
+                    _to_iso(record.hold_until),
+                    record.consecutive,
+                    record.reason,
+                    _to_iso(record.held_since),
+                ),
+            )
+
+    def delete_lane(self, host: str) -> None:
+        """Forget one lane's hold -- it is open again."""
+        with self._lock:
+            if self._closed:
+                logger.debug("Job store closed, dropping lane clear for %s", host)
+                return
+            self._conn.execute("DELETE FROM lanes WHERE host = ?", (host,))
 
     def close(self) -> None:
         """Close the connection.

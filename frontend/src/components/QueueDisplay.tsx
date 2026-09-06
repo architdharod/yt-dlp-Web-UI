@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   RotateCw,
   Music,
@@ -18,7 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useQueueQuery } from "@/hooks/useQueueQuery";
-import { formatDuration } from "@/lib/format";
+import { formatDuration, withCountdown } from "@/lib/format";
 import { useQueueActions } from "@/hooks/useQueueActions";
 import {
   CANCELLABLE_STATUSES,
@@ -28,6 +28,38 @@ import {
   type ChildCounts,
 } from "@/lib/queue";
 import type { Job, JobStatus } from "@/lib/types";
+
+/** How often the rate-limit countdown redraws. */
+const COUNTDOWN_TICK_MS = 1000;
+
+/**
+ * A job's note, with the seconds recomputed while it is waiting out a rate
+ * limit.
+ *
+ * The backend sends one event per wait with an absolute `retry_at`, not a tick
+ * a second per waiting job, so the ticking is the client's job — and it only
+ * ticks while there is something to count: a note without a `retry_at` (the
+ * common one, "tags not fixed: no match") mounts no interval at all.
+ */
+function JobDetail({
+  detail,
+  retryAt,
+}: {
+  detail: string;
+  retryAt: string | null;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (retryAt === null) return;
+    const timer = setInterval(() => setNow(Date.now()), COUNTDOWN_TICK_MS);
+    return () => clearInterval(timer);
+  }, [retryAt]);
+
+  const text =
+    retryAt === null ? detail : withCountdown(detail, retryAt, now);
+  return <p className="truncate text-xs text-muted-foreground">{text}</p>;
+}
 
 const STATUS_CONFIG: Record<
   JobStatus,
@@ -222,7 +254,7 @@ function JobRow({
           it can be read, but an errored row that carries one keeps it visible.
         */}
         {job.detail != null && job.detail !== "" && (
-          <p className="truncate text-xs text-muted-foreground">{job.detail}</p>
+          <JobDetail detail={job.detail} retryAt={job.retry_at ?? null} />
         )}
 
         {/*

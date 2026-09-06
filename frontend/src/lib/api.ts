@@ -1,3 +1,4 @@
+import { parseNotices } from "./queueCache";
 import type {
   BulkDownloadRequest,
   DownloadRequest,
@@ -10,6 +11,7 @@ import type {
   LibraryResponse,
   LibraryTagRequest,
   Notice,
+  NoticeAction,
   ProbeRequest,
   ProbeResponse,
   SSEEvent,
@@ -255,7 +257,31 @@ export async function fetchNotices(): Promise<Notice[]> {
     throw new Error(`Failed to fetch notices: ${await parseErrorDetail(res)}`);
   }
 
-  return res.json() as Promise<Notice[]>;
+  // Through the same parser the `notices` SSE event goes through, not a cast.
+  // A notice's action becomes a request the banner sends, so the check that a
+  // path is a path has to cover both ways a notice can arrive.
+  return parseNotices((await res.json()) as unknown);
+}
+
+/**
+ * Do what a notice's action button says.
+ *
+ * The notice carries the route (`POST /queue/lanes/youtube/resume` today), so
+ * this takes the action rather than naming the endpoint: a notice with a new
+ * action needs no new function here and no change in the banner.
+ *
+ * The response body is ignored. What the button did is announced the way
+ * everything else is — a fresh `notices` event, and the queue moving — so
+ * there is nothing here for a caller to read.
+ */
+export async function runNoticeAction(action: NoticeAction): Promise<void> {
+  const res = await fetch(`${API_BASE_URL}${action.path}`, {
+    method: action.method,
+  });
+
+  if (!res.ok) {
+    throw new Error(await parseErrorDetail(res));
+  }
 }
 
 /**

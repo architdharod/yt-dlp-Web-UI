@@ -11,12 +11,15 @@ Defines all API routes:
   - GET  /library/trash  -- what is in the trash
   - POST /library/trash/restore -- put one trash entry back
   - POST /library/trash/empty   -- delete the trash permanently
-  - GET  /notices        -- open Navidrome/Lidarr problems worth showing
+  - GET  /notices        -- open problems worth showing: Navidrome/Lidarr
+                            failures, and a source whose rate-limit lane is
+                            currently holding downloads back
   - GET  /queue          -- list in-flight and errored jobs
   - GET  /queue/stream   -- SSE stream of job events
   - POST /queue/{id}/retry   -- retry a failed job
   - POST /queue/{id}/cancel  -- stop a queued or running job
   - POST /queue/{id}/dismiss -- forget an errored job
+  - POST /queue/lanes/{host}/resume -- stop waiting out a source's rate limit
 """
 
 import asyncio
@@ -25,6 +28,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yt_dlp.version
@@ -35,9 +39,14 @@ from sse_starlette.sse import EventSourceResponse
 from app.dedup import DedupCandidate, find_in_library
 from app.downloader import (
     COOKIES_ENV_VAR,
+    POT_PROVIDER_ENV,
+    SLEEP_REQUESTS_ENV,
     DownloadError,
     cookies_file,
+    describe_pot_providers,
     extract_metadata,
+    pot_provider_url,
+    sleep_interval_requests,
     validate_cookies_file,
 )
 from app.file_organizer import DEFAULT_DOWNLOAD_PATH, resolve_artist_album
@@ -77,7 +86,9 @@ from app.models import (
     LibraryResponse,
     MAX_REASON,
     MovedPath,
+    LaneStatus,
     Notice,
+    NoticeAction,
     PreviewRow,
     ProbeCollectionResponse,
     ProbeRequest,
@@ -95,6 +106,7 @@ from app.probe import (
     BandcampProbeError,
     CollectionTooLarge,
     EmptyCollection,
+    RateLimitedProbeError,
     SpotifyProbeError,
     Enumeration,
     ProbeError,
@@ -125,6 +137,15 @@ from app.queue_manager import (
     QueueManager,
     TaggingConflict,
     tagging_conflict_message,
+)
+from app.rate_limit import (
+    LANE_HOSTS,
+    LaneRecord,
+    REASON_BOT_CHECK,
+    host_label,
+    lanes as rate_limit_lanes,
+    notice_message,
+    rate_limit_attempts,
 )
 from app.tagger import musicbrainz_contact, tag_fix_enabled
 
@@ -282,6 +303,57 @@ def _on_notices_changed(notices: list[Notice]) -> None:
 # The board is a module singleton so GET /notices can read it; the hook needs a
 # running event loop and an HTTP client, so it is built in the lifespan.
 notice_board = NoticeBoard(on_change=_on_notices_changed)
+
+
+def _lane_notice_key(host: str) -> str:
+    """The notice-board key one lane's banner is de-duplicated under."""
+    return f"rate_limit:{host}"
+
+
+def _on_lane_changed(host: str, record: LaneRecord) -> None:
+    """Keep the banner in step with one lane's hold.
+
+    Retract and re-raise on every change rather than editing in place, because
+    a re-raise is what gives the notice a new id -- and a new id is what brings
+    a banner the user dismissed back when the hold moves.  A lane that is no
+    longer held only retracts, which is how the banner goes away by itself.
+
+    This is therefore only called on a real transition: a new 429 or an
+    extension, the bot check, a resume, the lane opening, the ceiling, and the
+    one moment the wording escalates.  The seconds ticking by are *not* a
+    transition -- the notice carries ``hold_until`` and the banner counts down
+    from it -- because a re-raise a second would un-dismiss the banner
+    endlessly and churn its id.
+    """
+    key = _lane_notice_key(host)
+    notice_board.retract(host, key)
+    if record.hold_until is None:
+        return
+    now = datetime.now(timezone.utc)
+    remaining = (record.hold_until - now).total_seconds()
+    if remaining <= 0:
+        return
+    held_for = (
+        (now - record.held_since).total_seconds()
+        if record.held_since is not None
+        else 0.0
+    )
+    notice_board.raise_notice(
+        host,
+        "error" if record.reason == REASON_BOT_CHECK else "warning",
+        notice_message(host, record.reason, held_for),
+        key=key,
+        hold_until=record.hold_until.isoformat(),
+        reason=record.reason,
+        held_since=(
+            record.held_since.isoformat() if record.held_since is not None else None
+        ),
+        action=NoticeAction(
+            label="Resume now",
+            method="POST",
+            path=f"/queue/lanes/{host}/resume",
+        ),
+    )
 rescan_hook: RescanHook | None = None
 
 
@@ -376,6 +448,18 @@ async def lifespan(app: FastAPI):
     logger.info("MUSICBRAINZ_CONTACT      = %s", musicbrainz_contact())
     logger.info("TAG_FIX_TIMEOUT_SECONDS  = %s", queue_manager.tag_fix_timeout)
     logger.info("PROBE_TIMEOUT_SECONDS    = %s", probe_timeout_seconds())
+    logger.info("%-24s = %s", SLEEP_REQUESTS_ENV, sleep_interval_requests())
+    logger.info("RATE_LIMIT_ATTEMPTS      = %s", rate_limit_attempts())
+    logger.info("%-24s = %s", POT_PROVIDER_ENV, pot_provider_url() or "(not set)")
+    # Which PO-token providers yt-dlp's plugin discovery actually found.
+    # yt-dlp itself only mentions these at -v trace level, and only once a
+    # video is being fetched -- far too late to notice that the sidecar plugin
+    # is missing, which is exactly the difference between "anonymous downloads
+    # work" and "YouTube asks you to sign in".
+    providers = describe_pot_providers()
+    logger.info(
+        "PO-token providers       = %s", ", ".join(providers) if providers else "(none)"
+    )
     # The path only -- never the file, which is a set of live session cookies.
     logger.info("%-24s = %s", COOKIES_ENV_VAR, cookies_file() or "(not set)")
     for line in describe_config(rescan_config):
@@ -389,6 +473,11 @@ async def lifespan(app: FastAPI):
 
     store = JobStore(get_db_path(data_path))
     queue_manager.attach_store(store)
+    # The lanes go on the same store, and their banner on the same board.
+    # Restoring a hold is the point: a container that restarts inside one would
+    # otherwise send the burst that earned it a second time.
+    rate_limit_lanes.set_callbacks(on_change=_on_lane_changed)
+    rate_limit_lanes.attach_store(store)
 
     # Restore before the app serves anything, so the duplicate check and
     # GET /queue both see the previous run's jobs from the first request on.
@@ -487,6 +576,10 @@ async def health() -> HealthResponse:
 @app.get("/notices", response_model=list[Notice])
 async def get_notices() -> list[Notice]:
     """The Navidrome and Lidarr problems currently worth showing the user.
+
+    Two kinds today: a Navidrome or Lidarr call that failed, and a source whose
+    rate-limit lane is holding downloads back -- the second carries a
+    ``hold_until`` the banner counts down from and a "Resume now" action.
 
     The ``notices`` SSE event carries this same list every time it changes,
     but a client that connects after
@@ -594,6 +687,11 @@ async def probe_download(request: ProbeRequest):
       artist page, or was one whose artist could not be matched to a YouTube
       Music discography.  yt-dlp was never asked, so the message is ours and
       goes out unprefixed;
+    * **400** with the rate-limit sentence -- the source is refusing this
+      server's requests for now, either because it answered 429 or because its
+      lane is already being waited out by the queue.  The probe never backs off
+      by itself: a person is watching the form, and a page that hangs for eight
+      minutes is worse than one that says "try again in 45 s";
     * **400** with the Bandcamp streaming sentence -- the seller has turned
       streaming off for the track, so the page holds no audio at all.  Also
       unprefixed: yt-dlp reports it as "No video formats found" and a link to
@@ -611,6 +709,7 @@ async def probe_download(request: ProbeRequest):
         BandcampProbeError,
         CollectionTooLarge,
         EmptyCollection,
+        RateLimitedProbeError,
         SpotifyProbeError,
     ) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -910,6 +1009,37 @@ async def cancel_job(job_id: str) -> Job:
     except QueueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return queue_manager.with_children(job)
+
+
+@app.post("/queue/lanes/{host}/resume", response_model=LaneStatus)
+async def resume_lane(host: str) -> LaneStatus:
+    """Stop waiting out *host*'s rate limit and try again now.
+
+    The button on the rate-limit banner.  It clears the hold and releases one
+    waiting job as a canary: if nothing has actually changed that one job finds
+    out and the lane goes back to waiting, rather than every job of that host
+    walking into the limiter together.  With nothing waiting it simply opens
+    the lane.
+
+    Idempotent on purpose -- resuming an open lane is a no-op that answers with
+    the open lane -- so a double click, or a click on a banner that has just
+    gone away, is not an error.  **404** only for a host that has no lane at
+    all, which is a URL the client made up.
+    """
+    if host not in LANE_HOSTS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{host!r} is not a source with a rate-limit lane",
+        )
+    record = queue_manager.resume_lane(host)
+    logger.info("%s lane resumed by the user", host_label(host))
+    return LaneStatus(
+        host=host,
+        held=record.hold_until is not None,
+        hold_until=record.hold_until.isoformat() if record.hold_until else None,
+        reason=record.reason,
+        consecutive=record.consecutive,
+    )
 
 
 @app.post("/queue/{job_id}/dismiss", status_code=204)

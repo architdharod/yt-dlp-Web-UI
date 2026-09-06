@@ -41,6 +41,23 @@ def isolated_paths(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def open_lanes():
+    """Start every test with every rate-limit lane open and unpersisted.
+
+    The lane manager is a module singleton (both the queue and the probe have
+    to see the same holds), so without this a test that provokes a 429 would
+    leave YouTube held for the next one -- which would then refuse to probe.
+    """
+    from app.rate_limit import lanes
+
+    lanes.reset_for_tests()
+    try:
+        yield lanes
+    finally:
+        lanes.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def stub_download_audio(isolated_paths):
     """Never let a test reach the real yt-dlp.
 

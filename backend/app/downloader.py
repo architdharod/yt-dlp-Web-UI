@@ -164,6 +164,18 @@ _STATIC_OPTS: dict = {
 # starts asking the container to prove it is not a bot.
 COOKIES_ENV_VAR = "YTDLP_COOKIES_FILE"
 
+# How long yt-dlp waits between extractor requests, and where that is
+# configured.  0.75 is what yt-dlp's own `-t sleep` preset uses.
+SLEEP_REQUESTS_ENV = "YTDLP_SLEEP_REQUESTS"
+DEFAULT_SLEEP_INTERVAL_REQUESTS = 0.75
+
+# The PO-token provider sidecar (`brainicism/bgutil-ytdlp-pot-provider`), and
+# the extractor-args key its yt-dlp plugin reads its base URL from.  A PO token
+# is what keeps an anonymous, containerised yt-dlp out of YouTube's bot check
+# in the first place; cookies stay as the manual last resort.
+POT_PROVIDER_ENV = "POT_PROVIDER_URL"
+POT_PROVIDER_EXTRACTOR_KEY = "youtubepot-bgutilhttp"
+
 # The one cookie jar every YoutubeDL in this process shares, loaded once at
 # startup by :func:`load_cookie_jar`.
 #
@@ -263,6 +275,45 @@ def validate_cookies_file() -> None:
     load_cookie_jar()
 
 
+def sleep_interval_requests() -> float:
+    """Seconds yt-dlp sleeps between extractor requests, from the env.
+
+    Prevention rather than cure: yt-dlp's own ``-t sleep`` preset uses 0.75 for
+    exactly this, and pacing the extractor is what keeps a forty-track playlist
+    from arriving at YouTube as forty requests in two seconds.  It applies to
+    every session this app opens, the probe's flat enumeration included --
+    which is the one that fires the most requests in the shortest time.
+
+    ``0`` turns it off; an unset or empty variable (which is what docker
+    compose substitutes) means the default.
+    """
+    raw = os.environ.get(SLEEP_REQUESTS_ENV)
+    if not raw:
+        return DEFAULT_SLEEP_INTERVAL_REQUESTS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s=%r is not a number; using %s",
+            SLEEP_REQUESTS_ENV,
+            raw,
+            DEFAULT_SLEEP_INTERVAL_REQUESTS,
+        )
+        return DEFAULT_SLEEP_INTERVAL_REQUESTS
+    return max(0.0, value)
+
+
+def pot_provider_url() -> str | None:
+    """The PO-token provider sidecar's base URL, or ``None`` when unset.
+
+    Empty counts as unset, which leaves the plugin at its own default
+    (``http://127.0.0.1:4416``) -- and with no sidecar there, simply logging
+    that it could not be reached.  Under compose the variable is set to the
+    service, so this is only ever ``None`` for a backend run by hand.
+    """
+    return os.environ.get(POT_PROVIDER_ENV) or None
+
+
 def base_opts() -> dict:
     """The yt-dlp options every extraction in this app starts from.
 
@@ -270,7 +321,45 @@ def base_opts() -> dict:
     back.  Cookies are *not* in here; they reach yt-dlp as the shared jar
     :func:`ytdl` attaches.
     """
-    return dict(_STATIC_OPTS)
+    opts = dict(_STATIC_OPTS)
+
+    sleep = sleep_interval_requests()
+    if sleep > 0:
+        opts["sleep_interval_requests"] = sleep
+
+    provider = pot_provider_url()
+    if provider:
+        # The bgutil HTTP provider plugin's documented key.  yt-dlp's
+        # `extractor_args` is {ie_key_lowercase: {arg: [values]}}, so the URL
+        # travels as a one-element list -- the same shape
+        # `--extractor-args "youtubepot-bgutilhttp:base_url=..."` produces.
+        opts["extractor_args"] = {
+            POT_PROVIDER_EXTRACTOR_KEY: {"base_url": [provider]}
+        }
+
+    return opts
+
+
+def describe_pot_providers() -> list[str]:
+    """The PO-token providers yt-dlp has loaded, for the startup banner.
+
+    yt-dlp only mentions these at ``-v`` trace level and only when a video is
+    actually fetched, which is far too late to notice that the plugin is not
+    installed.  Constructing one ``YoutubeDL`` is what triggers plugin
+    discovery, after which the registry names what was found.
+
+    The registry is private, so every step is defensive: a yt-dlp that moves it
+    costs a log line, never a boot.
+    """
+    try:
+        with ytdl(base_opts()):
+            from yt_dlp.extractor.youtube.pot import _registry
+
+            names = sorted(_registry._pot_providers.value.keys())
+    except Exception as exc:  # pragma: no cover - depends on yt-dlp internals
+        logger.debug("Could not list yt-dlp PO-token providers: %s", exc)
+        return []
+    return names
 
 
 @contextlib.contextmanager
@@ -1249,120 +1338,11 @@ def download_audio(
     logger.info("Starting download for job %s (url=%s)", job.id, job.url)
     logger.info("DOWNLOAD_PATH = %s", download_path)
 
-    # Try to extract metadata for building the output path.  If this
-    # fails (e.g. stale yt-dlp, transient network issue) we fall back
-    # to the job's title or a generic name so the download can still
-    # be attempted -- yt-dlp may resolve formats during the actual
-    # download that it couldn't during a metadata-only probe.
-    #
-    # `skip_download` keeps yt-dlp away from the file downloaders for what is
-    # only a probe, and one extractor retry keeps a dead URL from holding the
-    # job here for minutes before the download proper even starts.  `retries` is
-    # deliberately left alone: it governs the file downloaders, which the real
-    # download below still wants to be persistent.
-    probe_opts = {**base_opts(), "skip_download": True, "extractor_retries": 1}
-    info: dict | None = None
-    try:
-        with ytdl(probe_opts) as ydl:
-            info = ydl.extract_info(job.url, download=False)
-    except yt_dlp.utils.YoutubeDLError as exc:
-        logger.warning(
-            "Pre-download metadata extraction failed for job %s: %s", job.id, exc
-        )
-
-    # The probe has no progress hook of its own, so this is the first chance to
-    # notice a cancel that arrived while it was running -- without it the job
-    # would go on to fetch the whole track before its first hook fired.
-    _raise_if_cancelled(cancel)
-
-    if info is not None:
-        _reject_collections(info, job.url)
-        # A child of a bulk parent was enumerated: its title and album came
-        # from the collection listing, and yt-dlp is looking at one video.
-        # Where the two disagree the enumeration wins -- but the two fields
-        # are gated differently.
-        #
-        # Title: on the parent alone, because every enumerated child's title
-        # came from a listing and is what the preview showed.  The enumeration
-        # has the track's name ("Horizon"), yt-dlp has the video's ("Glass
-        # Beams - 'Horizon' (Official Audio)"); the file and the tag have to
-        # be the first.  A row's title may have been truncated by
-        # ``probe._cap`` on its way through the preview, and that truncated
-        # title is still the row the user ticked, so it still wins.
-        enumerated = job.parent_id is not None
-        # Album: only where the source read the *release*, which is what
-        # ``album_final`` says.  There the answer is whole, empty included --
-        # a Single deliberately has no album, and taking yt-dlp's would refile
-        # a loose Single into a folder the preview never mentioned.  A row
-        # from the flat pass carries no such promise: its empty album is a
-        # listing that had none, so yt-dlp still fills it in, as it does for a
-        # plain ``POST /download``.
-        enumerated_album = job.parent_id is not None and job.album_final
-        title = (job.title if enumerated and job.title else None) or (
-            info.get("title") or job.title or "Unknown Title"
-        )
-        ytdlp_artist = _pick_artist(info)
-        ytdlp_album = None if enumerated_album else info.get("album")
-        logger.info(
-            "yt-dlp metadata: title=%r, artist=%r, album=%r",
-            title,
-            ytdlp_artist,
-            ytdlp_album,
-        )
-        # Backfill anything the submit-time probe could not provide.
-        job.title = job.title or title
-        job.duration = job.duration or info.get("duration")
-        job.thumbnail_url = job.thumbnail_url or info.get("thumbnail")
-        if on_phase is not None:
-            on_phase("metadata")
-    else:
-        title = job.title or "Unknown Title"
-        ytdlp_artist = None
-        ytdlp_album = None
-        logger.warning(
-            "No yt-dlp metadata available, using fallback title=%r", title
-        )
-
-    track_filename = track_filename_for(title)
-
-    try:
-        output_path = get_output_path(
-            track_filename=track_filename,
-            user_artist=job.artist,
-            user_album=job.album,
-            ytdlp_artist=ytdlp_artist,
-            ytdlp_album=ytdlp_album,
-            download_path=download_path,
-        )
-    except UnsafePathError as exc:
-        logger.error("Refusing unsafe output path for job %s: %s", job.id, exc)
-        raise DownloadError(f"Refusing unsafe output path: {exc}") from exc
-
-    # The same resolution that chose the folders, so the tags cannot disagree
-    # with where the file lands.
-    tag_artist, tag_album = resolve_artist_album(
-        job.artist, job.album, ytdlp_artist, ytdlp_album
-    )
-
-    # Published before the scratch directory, the download and every mkdir:
-    # the in-flight guard has to know where this job is going before anything
-    # of it exists on disk, otherwise a move could rename the folder out from
-    # under a download whose destination nobody could name yet.
-    if on_target is not None:
-        on_target(f"{tag_artist}/{tag_album}" if tag_album else tag_artist)
-
-    logger.info("Output file path: %s", output_path)
-
-    # Cheap check first: nothing has been fetched yet, so a track that is
-    # already in the library costs one stat() rather than a whole download.
-    _already_in_library(output_path, download_path)
-
-    # Sampled before anything is created so the failure path can tell "we made
-    # this empty folder" from "the user's empty folder" (or a concurrent job's).
-    would_create = _missing_output_dirs(output_path, download_path)
-
     # Nothing unfinished may be written into the library, so yt-dlp gets a
     # per-job scratch directory and we move the finished file out ourselves.
+    # Created before the extraction rather than after it, because the
+    # extraction and the download are now one yt-dlp session and that session
+    # has to know where it may write from the first call.
     temp_dir = job_temp_dir(job.id, download_path)
     try:
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -1399,16 +1379,54 @@ def download_audio(
         "progress_hooks": [_make_progress_hook(on_progress, cancel)],
     }
 
+    # Set inside the session below and read by the failure path outside it.
+    output_path: Path | None = None
+    would_create: frozenset[Path] = frozenset()
+
     logger.info("Starting yt-dlp download for job %s ...", job.id)
     try:
         try:
-            # Everything between the probe and here -- the path resolution, the
-            # library check, creating the scratch directory -- runs without a
-            # hook, so the stop button is read once more before any bytes are
-            # fetched.
+            # The stop button is read once more before anything is fetched.
             _raise_if_cancelled(cancel)
+
             with ytdl(opts) as ydl:
-                result_info = ydl.extract_info(job.url, download=True)
+                # ---- one extraction per track ----
+                #
+                # This used to be two: a metadata-only probe to resolve the
+                # output path, then a second full `extract_info(download=True)`
+                # that extracted the same page again.  That doubled every
+                # child's request count against the source, which is precisely
+                # what earns a 429 on a large playlist.  Now the page is read
+                # once and the resulting info dict is handed straight back to
+                # yt-dlp to download from -- `process_ie_result` is what
+                # `download_with_info_file` uses for exactly this, so it is the
+                # supported way in.
+                #
+                # The old "if the probe failed, try the download anyway"
+                # fallback is gone with the second extraction: an extraction
+                # that fails now leaves no info dict, and there is nothing left
+                # to download from.  It never had much to offer -- the two
+                # calls differed only in `skip_download` -- and it cost every
+                # job a second page fetch to keep.
+                info = ydl.extract_info(job.url, download=False)
+                if info is None:
+                    logger.error("yt-dlp returned no metadata for job %s", job.id)
+                    raise DownloadError("yt-dlp returned no metadata")
+
+                output_path, would_create, title, tag_artist, tag_album = _plan_output(
+                    job,
+                    info,
+                    download_path,
+                    on_phase=on_phase,
+                    on_target=on_target,
+                )
+
+                # Everything between the extraction and here -- the path
+                # resolution, the library check -- runs without a hook, so the
+                # stop button is read again before any bytes are fetched.
+                _raise_if_cancelled(cancel)
+
+                result_info = ydl.process_ie_result(info, download=True)
 
             source_audio = _downloaded_audio_path(result_info)
             if source_audio is None:
@@ -1441,9 +1459,10 @@ def download_audio(
                 picture = _cover_picture(thumbnail, temp_dir, cancel)
 
             # The download's own info dict is the better source: it carries the
-            # extractor and id fields the provenance tags need, which the
-            # metadata-only probe may not have produced at all if it failed.
-            tag_info = result_info if isinstance(result_info, dict) else (info or {})
+            # extractor and id fields the provenance tags need, and
+            # `process_ie_result` returns the same dict enriched with what the
+            # download itself learned.
+            tag_info = result_info if isinstance(result_info, dict) else info
             _write_tags(
                 flac_path,
                 title=title,
@@ -1492,7 +1511,8 @@ def download_audio(
         # `os.replace`; this therefore has something to do only when that move
         # itself failed.  The scratch directory, with every partial and temp
         # file in it, is removed by the caller's `finally`.
-        _remove_empty_output_dirs(output_path, would_create)
+        if output_path is not None:
+            _remove_empty_output_dirs(output_path, would_create)
         raise
 
     # Only the log line needs the size, and the download is already over: the
@@ -1514,3 +1534,106 @@ def download_audio(
             "Download complete for job %s: %s (%.2f MB)", job.id, output_path, size_mb
         )
     return output_path
+
+
+def _plan_output(
+    job: Job,
+    info: dict,
+    download_path: str,
+    on_phase: Callable[[str], None] | None,
+    on_target: Callable[[str], None] | None,
+) -> tuple[Path, frozenset[Path], str, str, str | None]:
+    """Decide where this track lands, and refuse it if it is already there.
+
+    Split out of :func:`download_audio` when the two extractions became one:
+    everything here happens between "yt-dlp has read the page" and "yt-dlp may
+    start fetching bytes", and keeping it inline would have buried that
+    boundary inside a hundred lines of a single ``with`` block.
+
+    Returns the output path, the library directories this run would have to
+    create, the title the file and tags will carry, and the resolved artist and
+    album.
+
+    Raises:
+        DownloadError: The URL is a collection, the resolved path is unsafe, or
+            the track is already in the library.
+    """
+    _reject_collections(info, job.url)
+    # A child of a bulk parent was enumerated: its title and album came
+    # from the collection listing, and yt-dlp is looking at one video.
+    # Where the two disagree the enumeration wins -- but the two fields
+    # are gated differently.
+    #
+    # Title: on the parent alone, because every enumerated child's title
+    # came from a listing and is what the preview showed.  The enumeration
+    # has the track's name ("Horizon"), yt-dlp has the video's ("Glass
+    # Beams - 'Horizon' (Official Audio)"); the file and the tag have to
+    # be the first.  A row's title may have been truncated by
+    # ``probe._cap`` on its way through the preview, and that truncated
+    # title is still the row the user ticked, so it still wins.
+    enumerated = job.parent_id is not None
+    # Album: only where the source read the *release*, which is what
+    # ``album_final`` says.  There the answer is whole, empty included --
+    # a Single deliberately has no album, and taking yt-dlp's would refile
+    # a loose Single into a folder the preview never mentioned.  A row
+    # from the flat pass carries no such promise: its empty album is a
+    # listing that had none, so yt-dlp still fills it in, as it does for a
+    # plain ``POST /download``.
+    enumerated_album = job.parent_id is not None and job.album_final
+    title = (job.title if enumerated and job.title else None) or (
+        info.get("title") or job.title or "Unknown Title"
+    )
+    ytdlp_artist = _pick_artist(info)
+    ytdlp_album = None if enumerated_album else info.get("album")
+    logger.info(
+        "yt-dlp metadata: title=%r, artist=%r, album=%r",
+        title,
+        ytdlp_artist,
+        ytdlp_album,
+    )
+    # Backfill anything the submit-time probe could not provide.
+    job.title = job.title or title
+    job.duration = job.duration or info.get("duration")
+    job.thumbnail_url = job.thumbnail_url or info.get("thumbnail")
+    if on_phase is not None:
+        on_phase("metadata")
+
+    track_filename = track_filename_for(title)
+
+    try:
+        output_path = get_output_path(
+            track_filename=track_filename,
+            user_artist=job.artist,
+            user_album=job.album,
+            ytdlp_artist=ytdlp_artist,
+            ytdlp_album=ytdlp_album,
+            download_path=download_path,
+        )
+    except UnsafePathError as exc:
+        logger.error("Refusing unsafe output path for job %s: %s", job.id, exc)
+        raise DownloadError(f"Refusing unsafe output path: {exc}") from exc
+
+    # The same resolution that chose the folders, so the tags cannot disagree
+    # with where the file lands.
+    tag_artist, tag_album = resolve_artist_album(
+        job.artist, job.album, ytdlp_artist, ytdlp_album
+    )
+
+    # Published before the download and every mkdir: the in-flight guard has to
+    # know where this job is going before anything of it exists in the library,
+    # otherwise a move could rename the folder out from under a download whose
+    # destination nobody could name yet.
+    if on_target is not None:
+        on_target(f"{tag_artist}/{tag_album}" if tag_album else tag_artist)
+
+    logger.info("Output file path: %s", output_path)
+
+    # Cheap check first: nothing has been fetched yet, so a track that is
+    # already in the library costs one stat() rather than a whole download.
+    _already_in_library(output_path, download_path)
+
+    # Sampled before anything is created so the failure path can tell "we made
+    # this empty folder" from "the user's empty folder" (or a concurrent job's).
+    would_create = _missing_output_dirs(output_path, download_path)
+
+    return output_path, would_create, title, tag_artist, tag_album
