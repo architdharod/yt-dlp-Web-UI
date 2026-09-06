@@ -38,12 +38,10 @@ from app.probe import (
     clear_cache,
     probe,
 )
+from app.fetch import MAX_RESPONSE_BYTES, USER_AGENT, TIMEOUT as _TIMEOUT
 from app.spotify import (
-    MAX_RESPONSE_BYTES,
-    _TIMEOUT,
     SPOTIFY_HOST,
     UNSUPPORTED_KIND_MESSAGE,
-    USER_AGENT,
     SpotifyTarget,
     SpotifyUnavailable,
     is_spotify_url,
@@ -54,6 +52,7 @@ from app.ytmusic import YouTubeMusicUnavailable, canonical_channel_url, search_a
 
 from tests.test_probe import fake_ytdl
 from tests.test_routes import client, fresh_app  # noqa: F401  (pytest fixtures)
+from tests.conftest import FakeResponse, FakeSession
 from tests.test_ytmusic import FakeYTMusic, fake_client
 
 ARTIST_ID = "4Z8W4fKeB5YxbusRsdQVPb"
@@ -74,77 +73,6 @@ def _empty_probe_cache():
     probe_module._probe_slots = asyncio.Semaphore(probe_module.MAX_CONCURRENT_PROBES)
     yield
     clear_cache()
-
-
-# ---------------------------------------------------------------------------
-# A stand-in for requests.Session
-# ---------------------------------------------------------------------------
-
-
-class FakeRaw:
-    """The urllib3 response body, read the way :func:`_get_text` reads it.
-
-    ``read1`` hands back at most *amt* bytes and an empty ``bytes`` at the end,
-    which is what the loop breaks on.
-    """
-
-    def __init__(self, body: bytes):
-        self._body = body
-        self._offset = 0
-        self.reads = 0
-
-    def read1(self, amt=-1, decode_content=True):
-        self.reads += 1
-        size = len(self._body) - self._offset if amt is None or amt < 0 else amt
-        chunk = self._body[self._offset : self._offset + size]
-        self._offset += len(chunk)
-        return chunk
-
-
-class FakeResponse:
-    """One canned answer.
-
-    *content_type* is the ``Content-Type`` header verbatim, so a test can leave
-    the charset undeclared -- which is the case Spotify actually serves -- or
-    declare one.  ``encoding`` is deliberately absent: :func:`_get_text` reads
-    the header rather than ``requests``' ISO-8859-1 guess.
-    """
-
-    def __init__(self, status_code=200, body=b"", content_type=None):
-        self.status_code = status_code
-        self.raw = FakeRaw(body)
-        self.headers = {} if content_type is None else {"Content-Type": content_type}
-        self.closed = False
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.closed = True
-        return False
-
-
-class FakeSession:
-    """``requests.Session`` with canned answers, keyed by URL.
-
-    A value that is an ``Exception`` is raised, which is how a timeout is
-    written; anything else is the response.  Every call is recorded so the
-    tests can assert on the request itself -- the timeout, the redirect policy
-    and the User-Agent are as much of the contract as the body is.
-    """
-
-    def __init__(self, responses=None):
-        self.responses = responses or {}
-        self.calls: list[dict] = []
-
-    def get(self, url, **kwargs):
-        self.calls.append({"url": url, **kwargs})
-        answer = self.responses.get(url)
-        if isinstance(answer, Exception):
-            raise answer
-        if answer is None:
-            return FakeResponse(status_code=404)
-        return answer
 
 
 def oembed(name: str) -> FakeResponse:

@@ -142,6 +142,15 @@ function child(id: string, status: JobStatus, error: string | null = null): Job 
   return { ...job(id, status), parent_id: "p1", error };
 }
 
+/** A child the backend marked as a skip — the field a current backend sends. */
+function skippedChild(id: string, error: string): Job {
+  return { ...child(id, "error", error), skipped: true };
+}
+
+/** The Bandcamp reason, spelled as the backend spells it. */
+const BANDCAMP_NO_STREAM =
+  "Bandcamp: streaming is disabled for this track, so there is nothing to download";
+
 describe("a bulk parent in the badge", () => {
   it("counts once, however many children it is running", () => {
     // GET /queue lists no child at the top level, so the children are only
@@ -165,7 +174,32 @@ describe("a bulk parent in the badge", () => {
 });
 
 describe("isSkipped", () => {
-  it("is true only for the already-in-library error", () => {
+  it("takes the backend's answer whenever there is one", () => {
+    // Whichever reason it was — already in the library, or a Bandcamp seller
+    // with streaming off — the backend has decided and the UI does not
+    // re-derive it from the message.
+    expect(isSkipped(skippedChild("c", BANDCAMP_NO_STREAM))).toBe(true);
+    expect(
+      isSkipped(skippedChild("c", `${ALREADY_IN_LIBRARY_PREFIX}Kong.flac`)),
+    ).toBe(true);
+    expect(
+      isSkipped({ ...child("c", "error", "ffmpeg exploded"), skipped: false }),
+    ).toBe(false);
+  });
+
+  it("does not second-guess a false from the backend", () => {
+    // The error text alone would say "skip"; the backend says otherwise, and
+    // the backend is the one that knows.
+    const job = {
+      ...child("c", "error", `${ALREADY_IN_LIBRARY_PREFIX}Kong.flac`),
+      skipped: false,
+    };
+    expect(isSkipped(job)).toBe(false);
+  });
+
+  it("falls back to the prefix when the field is missing", () => {
+    // A backend older than the field — a rolling update, where the queue and
+    // the SSE stream can be served by different versions.
     expect(
       isSkipped(child("c", "error", `${ALREADY_IN_LIBRARY_PREFIX}Kong.flac`)),
     ).toBe(true);
@@ -198,6 +232,20 @@ describe("childCounts", () => {
       skipped: 1,
       cancelled: 1,
       active: 4,
+    });
+  });
+
+  it("counts a Bandcamp track with streaming off as a skip", () => {
+    const parent = bulk([
+      skippedChild("c1", BANDCAMP_NO_STREAM),
+      child("c2", "error", "ffmpeg exploded"),
+      child("c3", "done"),
+    ]);
+
+    expect(childCounts(parent)).toMatchObject({
+      done: 1,
+      failed: 1,
+      skipped: 1,
     });
   });
 

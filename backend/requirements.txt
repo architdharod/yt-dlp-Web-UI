@@ -17,6 +17,15 @@ httpx==0.28.1
 # mode, so app/tagger.py wraps it thinly enough to be swapped.
 musicbrainzngs==0.7.1
 
+# Read directly, not only through ytmusicapi: app/fetch.py makes the one
+# bounded GET that app/spotify.py and app/bandcamp.py read a public page with,
+# and app/ytmusic.py catches urllib3's errors by class.  Declared here because
+# ytmusicapi's own floor (requests>=2.22) allows urllib3 1.26, whose
+# HTTPResponse has no `read1` -- and reading one socket read at a time is what
+# lets app/fetch.py check the probe's deadline between chunks.
+requests>=2.32
+urllib3>=2,<3
+
 # Keyless YouTube Music access for the artist enumeration in app/ytmusic.py: a
 # channel URL becomes a discography (albums, EPs, singles) instead of the pile
 # of uploads a flat yt-dlp pass sees.  Pinned: it parses YouTube's internal

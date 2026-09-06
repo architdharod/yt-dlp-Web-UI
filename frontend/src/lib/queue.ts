@@ -51,14 +51,20 @@ export function sortJobs(jobs: readonly Job[]): Job[] {
 }
 
 /**
- * Whether a job that ended as an error was in fact a skipped duplicate.
+ * Whether a job that ended as an error was in fact skipped.
  *
  * The backend has no "skipped" status: a download whose track is already under
- * the target artist ends as an error carrying the already-in-library prefix.
- * Nothing went wrong and retrying would fail identically, so the queue reads
- * it neutrally and offers no Retry.
+ * the target artist, or whose Bandcamp seller has streaming turned off, ends
+ * as an error carrying that reason. Nothing went wrong and retrying would fail
+ * identically, so the queue reads it neutrally and offers no Retry.
+ *
+ * Which errors those are is the backend's answer (`Job.skipped`), not a list
+ * of strings kept in step over here. The prefix check is only the fallback for
+ * a backend too old to send the field — a rolling update, where the queue is
+ * served by one version and the SSE stream by another.
  */
 export function isSkipped(job: Job): boolean {
+  if (job.skipped !== undefined) return job.skipped;
   return job.error?.startsWith(ALREADY_IN_LIBRARY_PREFIX) ?? false;
 }
 
@@ -67,7 +73,7 @@ export interface ChildCounts {
   done: number;
   /** Errors that are real failures — the ones a Retry is offered for. */
   failed: number;
-  /** Errors that are duplicates the backend refused to download again. */
+  /** Errors the backend marked as skips: nothing to retry. */
   skipped: number;
   cancelled: number;
   /** Queued, downloading, converting, or tagging: still to come. */
@@ -79,7 +85,7 @@ export interface ChildCounts {
  *
  * The parent's own `progress_done`/`progress_total` say "3 of 12"; this is the
  * line under it that says what became of the other nine. Skips are split out
- * of the error count because a collection where half the tracks were already
+ * of the error count because a playlist where half the tracks were already
  * in the library has not half failed.
  *
  * A parent with no `children` (one built from an SSE snapshot before the

@@ -317,3 +317,104 @@ def no_musicbrainz_or_cover_art():
         patch.object(album_tagger_module.httpx, "Client", side_effect=refuse),
     ):
         yield
+
+
+@pytest.fixture(autouse=True)
+def no_bandcamp_page_fetch():
+    """Never let a test reach a Bandcamp seller's page.
+
+    A probe of a Bandcamp artist or label URL reads the page once for the
+    display name, and a route test that only looked at the response body would
+    otherwise fire a real request at Bandcamp.  Returning None is the "page
+    could not be read" case, in which the probe keeps the subdomain -- which is
+    what every test expected before the page was read at all.
+
+    Tests that are *about* the name patch the same attribute over this fixture.
+    """
+    import app.probe as probe_module
+
+    with patch.object(probe_module, "resolve_bandcamp_artist_name", return_value=None):
+        yield
+
+
+# ---------------------------------------------------------------------------
+# A stand-in for requests.Session
+# ---------------------------------------------------------------------------
+#
+# Shared by every test of something that reads a public page through
+# :mod:`app.fetch` -- Spotify's artist name and Bandcamp's display name so far.
+# The bounded read is one piece of code now, so its stand-in is one too.
+
+
+class FakeRaw:
+    """The urllib3 response body, read the way :func:`app.fetch.get_text` reads it.
+
+    ``read1`` hands back at most *amt* bytes and an empty ``bytes`` at the end,
+    which is what the loop breaks on.
+    """
+
+    def __init__(self, body: bytes):
+        self._body = body
+        self._offset = 0
+        self.reads = 0
+
+    def read1(self, amt=-1, decode_content=True):
+        self.reads += 1
+        size = len(self._body) - self._offset if amt is None or amt < 0 else amt
+        chunk = self._body[self._offset : self._offset + size]
+        self._offset += len(chunk)
+        return chunk
+
+
+class FakeResponse:
+    """One canned answer.
+
+    *content_type* is the ``Content-Type`` header verbatim, so a test can leave
+    the charset undeclared -- which is the case these sites actually serve -- or
+    declare one.  ``encoding`` is deliberately absent: :func:`app.fetch.get_text` reads
+    the header rather than ``requests``' ISO-8859-1 guess.
+    """
+
+    def __init__(self, status_code=200, body=b"", content_type=None):
+        self.status_code = status_code
+        self.raw = FakeRaw(body)
+        self.headers = {} if content_type is None else {"Content-Type": content_type}
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+        return False
+
+
+class FakeSession:
+    """``requests.Session`` with canned answers, keyed by URL.
+
+    A value that is an ``Exception`` is raised, which is how a timeout is
+    written; anything else is the response.  Every call is recorded so the
+    tests can assert on the request itself -- the timeout, the redirect policy
+    and the User-Agent are as much of the contract as the body is.
+
+    ``closed`` records :meth:`close`, because whether a caller closes a session
+    it opened itself (and leaves alone one it was handed) is part of what the
+    callers promise.
+    """
+
+    def __init__(self, responses=None):
+        self.responses = responses or {}
+        self.calls: list[dict] = []
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+    def get(self, url, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        answer = self.responses.get(url)
+        if isinstance(answer, Exception):
+            raise answer
+        if answer is None:
+            return FakeResponse(status_code=404)
+        return answer

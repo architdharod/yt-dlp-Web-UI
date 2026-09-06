@@ -92,6 +92,7 @@ from app.models import (
     TrashRestoreResponse,
 )
 from app.probe import (
+    BandcampProbeError,
     CollectionTooLarge,
     EmptyCollection,
     SpotifyProbeError,
@@ -593,6 +594,10 @@ async def probe_download(request: ProbeRequest):
       artist page, or was one whose artist could not be matched to a YouTube
       Music discography.  yt-dlp was never asked, so the message is ours and
       goes out unprefixed;
+    * **400** with the Bandcamp streaming sentence -- the seller has turned
+      streaming off for the track, so the page holds no audio at all.  Also
+      unprefixed: yt-dlp reports it as "No video formats found" and a link to
+      its issue tracker, which reads as a bug here and is not one;
     * **400** for a collection with nothing downloadable in it -- an empty
       Bandcamp subdomain answers with an empty playlist rather than an error
       (enumeration research), and "0 tracks" is not a preview;
@@ -602,7 +607,12 @@ async def probe_download(request: ProbeRequest):
     """
     try:
         result = await probe(request.url)
-    except (CollectionTooLarge, EmptyCollection, SpotifyProbeError) as exc:
+    except (
+        BandcampProbeError,
+        CollectionTooLarge,
+        EmptyCollection,
+        SpotifyProbeError,
+    ) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except ProbeError as exc:
         raise HTTPException(status_code=400, detail=f"Failed to probe: {exc}") from exc

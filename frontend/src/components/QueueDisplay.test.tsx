@@ -348,7 +348,36 @@ describe("a bulk collection in the queue", () => {
     expect(screen.queryByRole("button", { name: "Cancel bulk download" })).toBeNull();
   });
 
-  it("reads a collection of nothing but duplicates as skipped", () => {
+  it("reads a parent of nothing but Bandcamp skips as skipped", () => {
+    // The other skip reason: the seller sells the tracks without streaming
+    // them, so there was never anything to download and nothing to retry.
+    // The backend says so per child; the parent reads the same as any skip.
+    renderQueue([
+      collection(
+        [
+          child("c1", "error", {
+            error:
+              "Bandcamp: streaming is disabled for this track, so there is nothing to download",
+            skipped: true,
+          }),
+          child("c2", "error", {
+            error:
+              "Bandcamp: streaming is disabled for this track, so there is nothing to download",
+            skipped: true,
+          }),
+        ],
+        { status: "error", progress_done: 2 },
+      ),
+    ]);
+
+    expect(screen.getByText("Skipped")).toBeTruthy();
+    expect(screen.queryByText("Failed")).toBeNull();
+    expect(screen.getByText("2 tracks were skipped")).toBeTruthy();
+    expect(screen.queryByText("Some tracks could not be downloaded")).toBeNull();
+    expect(screen.queryByRole("button", { name: /Retry/ })).toBeNull();
+  });
+
+  it("reads a parent of nothing but duplicates as skipped", () => {
     // Every track was already on disk: the parent's status is `error` (the
     // reasons have to stay readable) but nothing failed and nothing is left
     // to retry, so it reads neutral.
@@ -368,7 +397,7 @@ describe("a bulk collection in the queue", () => {
 
     expect(screen.getByText("Skipped")).toBeTruthy();
     expect(screen.queryByText("Failed")).toBeNull();
-    expect(screen.getByText("2 tracks were already in the library")).toBeTruthy();
+    expect(screen.getByText("2 tracks were skipped")).toBeTruthy();
     expect(screen.queryByText("Some tracks could not be downloaded")).toBeNull();
     expect(screen.getByRole("button", { name: /Dismiss/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Retry/ })).toBeNull();
@@ -388,7 +417,7 @@ describe("a bulk collection in the queue", () => {
     ]);
 
     expect(screen.getByText("Some tracks could not be downloaded")).toBeTruthy();
-    expect(screen.queryByText(/already in the library/)).toBeNull();
+    expect(screen.queryByText(/tracks were skipped/)).toBeNull();
   });
 
   it("shows a refused cancel on the collection row", () => {

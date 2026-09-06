@@ -85,7 +85,6 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from app.downloader import (
-    ALREADY_IN_LIBRARY_PREFIX,
     FFMPEG_TERMINATE_GRACE_SECONDS,
     CancelToken,
     DownloadError,
@@ -104,7 +103,13 @@ from app.library_ops import (
     check_resolved,
     is_audio,
 )
-from app.models import Job, JobKind, JobStatus, SSEEvent
+from app.models import (
+    ALREADY_IN_LIBRARY_PREFIX,
+    Job,
+    JobKind,
+    JobStatus,
+    SSEEvent,
+)
 from app.tagger import (
     NOTE_CANCELLED,
     NOTE_FAILED,
@@ -580,7 +585,7 @@ class QueueManager:
         * **already in the library** -- ``already_in_library`` maps a child's
           id to the library path the dedup rule matched.  The child is created
           directly in ``error`` with
-          :data:`~app.downloader.ALREADY_IN_LIBRARY_PREFIX` and that path,
+          :data:`~app.models.ALREADY_IN_LIBRARY_PREFIX` and that path,
           which is the same string a single download's own duplicate check
           writes, so the frontend renders it as "Skipped" with no Retry.  It is
           persisted (the user asked for it and deserves to see why it did not
@@ -730,17 +735,17 @@ class QueueManager:
 
     @staticmethod
     def _is_skipped(job: Job) -> bool:
-        """Whether this child failed only because the track was already there.
+        """Whether this child ended in ``error`` without anything going wrong.
 
-        The downloader ends a duplicate as an error carrying
-        :data:`~app.downloader.ALREADY_IN_LIBRARY_PREFIX`, and that is the
-        right shape -- the reason has to stay visible and there is nothing to
-        retry -- but it is not work still to be done, so the parent's "N of M"
-        counts it as finished.
+        The pipeline ends both of these as errors -- a duplicate carrying
+        :data:`~app.models.ALREADY_IN_LIBRARY_PREFIX`, and a Bandcamp track
+        whose seller has streaming turned off -- and that is the right shape:
+        the reason has to stay visible.  Neither is work still to be done,
+        though, so the parent's "N of M" counts them as finished.
+        :attr:`~app.models.Job.skipped` is the same rule, and is what the UI
+        reads.
         """
-        return job.status is JobStatus.ERROR and bool(
-            job.error and job.error.startswith(ALREADY_IN_LIBRARY_PREFIX)
-        )
+        return job.status is JobStatus.ERROR and job.skipped
 
     def _refresh_parent(self, parent_id: str | None, emit: bool = True) -> None:
         """Re-derive a parent from its children after one of them moved.
@@ -2608,6 +2613,10 @@ class QueueManager:
             # event from these two alone instead of having to refetch.
             "kind": job.kind.value,
             "parent_id": job.parent_id,
+            # Always present, and false for everything that is not an error:
+            # a client applying an event without having seen the job must be
+            # able to tell "failed" from "there was nothing to do".
+            "skipped": job.skipped,
         }
         if job.error:
             data["error"] = job.error

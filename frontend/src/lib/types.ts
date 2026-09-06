@@ -16,9 +16,13 @@ export type JobStatus =
 
 /**
  * Prefix of the error a job carries when its target file already exists in the
- * library. Mirrors ALREADY_IN_LIBRARY_PREFIX in backend/app/downloader.py — the
- * backend ends such a job as "error", but it is a skip rather than a failure,
- * so the queue renders it neutrally and offers no Retry. Keep the two in sync.
+ * library. Mirrors ALREADY_IN_LIBRARY_PREFIX in backend/app/models.py.
+ *
+ * No longer how the UI decides a job was skipped — the backend answers that
+ * itself, in `Job.skipped`, so the reasons live in one place and a new one
+ * (a Bandcamp seller with streaming turned off) needs no second string here.
+ * This is kept as the fallback for a job payload that carries no `skipped`,
+ * and for the tests that build such an error. Keep the two in sync.
  */
 export const ALREADY_IN_LIBRARY_PREFIX = "already in library: ";
 
@@ -59,6 +63,16 @@ export interface Job {
   duration: number | null;
   progress: number;
   error: string | null;
+  /**
+   * Whether this `error` row is a skip rather than a failure: the track was
+   * already in the library, or its Bandcamp seller has streaming turned off.
+   * Derived by the backend from the error, so the UI needs none of the
+   * strings. Optional only so that a job literal without it still type-checks
+   * — a test fixture, or a payload cached before the field existed; a live
+   * backend always sends it, and `isSkipped` falls back to the prefix check
+   * when it is absent.
+   */
+  skipped?: boolean;
   /**
    * A note about a job that finished anyway — today only "tags not fixed: ..."
    * on a `done` row, when the automatic MusicBrainz fix did not apply. It is

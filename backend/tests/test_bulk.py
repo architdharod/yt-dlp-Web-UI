@@ -15,11 +15,16 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.downloader import ALREADY_IN_LIBRARY_PREFIX, DownloadError
+from app.downloader import (
+    ALREADY_IN_LIBRARY_PREFIX,
+    BANDCAMP_NO_STREAM_MESSAGE,
+    DownloadError,
+)
 from app.file_organizer import resolve_artist_album
 from app.job_store import JobStore
 from app.models import MAX_REASON, Job, JobKind, JobStatus
 from app.probe import (
+    BandcampProbeError,
     Enumeration,
     EnumeratedTrack,
     ProbeError,
@@ -323,6 +328,62 @@ class TestParentEvents:
         parent = qm.get_job(parent.id)
         assert (parent.progress_done, parent.progress_total) == (3, 3)
         assert parent.status is JobStatus.ERROR
+
+    async def test_a_bandcamp_track_with_streaming_off_counts_the_same_way(self):
+        """The other skip reason, through the same accounting.
+
+        A seller who sells a track without streaming it leaves nothing to
+        download and nothing to retry, so the parent reads 2 of 2 rather than
+        waiting on a child that can never finish.
+        """
+
+        def one_has_no_stream(job, *args, **kwargs):
+            if job.id == "child-1":
+                raise DownloadError(BANDCAMP_NO_STREAM_MESSAGE)
+            return "/data/music/x.flac"
+
+        qm = QueueManager(max_concurrent=2, timeout=10)
+        with patch("app.queue_manager.download_audio", side_effect=one_has_no_stream):
+            parent = qm.add_bulk_job(_parent(), [_child(1), _child(2)])
+            await _wait_for(qm, parent.id, JobStatus.ERROR)
+
+        parent = qm.get_job(parent.id)
+        assert (parent.progress_done, parent.progress_total) == (2, 2)
+        assert qm.get_job("child-1").skipped is True
+
+    async def test_every_event_says_whether_its_job_was_skipped(self):
+        """``skipped`` is on every payload, not only on the errors.
+
+        A client applying an event for a job it has never seen has to be able
+        to tell "failed" from "there was nothing to do", so the field is always
+        there rather than only when it is true.
+        """
+
+        def one_has_no_stream(job, *args, **kwargs):
+            if job.id == "child-1":
+                raise DownloadError(BANDCAMP_NO_STREAM_MESSAGE)
+            return "/data/music/x.flac"
+
+        events = []
+        qm = QueueManager(max_concurrent=2, timeout=10, on_event=events.append)
+        with patch("app.queue_manager.download_audio", side_effect=one_has_no_stream):
+            parent = qm.add_bulk_job(_parent(), [_child(1), _child(2)])
+            await _wait_for(qm, parent.id, JobStatus.ERROR)
+
+        job_events = [event for event in events if event.event != "library_changed"]
+        assert job_events
+        assert all("skipped" in event.data for event in job_events)
+        skipped = [
+            event
+            for event in job_events
+            if event.job_id == "child-1" and event.data["status"] == "error"
+        ]
+        assert skipped and all(event.data["skipped"] is True for event in skipped)
+        assert all(
+            event.data["skipped"] is False
+            for event in job_events
+            if event.job_id == "child-2"
+        )
 
     async def test_every_event_says_its_kind_and_parent(self):
         events = []
@@ -1000,6 +1061,29 @@ class TestProbeRoute:
         assert resp.status_code == 400
         assert resp.json()["detail"].startswith("Failed to probe:")
 
+    def test_a_bandcamp_track_with_streaming_off_keeps_its_own_words(
+        self, client_and_qm
+    ):
+        """No "Failed to probe:" in front of it.
+
+        The probe did not fail -- it read the page and there is no audio on it
+        -- so the sentence the user is shown is the whole detail.
+        """
+        client, _ = client_and_qm
+        with patch(
+            "app.main.probe",
+            side_effect=BandcampProbeError(BANDCAMP_NO_STREAM_MESSAGE),
+        ):
+            resp = client.post(
+                "/download/probe",
+                json={
+                    "url": "https://amelielens.bandcamp.com/track/theory-of-relativity"
+                },
+            )
+
+        assert resp.status_code == 400
+        assert resp.json()["detail"] == BANDCAMP_NO_STREAM_MESSAGE
+
     def test_a_slow_probe_is_a_504(self, client_and_qm):
         client, _ = client_and_qm
         with patch("app.main.probe", side_effect=ProbeTimeout("too slow")):
@@ -1234,6 +1318,40 @@ class TestBulkRoute:
         assert first["error"] == (
             f"{ALREADY_IN_LIBRARY_PREFIX}{folder}/Black Sands/Kiara.flac"
         )
+
+    def test_the_children_say_whether_they_were_skipped(
+        self, client_and_qm, isolated_paths
+    ):
+        """``GET /queue`` and the bulk response both carry ``skipped``.
+
+        The client decides whether to offer a Retry from this, so it has to be
+        on the row rather than something the client re-derives from the error
+        text.
+        """
+        client, qm = client_and_qm
+        download_dir, _data = isolated_paths
+        from tests.test_probe import _write_flac
+
+        _write_flac(
+            download_dir / "Bonobo" / "Black Sands" / "Kiara.flac",
+            title="Kiara",
+            tags={"SOURCEID": "youtube:vid1"},
+        )
+
+        resp = client.post("/download/bulk", json=self._body())
+        assert resp.status_code == 200
+        first = resp.json()["children"][0]
+        assert first["error"].startswith(ALREADY_IN_LIBRARY_PREFIX)
+        assert first["skipped"] is True
+
+        # And a child that really failed is not a skip.
+        failed = qm.get_job(resp.json()["children"][1]["id"])
+        failed.status = JobStatus.ERROR
+        failed.error = "Download failed: ffmpeg exited 1"
+        rows = client.get("/queue").json()
+        children = {child["id"]: child for child in rows[0]["children"]}
+        assert children[first["id"]]["skipped"] is True
+        assert children[failed.id]["skipped"] is False
 
     def test_a_blank_artist_is_refused(self, client_and_qm):
         client, _ = client_and_qm

@@ -62,7 +62,9 @@ from urllib.parse import urlsplit
 
 import yt_dlp
 
-from app.downloader import _YtDlpLogger, base_opts, ytdl
+from app.bandcamp import artist_page_url as bandcamp_artist_page_url
+from app.bandcamp import resolve_artist_name as resolve_bandcamp_artist_name
+from app.downloader import _YtDlpLogger, base_opts, readable_ytdlp_message, ytdl
 from app.models import (
     MAX_COLLECTION_TRACKS,
     MAX_CONCURRENT_PROBES,
@@ -127,6 +129,22 @@ BANDCAMP_NOTICE = (
     "Bandcamp streams are 128 kbps MP3; downloads are converted to FLAC but "
     "are not lossless"
 )
+
+# The other thing only Bandcamp does.  A seller can sell a track without
+# streaming it, and the flat listing cannot tell: ``trackinfo[0].streaming`` and
+# ``file`` are only in the *full* extraction of a track page, which is one HTTP
+# request per row and far too much for a preview.  So the row shows as
+# available and the child job is where it turns out there was nothing to
+# download -- which is worth saying up front rather than only afterwards.
+BANDCAMP_STREAMING_NOTICE = (
+    "A Bandcamp track whose seller has turned off streaming is listed here as "
+    "available but fails when downloaded"
+)
+
+# What ``BandcampUserIE`` titles a seller's discography: the subdomain, because
+# the flat listing has no display name in it.  ``_enumerate`` re-titles it once
+# the page has been read for the real one.
+_BANDCAMP_DISCOGRAPHY_PREFIX = "Discography of "
 
 # Said when a channel URL was offered to YouTube Music and the request never
 # got an answer.  The preview that follows is the flat yt-dlp listing, which
@@ -230,6 +248,17 @@ class SpotifyProbeError(ProbeError):
     unchanged: the route prefixes a plain :class:`ProbeError` with "Failed to
     probe", which is yt-dlp's voice and wrong for a URL yt-dlp was never asked
     about.
+    """
+
+
+class BandcampProbeError(ProbeError):
+    """A Bandcamp URL failed for a reason we can put in a sentence.
+
+    Its own class for the same reason :class:`SpotifyProbeError` is one: the
+    route prefixes a plain :class:`ProbeError` with "Failed to probe", which
+    reads as though something went wrong here.  Nothing did -- the seller has
+    streaming turned off and there is no audio on the page -- so the message
+    reaches the user unchanged.
     """
 
 
@@ -412,12 +441,26 @@ def _extract(url: str) -> dict:
         with ytdl({**_flat_opts(), "logger": log}) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.YoutubeDLError as exc:
-        raise ProbeError(str(exc)) from exc
+        raise _probe_error(str(exc)) from exc
     if info is None:
         # ``ignoreerrors`` turned the failure into a None; the reason only ever
         # reached the logger.
-        raise ProbeError(log.last_error or NOTHING_RETURNED_MESSAGE)
+        raise _probe_error(log.last_error or NOTHING_RETURNED_MESSAGE)
     return info
+
+
+def _probe_error(message: str) -> ProbeError:
+    """yt-dlp's failure as the error the route should raise.
+
+    Both of :func:`_extract`'s arms come through here, because which one a
+    failure takes is yt-dlp's business: ``ignoreerrors`` decides whether a
+    top-level error is raised or logged and turned into a ``None``, and the
+    user's message must not depend on that.
+    """
+    readable = readable_ytdlp_message(message)
+    if readable is not None:
+        return BandcampProbeError(readable)
+    return ProbeError(message)
 
 
 def is_collection(info: dict) -> bool:
@@ -659,6 +702,7 @@ def _suggested_artist(
     url: str,
     source: Source,
     entry_artists: Counter[str] | None = None,
+    bandcamp_name: str | None = None,
 ) -> str | None:
     """The artist the UI offers, from whatever the source called it.
 
@@ -675,8 +719,12 @@ def _suggested_artist(
       ``- Topic`` suffix and, for a playlist page, the ``by `` prefix;
     * SoundCloud: the user page's title is "<user> (All)"/"(Tracks)"/..., so
       the page suffix comes off;
-    * Bandcamp: the title is "Discography of <subdomain>" and carries no
-      display name at all, so the subdomain is the best there is.
+    * Bandcamp: nothing yt-dlp returns for a seller page carries a display
+      name -- the title is "Discography of <subdomain>" and every entry is a
+      bare URL -- so the name is read off the page itself
+      (:func:`app.bandcamp.resolve_artist_name`) and arrives here as
+      *bandcamp_name*.  The subdomain is the fallback for when that fetch
+      found nothing, which is what this used to offer always.
 
     The title is the last resort everywhere except a YouTube ``OLAK`` playlist,
     whose title is the *album*: filing a whole record under an artist folder
@@ -686,6 +734,12 @@ def _suggested_artist(
         # Ties go to whichever name appeared first: Counter preserves insertion
         # order and ``most_common`` sorts stably.
         return entry_artists.most_common(1)[0][0]
+
+    if source == "bandcamp" and bandcamp_name:
+        # Ahead of ``_top_level_artist``: for a seller page yt-dlp fills
+        # ``uploader`` with the subdomain when it fills it at all, and the name
+        # read off the page is better than that by construction.
+        return bandcamp_name
 
     top_level = _top_level_artist(info, source)
     if top_level:
@@ -699,6 +753,8 @@ def _suggested_artist(
             if title.endswith(suffix):
                 return title[: -len(suffix)].strip() or None
     if source == "bandcamp":
+        # The display name was already returned above; this is the fallback for
+        # when the page could not be read.
         host = (urlsplit(url).hostname or "").casefold()
         subdomain = host.split(".")[0]
         if subdomain and subdomain != "bandcamp":
@@ -1244,6 +1300,38 @@ def _spotify_enumeration(url: str, deadline: float) -> Enumeration:
     return view
 
 
+def _bandcamp_display_name(url: str, source: Source, walk: _Walk) -> str | None:
+    """The seller's real name for a Bandcamp artist/label page, or None.
+
+    None for every other source, for a Bandcamp ``/album/`` or ``/track/`` URL
+    (yt-dlp's full extraction of one already carries the artist), and for a
+    page that could not be read -- in which case the caller keeps the subdomain
+    it has always used.  At most one HTTP GET per probe.
+    """
+    if source != "bandcamp":
+        return None
+    page_url = bandcamp_artist_page_url(url)
+    if page_url is None:
+        return None
+    walk.check_deadline()
+    name = resolve_bandcamp_artist_name(page_url, check_deadline=walk.check_deadline)
+    if name:
+        logger.info("Bandcamp page %s names its artist %r", page_url, name)
+    return name
+
+
+def _bandcamp_title(title: str | None, name: str | None) -> str | None:
+    """``"Discography of <subdomain>"`` re-titled with the display name.
+
+    Left alone when the page gave no name, or when yt-dlp titled the listing
+    something other than a discography -- an album page, say, whose title is
+    the album and must stay that.
+    """
+    if not name or not title or not title.startswith(_BANDCAMP_DISCOGRAPHY_PREFIX):
+        return title
+    return f"{_BANDCAMP_DISCOGRAPHY_PREFIX}{name}"
+
+
 def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
     """The whole blocking probe: one extraction, then the walk.
 
@@ -1283,11 +1371,17 @@ def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
         )
 
     source = _source_of(info, url)
+    # Before the walk, not after: the walk is the part that can run out of
+    # deadline, and a name paid for and then thrown away with the enumeration
+    # would be the worst of both.  One GET, and only for a seller's page --
+    # never one per track.
+    bandcamp_name = _bandcamp_display_name(url, source, walk)
     _walk(info, url, _album_for(info, url), walk, 0)
 
     notices: list[str] = list(ytmusic_notices)
     if source == "bandcamp":
         notices.append(BANDCAMP_NOTICE)
+        notices.append(BANDCAMP_STREAMING_NOTICE)
     unreadable = _unreadable_notice(walk.unreadable, "track")
     if unreadable:
         notices.append(unreadable)
@@ -1297,9 +1391,12 @@ def _enumerate(url: str, deadline: float) -> SingleTrack | Enumeration:
         # Both travel back through ``CollectionPreview``, whose bounds match
         # these: a channel with a novel-length title, or a suggested artist
         # lifted from one, must not 500 the preview on the response model.
-        title=_cap(_text(info.get("title")), MAX_TRACK_TITLE),
+        title=_cap(
+            _bandcamp_title(_text(info.get("title")), bandcamp_name),
+            MAX_TRACK_TITLE,
+        ),
         artist=_cap(
-            _suggested_artist(info, url, source, walk.entry_artists),
+            _suggested_artist(info, url, source, walk.entry_artists, bandcamp_name),
             MAX_FOLDER_NAME,
         ),
         source=source,

@@ -19,7 +19,7 @@ from mutagen.flac import FLAC
 
 from app import probe as probe_module
 from app.dedup import DedupCandidate, find_in_library
-from app.downloader import _source_id
+from app.downloader import BANDCAMP_NO_STREAM_MESSAGE, _source_id
 from app.models import (
     MAX_COLLECTION_TRACKS,
     MAX_FOLDER_NAME,
@@ -35,6 +35,8 @@ from app.models import (
 )
 from app.probe import (
     BANDCAMP_NOTICE,
+    BANDCAMP_STREAMING_NOTICE,
+    BandcampProbeError,
     CollectionTooLarge,
     EmptyCollection,
     Enumeration,
@@ -140,6 +142,17 @@ def _youtube_entry(index: int, **overrides) -> dict:
 
 
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PL123"
+
+# A Bandcamp track whose seller sells it without streaming it, and what yt-dlp
+# really says about one -- captured from a live run against
+# https://amelielens.bandcamp.com/track/theory-of-relativity.
+BANDCAMP_TRACK_URL = "https://amelielens.bandcamp.com/track/theory-of-relativity"
+_BANDCAMP_NO_FORMATS = (
+    "[Bandcamp] 3456873933: No video formats found!; please report this issue "
+    "on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the "
+    "appropriate issue template. Confirm you are on the latest version using  "
+    "yt-dlp -U"
+)
 PLAYLIST_INFO = {
     "_type": "playlist",
     "id": "PL123",
@@ -219,6 +232,59 @@ class TestProbeClassification:
         with fake_ytdl({PLAYLIST_URL: yt_dlp.utils.DownloadError("Video unavailable")}):
             with pytest.raises(ProbeError, match="Video unavailable"):
                 await probe(PLAYLIST_URL)
+
+    async def test_a_bandcamp_track_with_streaming_off_says_so(self):
+        """A single track page yt-dlp found no formats on.
+
+        yt-dlp reports it as "No video formats found!" plus a link to its issue
+        tracker, which reads like a bug in this app.  The probe says what
+        actually happened instead, and says it unprefixed.
+        """
+        with fake_ytdl({BANDCAMP_TRACK_URL: yt_dlp.utils.DownloadError(_BANDCAMP_NO_FORMATS)}):
+            with pytest.raises(BandcampProbeError) as caught:
+                await probe(BANDCAMP_TRACK_URL)
+
+        assert str(caught.value) == BANDCAMP_NO_STREAM_MESSAGE
+
+    async def test_the_same_failure_swallowed_by_ignoreerrors_says_so_too(self):
+        """The other half of ``_extract``: no exception, only a logged line.
+
+        ``ignoreerrors`` is on for the flat pass, so yt-dlp logs the error and
+        hands back ``None``.  Which of the two arms a failure takes is yt-dlp's
+        business and the user's message must not depend on it.
+        """
+
+        class _LoggingYoutubeDL:
+            """yt-dlp under ``ignoreerrors``: it logs, then returns None."""
+
+            def __init__(self, opts):
+                self._logger = opts["logger"]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+            def extract_info(self, url, download=False):
+                self._logger.error(f"ERROR: {_BANDCAMP_NO_FORMATS}")
+                return None
+
+        with patch("app.probe.yt_dlp.YoutubeDL", _LoggingYoutubeDL):
+            with pytest.raises(BandcampProbeError) as caught:
+                await probe(BANDCAMP_TRACK_URL)
+
+        assert str(caught.value) == BANDCAMP_NO_STREAM_MESSAGE
+
+    async def test_every_other_failure_keeps_yt_dlps_words(self):
+        with fake_ytdl(
+            {PLAYLIST_URL: yt_dlp.utils.DownloadError("[youtube] x: No video formats found!")}
+        ):
+            with pytest.raises(ProbeError) as caught:
+                await probe(PLAYLIST_URL)
+
+        assert not isinstance(caught.value, BandcampProbeError)
+        assert "No video formats found" in str(caught.value)
 
     async def test_a_collection_with_nothing_downloadable_is_refused(self):
         """A Bandcamp subdomain that is not a discography answers with zero
@@ -444,7 +510,8 @@ class TestSubCollections:
 
         assert ydl.calls == [artist_url, album_url]
         assert result.source == "bandcamp"
-        # No display name anywhere on the page; the subdomain is all there is.
+        # Nothing yt-dlp returns names the artist, and ``conftest`` stubs the
+        # page fetch out, so the subdomain is the fallback.
         assert result.artist == "zoekeating"
         assert [row.album for row in result.rows] == ["Into The Trees", None]
         # A loose /track/ URL is not expanded: its title costs a full
@@ -473,6 +540,138 @@ class TestSubCollections:
             result = await probe(artist_url)
 
         assert BANDCAMP_NOTICE in result.notices
+
+    async def test_bandcamp_says_streaming_can_be_turned_off(self):
+        artist_url = "https://zoekeating.bandcamp.com"
+        artist = {
+            "_type": "playlist",
+            "id": "zoekeating",
+            "extractor_key": "BandcampUser",
+            "title": "Discography of zoekeating",
+            "entries": [
+                {
+                    "_type": "url",
+                    "ie_key": "Bandcamp",
+                    "id": "1",
+                    "title": "Optimist",
+                    "url": "https://zoekeating.bandcamp.com/track/optimist",
+                }
+            ],
+        }
+        with fake_ytdl({artist_url: artist}):
+            result = await probe(artist_url)
+
+        # The flat pass cannot see a seller's streaming switch, so the preview
+        # says the row may be a lie rather than pretending it checked.
+        assert BANDCAMP_STREAMING_NOTICE in result.notices
+
+    async def test_the_display_name_replaces_the_subdomain(self):
+        artist_url = "https://amelielens.bandcamp.com/"
+        artist = {
+            "_type": "playlist",
+            "id": "amelielens",
+            "extractor_key": "BandcampUser",
+            "title": "Discography of amelielens",
+            "entries": [
+                {
+                    "_type": "url",
+                    "ie_key": "Bandcamp",
+                    "id": "1",
+                    "url": "https://amelielens.bandcamp.com/track/exhale",
+                }
+            ],
+        }
+        with patch.object(
+            probe_module, "resolve_bandcamp_artist_name", return_value="Amelie Lens"
+        ) as resolve:
+            with fake_ytdl({artist_url: artist}):
+                result = await probe(artist_url)
+
+        assert result.artist == "Amelie Lens"
+        assert result.title == "Discography of Amelie Lens"
+        # One request for the page, never one per row.
+        assert resolve.call_count == 1
+        assert resolve.call_args.args[0] == "https://amelielens.bandcamp.com/"
+
+    async def test_the_subdomain_is_the_fallback_when_the_page_says_nothing(self):
+        artist_url = "https://amelielens.bandcamp.com/"
+        artist = {
+            "_type": "playlist",
+            "id": "amelielens",
+            "extractor_key": "BandcampUser",
+            "title": "Discography of amelielens",
+            "entries": [
+                {
+                    "_type": "url",
+                    "ie_key": "Bandcamp",
+                    "id": "1",
+                    "url": "https://amelielens.bandcamp.com/track/exhale",
+                }
+            ],
+        }
+        # ``conftest``'s autouse stub already answers None -- an unreachable
+        # page, a redirect to a custom domain, markup that has moved on.
+        with fake_ytdl({artist_url: artist}):
+            result = await probe(artist_url)
+
+        assert result.artist == "amelielens"
+        assert result.title == "Discography of amelielens"
+
+    async def test_a_long_display_name_is_capped_like_every_other(self):
+        artist_url = "https://amelielens.bandcamp.com/"
+        artist = {
+            "_type": "playlist",
+            "id": "amelielens",
+            "extractor_key": "BandcampUser",
+            "title": "Discography of amelielens",
+            "entries": [
+                {
+                    "_type": "url",
+                    "ie_key": "Bandcamp",
+                    "id": "1",
+                    "url": "https://amelielens.bandcamp.com/track/exhale",
+                }
+            ],
+        }
+        with patch.object(
+            probe_module,
+            "resolve_bandcamp_artist_name",
+            return_value="N" * (MAX_FOLDER_NAME + 50),
+        ):
+            with fake_ytdl({artist_url: artist}):
+                result = await probe(artist_url)
+
+        assert result.artist == "N" * MAX_FOLDER_NAME
+
+    async def test_an_album_page_is_not_asked_for_a_display_name(self):
+        album_url = "https://amelielens.bandcamp.com/album/exhale"
+        album = {
+            "_type": "playlist",
+            "id": "exhale",
+            "extractor_key": "BandcampAlbum",
+            "title": "Exhale",
+            "uploader": "Amelie Lens",
+            "entries": [
+                {
+                    "_type": "url",
+                    "ie_key": "Bandcamp",
+                    "id": "1",
+                    "title": "Feel It",
+                    "url": "https://amelielens.bandcamp.com/track/feel-it",
+                }
+            ],
+        }
+        with patch.object(
+            probe_module, "resolve_bandcamp_artist_name"
+        ) as resolve:
+            with fake_ytdl({album_url: album}):
+                result = await probe(album_url)
+
+        # yt-dlp's own extraction of an album page already names the artist,
+        # so there is nothing to go and fetch.
+        assert resolve.call_count == 0
+        assert result.artist == "Amelie Lens"
+        assert result.title == "Exhale"
 
 
 # ===========================================================================

@@ -11,8 +11,15 @@ import {
   resyncAfterReconnect,
   setJobActionError,
 } from "@/lib/queueCache";
+import { childCounts, isSkipped } from "@/lib/queue";
 import { queryKeys } from "@/lib/queryKeys";
-import type { Job, JobStatus, Notice, SSEEvent } from "@/lib/types";
+import {
+  ALREADY_IN_LIBRARY_PREFIX,
+  type Job,
+  type JobStatus,
+  type Notice,
+  type SSEEvent,
+} from "@/lib/types";
 
 // The reconciliation tests drive the real queue query, so the only thing that
 // needs faking is the request itself.
@@ -348,6 +355,57 @@ function notices(): Notice[] | undefined {
 function noticesEvent(...open: Notice[]): SSEEvent {
   return { event: "notices", job_id: null, data: { notices: open } };
 }
+
+describe("the skipped verdict", () => {
+  it("takes the verdict off the error event that carries it", () => {
+    // The cached row was queued, so the backend had already answered
+    // `skipped: false`. Only this event says otherwise, and until it is
+    // merged `isSkipped` sees a defined `false` and never reaches the
+    // fallback — the row would offer a Retry that cannot work.
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "downloading"), skipped: false },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("error", "a", {
+        status: "error",
+        error: `${ALREADY_IN_LIBRARY_PREFIX}Bonobo/Kong.flac`,
+        skipped: true,
+      }),
+    );
+
+    expect(queue()![0].skipped).toBe(true);
+    expect(isSkipped(queue()![0])).toBe(true);
+  });
+
+  it("takes a false verdict too, so a real failure stops reading as a skip", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "downloading"), skipped: true },
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      event("error", "a", {
+        status: "error",
+        error: "ffmpeg exploded",
+        skipped: false,
+      }),
+    );
+
+    expect(isSkipped(queue()![0])).toBe(false);
+  });
+
+  it("leaves the cached verdict alone when an event carries none", () => {
+    queryClient.setQueryData(queryKeys.queue, [
+      { ...job("a", "error"), skipped: true },
+    ]);
+
+    applyQueueEvent(queryClient, event("progress", "a", { progress: 40 }));
+
+    expect(queue()![0].skipped).toBe(true);
+  });
+});
 
 describe("the notices event", () => {
   it("seeds a cache GET /notices has not filled yet", () => {
@@ -808,6 +866,39 @@ describe("a bulk parent's children in the cache", () => {
     expect(children()[0]).toMatchObject({
       status: "error",
       error: "ffmpeg exploded",
+    });
+  });
+
+  it("takes a child's skipped verdict so the parent's counts follow", () => {
+    // A Bandcamp track whose seller has streaming turned off, ending while
+    // the parent is on screen: the parent's summary is read off the children,
+    // so the verdict has to reach the child row for "1 skipped" to be right.
+    queryClient.setQueryData(queryKeys.queue, [
+      parent([
+        { ...childJob("c1"), skipped: false },
+        { ...childJob("c2"), skipped: false },
+      ]),
+    ]);
+
+    applyQueueEvent(
+      queryClient,
+      childEvent("error", "c1", {
+        status: "error",
+        error:
+          "Bandcamp: streaming is disabled for this track, so there is nothing to download",
+        skipped: true,
+      }),
+    );
+    applyQueueEvent(
+      queryClient,
+      childEvent("status_change", "c2", { status: "done", skipped: false }),
+    );
+
+    expect(children()[0].skipped).toBe(true);
+    expect(childCounts(queue()![0])).toMatchObject({
+      done: 1,
+      failed: 0,
+      skipped: 1,
     });
   });
 

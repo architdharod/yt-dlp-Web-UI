@@ -25,6 +25,7 @@ junk the source container carried, which ``-map_metadata -1`` now drops).
 import contextlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -47,7 +48,11 @@ from app.file_organizer import (
     get_output_path,
     resolve_artist_album,
 )
-from app.models import Job
+from app.models import (
+    ALREADY_IN_LIBRARY_PREFIX,
+    BANDCAMP_NO_STREAM_MESSAGE,
+    Job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -311,10 +316,41 @@ class DownloadError(Exception):
 
 CANCELLED_MESSAGE = "Download cancelled"
 
-# The error a job carries when its target file is already in the library.  The
-# relative path is appended, and the queue shows the whole thing as the job's
-# reason, so it has to read as a sentence to somebody who never saw this code.
-ALREADY_IN_LIBRARY_PREFIX = "already in library: "
+# Both live in :mod:`app.models`, which cannot import this module, and are
+# re-exported here because this is where the pipeline raises them and where
+# every caller has always looked for them.  :attr:`app.models.Job.skipped` is
+# derived from the same two strings.
+
+# The two halves of yt-dlp's message that, together, mean exactly that.  Both
+# are required: "No video formats found" from any other extractor is a
+# different failure and keeps its own wording, and a Bandcamp error that is not
+# this one does too.  The tag is matched as yt-dlp writes it -- ``[Bandcamp]``
+# or an ``IE_NAME`` with one suffix, ``[Bandcamp:album]``, ``[Bandcamp:user]``
+# -- rather than as anything between brackets, so a *track title* in brackets
+# cannot trip it.
+_BANDCAMP_TAG = re.compile(r"\[Bandcamp(?::\w+)?\]", re.IGNORECASE)
+_NO_FORMATS = "No video formats found"
+
+
+def readable_ytdlp_message(message: str) -> str | None:
+    """A sentence for the user, or None to keep yt-dlp's own words.
+
+    One case so far.  Everything else is None: yt-dlp's messages are usually
+    the most specific thing anyone has, and paraphrasing them by guesswork
+    loses more than it gains.
+
+    Split from :func:`_readable_ytdlp_error` because the probe reaches this
+    with a *string* -- ``ignoreerrors`` turns a top-level failure into a logged
+    line and a ``None`` return, so there is no exception to hand over.
+    """
+    if _NO_FORMATS in message and _BANDCAMP_TAG.search(message):
+        return BANDCAMP_NO_STREAM_MESSAGE
+    return None
+
+
+def _readable_ytdlp_error(exc: Exception, fallback: str) -> str:
+    """*fallback*, unless yt-dlp said something we can say better."""
+    return readable_ytdlp_message(str(exc)) or fallback
 
 
 def _raise_if_cancelled(cancel: "CancelToken | None") -> None:
@@ -490,7 +526,9 @@ def extract_metadata(url: str) -> TrackMetadata:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.YoutubeDLError as exc:
         logger.error("Metadata extraction failed for %s: %s", url, exc)
-        raise DownloadError(f"Failed to extract metadata: {exc}") from exc
+        raise DownloadError(
+            _readable_ytdlp_error(exc, f"Failed to extract metadata: {exc}")
+        ) from exc
 
     if info is None:
         logger.error("yt-dlp returned no metadata for %s", url)
@@ -1442,7 +1480,9 @@ def download_audio(
             raise DownloadError(CANCELLED_MESSAGE) from exc
         except yt_dlp.utils.YoutubeDLError as exc:
             logger.error("Download failed for job %s: %s", job.id, exc)
-            raise DownloadError(f"Download failed: {exc}") from exc
+            raise DownloadError(
+                _readable_ytdlp_error(exc, f"Download failed: {exc}")
+            ) from exc
         except OSError as exc:
             logger.error("Filesystem error during download for job %s: %s", job.id, exc)
             raise DownloadError(f"Download failed: {exc}") from exc

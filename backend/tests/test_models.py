@@ -3,7 +3,15 @@
 import pytest
 from pydantic import ValidationError
 
-from app.models import DownloadRequest, HealthResponse, Job, JobStatus, SSEEvent
+from app.models import (
+    ALREADY_IN_LIBRARY_PREFIX,
+    BANDCAMP_NO_STREAM_MESSAGE,
+    DownloadRequest,
+    HealthResponse,
+    Job,
+    JobStatus,
+    SSEEvent,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +242,44 @@ class TestJob:
             Job()  # type: ignore[call-arg]
         with pytest.raises(ValidationError):
             Job(id="j1")  # type: ignore[call-arg]
+
+    # ------------------------------------------------------------------
+    # ``skipped``: an error that is not a failure
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "error, expected",
+        [
+            (f"{ALREADY_IN_LIBRARY_PREFIX}Bonobo/Black Sands/Kiara.flac", True),
+            (BANDCAMP_NO_STREAM_MESSAGE, True),
+            ("Download failed: ffmpeg exited 1", False),
+            ("", False),
+            (None, False),
+            # The prefix has to be a *prefix*, and the Bandcamp sentence the
+            # whole message: a failure that merely quotes one is a failure.
+            ("Download failed: already in library: x", False),
+            (f"Download failed: {BANDCAMP_NO_STREAM_MESSAGE}", False),
+        ],
+        ids=[
+            "already-in-library",
+            "bandcamp-no-stream",
+            "a-real-failure",
+            "blank",
+            "none",
+            "prefix-not-at-the-start",
+            "sentence-quoted-inside-another",
+        ],
+    )
+    def test_which_errors_are_skips(self, error, expected):
+        job = Job(id="j1", url="https://youtu.be/x", status=JobStatus.ERROR, error=error)
+        assert job.skipped is expected
+
+    def test_skipped_is_serialised_and_is_not_an_input(self):
+        job = Job(id="j1", url="https://youtu.be/x", error=BANDCAMP_NO_STREAM_MESSAGE)
+        assert job.model_dump()["skipped"] is True
+        # Derived on the way out, so it cannot be set on the way in and there
+        # is no column for it: an older row gets the same answer as a new one.
+        assert "skipped" not in Job.model_fields
 
 
 # ---------------------------------------------------------------------------

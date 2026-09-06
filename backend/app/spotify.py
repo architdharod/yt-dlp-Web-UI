@@ -25,20 +25,10 @@ probe adapts them -- exactly like :mod:`app.ytmusic`, so the two can be tested
 apart.  Everything here is blocking and is called from the probe's worker
 thread.
 
-The body of each answer is read with ``response.raw.read1`` in a loop rather
-than with ``requests``' ``iter_content``.  The read timeout in
-:data:`_TIMEOUT` is per *socket read*, not per response: a server that
-dribbles a byte at a time resets it on every read, so a single 8 KiB
-``iter_content`` chunk can take hours to assemble and no deadline check
-between chunks would ever run.  Reading one raw read at a time is what lets
-the probe's deadline be checked after each returned chunk (at most a few
-socket reads on a compressed body), so the overrun is normally bounded by a
-small multiple of one read timeout rather than by the whole body.  The check
-only runs *between* ``read1`` returns, though, and urllib3's ``read1`` with
-``decode_content=True`` loops internally until the decoder yields bytes: a
-pathological content-encoding that decodes to nothing hands back no chunk to
-check between.  Accepted, because the host is pinned and no redirect is
-followed -- the only server that can do it is Spotify itself.
+Both requests go through :func:`app.fetch.get_text`, which is where the
+timeout, the cap on how much of a body is read, the refusal to follow a
+redirect and the deadline check between socket reads all live; see that
+module for why the body is read the way it is.
 
 Both requests are made against a URL *we* build from the parsed id
 (:attr:`SpotifyTarget.canonical_url`) rather than against the string the user
@@ -53,14 +43,14 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from email.message import Message
 from html.parser import HTMLParser
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlsplit
 
 import requests
-import urllib3
+
+from app.fetch import FetchFailed, get_text
 
 logger = logging.getLogger(__name__)
 
@@ -109,25 +99,6 @@ UNSUPPORTED_KIND_MESSAGE = (
     "Only Spotify artist URLs are supported; paste the artist page, or a "
     "YouTube / YouTube Music / SoundCloud / Bandcamp link for a track, album "
     "or playlist"
-)
-
-# How long one request to Spotify may take: (connect, read).  Two of these run
-# inside a probe that has its own deadline, so they are short.
-_TIMEOUT = (5, 10)
-
-# How much of a response is read before the rest is thrown away.  The oEmbed
-# JSON is under a kilobyte and an artist page is ~300 KB whose ``<title>`` and
-# ``og:title`` are both in the first few, so this only ever truncates the tail
-# of the page -- but it is what stops a hostile or broken response from being
-# read into memory without bound.
-MAX_RESPONSE_BYTES = 256 * 1024
-
-# Sent because Spotify serves a different (and sometimes no) page to a client
-# that does not look like a browser.  Honest about what it is: this is a
-# self-hosted app reading a public page, not a crawler pretending otherwise.
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; music-for-arr/1.0; +https://github.com/) "
-    "python-requests"
 )
 
 # Spotify's page titles are "<Name> | Spotify".
@@ -319,7 +290,7 @@ class _TitleReader(HTMLParser):
     ``convert_charrefs`` leaves ``&amp;`` as ``&`` in the text, and
     ``HTMLParser`` unescapes attribute values itself, so a name like
     "Simon & Garfunkel" arrives intact from either source.  A truncated
-    document (see :data:`MAX_RESPONSE_BYTES`) is fine: the parser simply never
+    document (see :data:`app.fetch.MAX_RESPONSE_BYTES`) is fine: the parser simply never
     sees the tags that were cut off.
     """
 
@@ -386,22 +357,6 @@ def _get_json(
     return payload if isinstance(payload, dict) else None
 
 
-def _charset(content_type: str | None) -> str | None:
-    """The charset a Content-Type explicitly declares, or None.
-
-    Not ``response.encoding``: ``requests`` answers ISO-8859-1 for any
-    ``text/*`` that declares nothing, which would mangle a UTF-8 name into
-    ``Ã\x81rtist``.  An undeclared body is utf-8 here -- what Spotify sends,
-    and what JSON is by spec.
-    """
-    if not content_type:
-        return None
-    message = Message()
-    message["Content-Type"] = content_type
-    charset = message.get_param("charset")
-    return charset if isinstance(charset, str) else None
-
-
 def _get_text(
     session: requests.Session,
     url: str,
@@ -409,66 +364,22 @@ def _get_text(
     *,
     check_deadline: Callable[[], None] | None = None,
 ) -> str | None:
-    """At most :data:`MAX_RESPONSE_BYTES` of *url*'s body, or None.
+    """One bounded GET, with the transport failure named as Spotify's.
 
-    ``allow_redirects=False`` -- see the module docstring: the canonical URLs
-    answer 200 directly, so a 3xx here is something this code should not be
-    following, and it is reported as "no answer" rather than chased.  The body
-    is read one socket read at a time and cut at the cap instead of being read
-    whole, so a response that never ends cannot become memory *or* time: see
-    the module docstring for why ``raw.read1`` rather than ``iter_content``.
+    Everything about how the request is made lives in :mod:`app.fetch`; this
+    only relabels its failure, because there is no fallback for a Spotify URL
+    and the probe's message has to say which site went quiet.
 
-    Whatever *check_deadline* raises is left alone on the way out.  A probe's
-    ``ProbeTimeout`` is neither a ``urllib3`` error nor an ``OSError``, so the
-    ``except`` below does not catch it and it reaches the probe as the deadline
-    answer it is, rather than being reported as Spotify being unreachable.  A
-    *check_deadline* that raised an ``OSError`` subclass would be swallowed as
-    Spotify being unreachable; nothing in this tree raises one.
+    Raises:
+        SpotifyUnavailable: The request never got an answer.
     """
     try:
-        with session.get(
+        return get_text(
+            session,
             url,
-            params=params,
-            timeout=_TIMEOUT,
-            allow_redirects=False,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "en"},
-            stream=True,
-        ) as response:
-            if response.status_code != 200:
-                logger.info("Spotify answered %s for %s", response.status_code, url)
-                return None
-            body = b""
-            while len(body) < MAX_RESPONSE_BYTES:
-                # ``read1`` (urllib3 2.x, which is what is pinned) returns
-                # whatever it has rather than waiting to fill a buffer, so the
-                # deadline below is checked after each returned chunk (at most
-                # a few socket reads on a compressed body): the overrun is
-                # normally bounded by a small multiple of one read timeout
-                # rather than by the whole body.  Only *between* returns,
-                # though -- with ``decode_content=True`` this loops inside
-                # urllib3 until the decoder yields bytes, so a content-encoding
-                # that decodes to nothing never comes back here to be checked.
-                # Accepted: the host is pinned and nothing redirects.
-                chunk = response.raw.read1(8192, decode_content=True)
-                if not chunk:
-                    break
-                body += chunk
-                if check_deadline is not None:
-                    check_deadline()
-            body = body[:MAX_RESPONSE_BYTES]
-            # Read inside the ``with``: the connection is released on the way
-            # out and nothing about the response should be touched after that.
-            encoding = _charset(response.headers.get("Content-Type")) or "utf-8"
-    # ``requests`` only translates urllib3's errors into its own inside
-    # ``iter_content``/``.content``; reading ``raw`` ourselves means a
-    # ``ReadTimeoutError``, a ``ProtocolError`` on a truncated body or a
-    # ``DecodeError`` on corrupt gzip arrives raw and would escape to the route
-    # as a 500.  Both arms are needed: ``RequestException`` is an ``OSError``,
-    # so that half still covers the connect-time failures, and
-    # ``urllib3.exceptions.HTTPError`` is not an ``OSError`` at all.
-    except (urllib3.exceptions.HTTPError, OSError) as exc:
-        raise SpotifyUnavailable(f"{type(exc).__name__}: {exc}") from exc
-    try:
-        return body.decode(encoding, errors="replace")
-    except LookupError:  # a header naming an unknown charset
-        return body.decode("utf-8", errors="replace")
+            params,
+            label="Spotify",
+            check_deadline=check_deadline,
+        )
+    except FetchFailed as exc:
+        raise SpotifyUnavailable(str(exc)) from exc

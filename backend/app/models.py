@@ -14,6 +14,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    computed_field,
     field_validator,
 )
 from pydantic_core import PydanticCustomError
@@ -188,6 +189,29 @@ class DownloadRequest(BaseModel):
         return reject_spotify_url(validate_download_url(value))
 
 
+# The two errors that are not failures: nothing went wrong and nothing can be
+# done about them, so :attr:`Job.skipped` marks them and the UI offers no
+# Retry.  Here rather than in :mod:`app.downloader` (which raises them, and
+# re-exports them) because that module imports this one; the strings are as
+# much part of a job's shape as its status is.
+#
+# The error a job carries when its target file is already in the library.  The
+# relative path is appended, and the queue shows the whole thing as the job's
+# reason, so it has to read as a sentence to somebody who never saw this code.
+ALREADY_IN_LIBRARY_PREFIX = "already in library: "
+
+# What a job says when the Bandcamp seller has streaming turned off.  yt-dlp
+# reports that as "No video formats found!" plus a link to its issue tracker,
+# which reads like a bug in this app and is not one: the track page's
+# ``trackinfo`` carries ``streaming: null`` and ``file: null``, so there is no
+# audio to fetch and nothing to report anywhere.  The original message stays in
+# the log; this is what the queue shows.
+BANDCAMP_NO_STREAM_MESSAGE = (
+    "Bandcamp: streaming is disabled for this track, so there is nothing to "
+    "download"
+)
+
+
 class Job(BaseModel):
     """Represents a queue entry with its current state and metadata.
 
@@ -296,6 +320,26 @@ class Job(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Job creation timestamp")
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), description="Timestamp of the last state change")
     finished_at: datetime | None = Field(None, description="Timestamp the job reached done/error/cancelled")
+
+    @computed_field(  # type: ignore[prop-decorator]
+        description=(
+            "Whether this job ended in ``error`` for a reason that is not a "
+            "failure and cannot be retried into success: the track was already "
+            "in the library, or its Bandcamp seller has streaming turned off. "
+            "Derived from ``error`` on the way out -- it is not a column, so "
+            "an older row gets the same answer as a new one, and the two "
+            "strings are named in one place instead of being re-spelled by "
+            "every client."
+        )
+    )
+    @property
+    def skipped(self) -> bool:
+        if not self.error:
+            return False
+        return (
+            self.error.startswith(ALREADY_IN_LIBRARY_PREFIX)
+            or self.error == BANDCAMP_NO_STREAM_MESSAGE
+        )
 
 
 class SSEEvent(BaseModel):

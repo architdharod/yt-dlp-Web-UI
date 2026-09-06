@@ -144,9 +144,11 @@ function JobRow({
   const showProgress = !tagging && job.status === "downloading";
   const total = job.progress_total ?? null;
   const canCancel = CANCELLABLE_STATUSES.has(job.status);
-  // The backend ends a download whose target file already exists as an error,
-  // but nothing went wrong and retrying would fail the same way — so it reads
-  // as a neutral "Skipped" with the reason in muted text and no Retry.
+  // The backend ends two kinds of download as an error without anything
+  // having gone wrong: one whose target file already exists, and a Bandcamp
+  // track whose seller has streaming turned off. Retrying either would fail
+  // the same way, so both read as a neutral "Skipped" with the reason in
+  // muted text and no Retry.
   const skipped = isSkipped(job);
 
   return (
@@ -323,8 +325,8 @@ function BulkJobRow({
   const summary = countsSummary(counts);
   const total = job.progress_total ?? children.length;
   const canCancel = CANCELLABLE_STATUSES.has(job.status);
-  // A collection whose only errors are duplicates has not failed: every track
-  // is accounted for and there is nothing to retry. The parent's status stays
+  // A parent whose only errors are skips has not failed: every track is
+  // accounted for and there is nothing to retry. The parent's status stays
   // `error` (that is what keeps Dismiss available and the reason on the child
   // rows), but it reads as the same neutral "Skipped" a single row gets.
   const allSkipped =
@@ -419,11 +421,15 @@ function BulkJobRow({
                     : "text-destructive"
                 }`}
               >
+                {/* Not naming the reason: a skip is a track already in the
+                    library or one whose Bandcamp seller has streaming turned
+                    off, and a parent can hold both. Each track row carries its
+                    own reason, which is where it belongs. */}
                 {job.error ??
                   (allSkipped
                     ? `${counts.skipped} ${
                         counts.skipped === 1 ? "track was" : "tracks were"
-                      } already in the library`
+                      } skipped`
                     : "Some tracks could not be downloaded")}
               </p>
               {job.status === "error" && (

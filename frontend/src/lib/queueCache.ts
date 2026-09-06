@@ -291,11 +291,11 @@ function numberOrNull(
  * Merge the job snapshot fields carried by every SSE event into a job.
  *
  * The backend's `_emit_event` sends status, progress, title, thumbnail_url,
- * duration, artist and album on every event type, plus the N-of-M counters,
- * and error/detail when they are set. `kind`, `parent_id` and `path` are *not*
- * merged — they never change over a job's life, so the cached row keeps
- * whatever `GET /queue` (or the creating response) gave it. Neither are
- * `children`: a parent's synthetic `status_change` carries its own derived
+ * duration, artist and album on every event type, plus the N-of-M counters and
+ * `skipped`, and error/detail when they are set. `kind`, `parent_id` and
+ * `path` are *not* merged — they never change over a job's life, so the cached
+ * row keeps whatever `GET /queue` (or the creating response) gave it. Neither
+ * are `children`: a parent's synthetic `status_change` carries its own derived
  * fields only, and the children it holds are patched by their own events.
  */
 export function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
@@ -333,6 +333,14 @@ export function mergeSnapshot(job: Job, data: Record<string, unknown>): Job {
   }
   if (typeof data.error === "string") {
     merged.error = data.error;
+  }
+  // Alongside the error, because it is the backend's verdict *on* that error:
+  // a job cached while it was queued carries `skipped: false`, and the event
+  // that ends it as a duplicate or a Bandcamp track with streaming off is the
+  // only thing that says otherwise until the next `GET /queue`. Without this
+  // the row would offer a Retry that cannot work.
+  if (typeof data.skipped === "boolean") {
+    merged.skipped = data.skipped;
   }
   // Only `done` jobs carry one, and they leave the view — merged anyway so a
   // row that is still on screen when the event arrives is not left with a

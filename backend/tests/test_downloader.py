@@ -22,6 +22,7 @@ from mutagen.flac import FLAC
 
 from app.downloader import (
     ALREADY_IN_LIBRARY_PREFIX,
+    BANDCAMP_NO_STREAM_MESSAGE,
     CANCELLED_MESSAGE,
     CancelToken,
     DownloadError,
@@ -136,6 +137,112 @@ class TestExtractMetadata:
 
         with pytest.raises(DownloadError, match="Failed to extract metadata"):
             extract_metadata("https://example.com/unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Streaming turned off on Bandcamp
+# ---------------------------------------------------------------------------
+
+
+# What yt-dlp really says for a Bandcamp track whose seller sells it without
+# streaming it, captured from a live run against
+# https://amelielens.bandcamp.com/track/theory-of-relativity.
+_BANDCAMP_NO_FORMATS = (
+    "ERROR: [Bandcamp] 3456873933: No video formats found!; please report this "
+    "issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the "
+    "appropriate issue template. Confirm you are on the latest version using  "
+    "yt-dlp -U"
+)
+
+
+class TestBandcampStreamingDisabled:
+    """A track with no stream fails with a sentence, not with a bug report.
+
+    The failure lands in ``extract_metadata`` -- yt-dlp picks formats before it
+    downloads anything, so the metadata pass is where it notices -- but the
+    download path maps it the same way, because which of the two sees it first
+    is yt-dlp's business and not something a user's error message should
+    depend on.
+    """
+
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_metadata_extraction_says_streaming_is_off(self, mock_ydl_cls, caplog):
+        mock_ydl = MagicMock()
+        mock_ydl.extract_info.side_effect = yt_dlp.utils.DownloadError(
+            _BANDCAMP_NO_FORMATS
+        )
+        mock_ydl_cls.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+        mock_ydl_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        with caplog.at_level(logging.ERROR, logger="app.downloader"):
+            with pytest.raises(DownloadError) as caught:
+                extract_metadata(
+                    "https://amelielens.bandcamp.com/track/theory-of-relativity"
+                )
+
+        assert str(caught.value) == BANDCAMP_NO_STREAM_MESSAGE
+        # The original is not lost: it is what anybody diagnosing this needs.
+        assert "No video formats found" in caplog.text
+
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_the_download_path_maps_it_too(self, mock_ydl_cls):
+        # The pre-download metadata pass is advisory inside ``download_audio``
+        # -- it is logged and carried on from -- so the failure that reaches
+        # the user comes out of the downloading extraction, and that arm has to
+        # map the message as well.
+        mock_ydl = MagicMock()
+        mock_ydl.extract_info.side_effect = yt_dlp.utils.DownloadError(
+            _BANDCAMP_NO_FORMATS
+        )
+        mock_ydl_cls.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+        mock_ydl_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        job = _make_job(
+            url="https://amelielens.bandcamp.com/track/theory-of-relativity",
+            artist="Amelie Lens",
+            title="Theory of Relativity",
+        )
+        with pytest.raises(DownloadError) as caught:
+            download_audio(job)
+
+        assert str(caught.value) == BANDCAMP_NO_STREAM_MESSAGE
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            # The same yt-dlp complaint from a different extractor is a
+            # different failure and keeps yt-dlp's own words.
+            "ERROR: [youtube] abc123: No video formats found!",
+            # A Bandcamp failure that is not this one keeps them too.
+            "ERROR: [Bandcamp] 123: Unable to download webpage",
+        ],
+        ids=["other-extractor", "other-bandcamp-error"],
+    )
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_nothing_else_is_reworded(self, mock_ydl_cls, message):
+        mock_ydl = MagicMock()
+        mock_ydl.extract_info.side_effect = yt_dlp.utils.DownloadError(message)
+        mock_ydl_cls.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+        mock_ydl_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        with pytest.raises(DownloadError) as caught:
+            extract_metadata("https://example.com/track")
+
+        assert str(caught.value) == f"Failed to extract metadata: {message}"
+
+    @patch("app.downloader.yt_dlp.YoutubeDL")
+    def test_an_album_extractor_counts_as_bandcamp(self, mock_ydl_cls):
+        mock_ydl = MagicMock()
+        mock_ydl.extract_info.side_effect = yt_dlp.utils.DownloadError(
+            "ERROR: [Bandcamp:album] 9: No video formats found!"
+        )
+        mock_ydl_cls.return_value.__enter__ = MagicMock(return_value=mock_ydl)
+        mock_ydl_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+        with pytest.raises(DownloadError) as caught:
+            extract_metadata("https://amelielens.bandcamp.com/album/exhale")
+
+        assert str(caught.value) == BANDCAMP_NO_STREAM_MESSAGE
 
     @patch("app.downloader.yt_dlp.YoutubeDL")
     def test_raises_download_error_on_none_info(self, mock_ydl_cls):

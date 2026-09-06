@@ -88,6 +88,14 @@ top artist match is taken without a picker, and its discography becomes the prev
 artist it matched and says the two catalogues may differ; the artist field stays editable. Nothing is ever
 downloaded from Spotify.
 
+#### Bandcamp artist pages
+
+A `<name>.bandcamp.com/` or `/music` URL is enumerated by yt-dlp, which builds the whole listing out of the
+subdomain: the artist would come out as `amelielens` rather than `Amelie Lens`, and no MusicBrainz lookup
+matches a subdomain. So the probe reads the page itself once — the `data-band` attribute, then `og:site_name`,
+then the `Music | <Name>` title — and offers that name instead, falling back to the subdomain when the page
+cannot be read. One request per page, never one per track.
+
 ### Fixing the tags
 
 With the track filed, the download slot is freed and the job moves to **tagging**. It queues for the single
@@ -103,7 +111,9 @@ container.
 ### The queue
 
 Queue rows carry Cancel and Dismiss; a failed row also offers **Retry**, which re-queues the job from the
-start (a skipped duplicate and a bulk parent do not get one; retry a bulk download's failed child instead).
+start (a skipped row and a bulk parent do not get one; retry a bulk download's failed child instead). A row
+is **skipped** rather than failed when nothing went wrong and retrying could not help: the track was already
+in the library, or its Bandcamp seller has streaming turned off.
 **Cancel** stops a job that is queued, downloading or converting, and removes
 every partial and temporary file. Cancelled jobs leave the queue and are not retried; resubmit the URL
 instead. Cancelling a job that is already **tagging** stops only the tag fix: the track is in the library, so
@@ -532,7 +542,13 @@ worth knowing:
   any Spotify URL: it is a single-track route.
 - **The preview is a flat extraction** — cheap, and thin: a row can only be marked unavailable when the flat
   pass says so. SoundCloud DRM is invisible to it, because yt-dlp only meets the DRM in a full extraction, so
-  such a track previews as available and then fails in its own child job with yt-dlp's DRM message.
+  such a track previews as available and then fails in its own child job with yt-dlp's DRM message. A
+  Bandcamp track whose seller has turned off streaming is invisible the same way and for the same reason —
+  the streaming switch is only in the full extraction of the track page — so it too previews as available,
+  and its child job ends as **skipped**, not failed, reading "Bandcamp: streaming is disabled for this track,
+  so there is nothing to download". The preview says so for a Bandcamp album or artist URL; a single Bandcamp
+  track URL previews as one track and carries no notices, and one whose streaming is off is refused with that
+  message instead of being queued.
 - **A fixed host allowlist** — the backend accepts `http`/`https` URLs on `youtube.com`, `youtu.be`,
   `soundcloud.com`, `bandcamp.com` and `open.spotify.com`, each matched exactly or as a subdomain, and
   rejects everything else with a validation error. `music.youtube.com` is a subdomain of `youtube.com`, so

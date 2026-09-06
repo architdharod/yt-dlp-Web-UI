@@ -316,16 +316,22 @@ describe("CollectionPreview selection", () => {
   });
 
   it("renders the source notices", () => {
+    /**
+     * A Bandcamp preview carries two of them -- the 128 kbps one and the one
+     * about a seller who has streaming turned off -- so this checks that a
+     * list of notices renders as a list rather than as only the first.
+     */
+    const notices = [
+      "Bandcamp streams are 128 kbps MP3.",
+      "A Bandcamp track whose seller has turned off streaming is listed here as available but fails when downloaded.",
+    ];
     renderPreview(
-      collectionPreview([previewRow("a")], {
-        source: "bandcamp",
-        notices: ["Bandcamp streams are 128 kbps MP3."],
-      }),
+      collectionPreview([previewRow("a")], { source: "bandcamp", notices }),
     );
 
-    expect(
-      screen.getByText("Bandcamp streams are 128 kbps MP3."),
-    ).toBeTruthy();
+    for (const notice of notices) {
+      expect(screen.getByText(notice)).toBeTruthy();
+    }
   });
 
   it("shows the Spotify match notice and the resolved artist", () => {
