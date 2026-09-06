@@ -327,7 +327,7 @@ describe("a bulk collection in the queue", () => {
     vi.mocked(cancelJob).mockResolvedValue(mixed);
     renderQueue([mixed]);
 
-    fireEvent.click(screen.getByRole("button", { name: "Cancel collection" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel bulk download" }));
 
     await waitFor(() =>
       expect(vi.mocked(cancelJob).mock.calls[0]?.[0]).toBe("p1"),
@@ -345,7 +345,7 @@ describe("a bulk collection in the queue", () => {
 
     expect(screen.getByRole("button", { name: /Dismiss/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Retry/ })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Cancel collection" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Cancel bulk download" })).toBeNull();
   });
 
   it("reads a collection of nothing but duplicates as skipped", () => {

@@ -389,7 +389,7 @@ function BulkJobRow({
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label="Cancel collection"
+                  aria-label="Cancel bulk download"
                   title="Cancel every track still to download"
                   disabled={cancelling.has(job.id)}
                   onClick={() => onCancel(job.id)}
@@ -432,7 +432,7 @@ function BulkJobRow({
                   size="xs"
                   onClick={() => onDismiss(job.id)}
                   className="shrink-0"
-                  title="Remove this collection and its tracks from the queue"
+                  title="Remove this download and its tracks from the queue"
                 >
                   <X className="size-3" data-icon="inline-start" />
                   Dismiss

@@ -539,7 +539,7 @@ class TestCapsAndCache:
                 await probe(PLAYLIST_URL)
 
         assert str(excinfo.value).startswith(
-            f"This collection has more than {MAX_COLLECTION_TRACKS} tracks"
+            f"This playlist, album or artist page has more than {MAX_COLLECTION_TRACKS} tracks"
         )
 
     async def test_exactly_the_cap_is_allowed(self):

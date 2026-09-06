@@ -319,7 +319,7 @@ class SSEEvent(BaseModel):
 
     event: str = Field(
         ...,
-        description="Event type: status_change, progress, error, library_changed, notices",
+        description="Event type: status_change, progress, metadata, error, library_changed, notices",
     )
     job_id: str | None = Field(
         None,

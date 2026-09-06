@@ -988,7 +988,7 @@ class TestProbeRoute:
 
         assert resp.status_code == 400
         assert resp.json()["detail"].startswith(
-            "This collection has more than 2000 tracks"
+            "This playlist, album or artist page has more than 2000 tracks"
         )
         assert "narrower URL" in resp.json()["detail"]
 

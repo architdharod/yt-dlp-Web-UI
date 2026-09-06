@@ -176,12 +176,12 @@ SPOTIFY_UNREADABLE_MESSAGE = (
 )
 
 TOO_LARGE_MESSAGE = (
-    f"This collection has more than {MAX_COLLECTION_TRACKS} tracks. "
-    "Use a narrower URL -- a single album or playlist rather than a whole "
-    "artist or channel."
+    f"This playlist, album or artist page has more than {MAX_COLLECTION_TRACKS} "
+    "tracks. Use a narrower URL -- a single album or playlist rather than a "
+    "whole artist or channel."
 )
 
-EMPTY_MESSAGE = "This collection has no downloadable tracks"
+EMPTY_MESSAGE = "This playlist, album or artist page has no downloadable tracks"
 
 # What a swallowed failure is called when yt-dlp did not say anything useful.
 NOTHING_RETURNED_MESSAGE = "yt-dlp returned nothing for this URL"
